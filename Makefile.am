@@ -25,9 +25,9 @@ if ENABLE_HTS
 CPPFLAGS += -DUSE_HTS
 endif
 
-bin_PROGRAMS = falco
+bin_PROGRAMS = falcoAmadeus
 
-falco_SOURCES = \
+falcoAmadeus_SOURCES = \
 	src/falco.cpp \
 	src/FastqStats.cpp \
 	src/HtmlMaker.cpp \

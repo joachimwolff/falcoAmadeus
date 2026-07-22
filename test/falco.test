@@ -8,7 +8,7 @@ for i in ${infiles}
 do
   a=$(basename $i ".fastq")
   mkdir -p test_output/${a}
-  ./falco -o test_output/${a} ${i} \
+  ./falcoAmadeus -o test_output/${a} ${i} \
        1>test_output/${a}/${a}.output  \
        2>test_output/${a}/${a}.error
   for j in test_output/${a}/*.txt; do
