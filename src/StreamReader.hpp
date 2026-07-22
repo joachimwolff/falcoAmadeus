@@ -21,6 +21,12 @@
 #include <string>
 #include <cmath>
 #include <bitset>
+#include <vector>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <atomic>
 
 // Optional zlib usage
 #include <zlib.h>
@@ -212,13 +218,66 @@ class FastqReader : public StreamReader {
 };
 
 /*******************************************************/
+/*************** BACKGROUND GZ DECOMPRESSOR ************/
+/*******************************************************/
+// A single background thread that pulls fixed-size blocks of *decompressed*
+// bytes off a gzFile, so the (unchanged) parser can consume them while
+// zlib inflates the next block on another core. The decompressed byte stream
+// handed to the consumer is exactly the one gzgets would have produced, so
+// output stays byte-identical; only the wall-clock overlap changes.
+class GzBlockDecompressor {
+ private:
+  gzFile file;
+  const size_t block_size;
+  std::vector<std::vector<char>> blocks;  // fixed pool of block buffers
+  std::vector<size_t> lens;               // valid bytes per block
+  std::queue<int> free_q;                 // indices ready to be (re)filled
+  std::queue<int> filled_q;               // indices holding data to consume
+  std::mutex mtx;
+  std::condition_variable free_cv, filled_cv;
+  std::thread worker;
+  bool producer_done = false;             // gzread hit EOF/error
+  bool stop_requested = false;
+  // compressed offset after the most recent gzread, for the progress bar
+  // (only the producer thread may touch the gzFile)
+  std::atomic<size_t> comp_offset{0};
+
+  // consumer-side current block state (touched only by the consumer thread)
+  int cur_idx = -1;
+  size_t cur_pos = 0, cur_len = 0;
+  bool consumed_eof = false;
+
+  void producer_loop();
+
+ public:
+  GzBlockDecompressor(gzFile f, size_t bs, int npool);
+  ~GzBlockDecompressor();
+
+  // Make sure the current block still has unread bytes; fetch the next filled
+  // block if not. Returns false once the whole stream has been consumed.
+  bool ensure_data();
+
+  // Copy one line (up to and including '\n', NUL-terminated) into dst, exactly
+  // like gzgets. Returns the number of bytes written (0 only at end of stream).
+  size_t getline(char *dst, size_t maxlen);
+
+  bool eof() const { return consumed_eof; }
+  size_t compressed_offset() const { return comp_offset.load(); }
+};
+
+/*******************************************************/
 /*************** READ FASTQ GZ RCORD *******************/
 /*******************************************************/
 class GzFastqReader : public StreamReader {
  private:
   static const size_t RESERVE_SIZE = (1<<26);
+  // background-decompression tunables (only used when threads >= 2)
+  static const size_t GZ_BLOCK_SIZE = (1<<22);  // 4 MiB decompressed blocks
+  static const int GZ_NUM_BLOCKS = 6;           // bounded prefetch (~24 MiB)
   char *gzbuf;
   gzFile fileobj;
+  const bool threaded;              // overlap decompression on a bg thread
+  GzBlockDecompressor *decomp;      // non-null only when threaded
 
  public:
   GzFastqReader(FalcoConfig &fc, const size_t _buffer_size);

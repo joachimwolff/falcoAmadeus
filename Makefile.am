@@ -20,7 +20,9 @@ ACLOCAL_AMFLAGS = -I m4
 
 # ADS: fix the order of user and project set vars; shouldn't need to worry about
 # setting CXXFLAGS in configure.ac
-AM_CXXFLAGS = -Wall -Wextra -Wpedantic
+# -pthread: falco uses std::thread to overlap gzip decompression with parsing
+AM_CXXFLAGS = -Wall -Wextra -Wpedantic -pthread
+AM_LDFLAGS = -pthread
 if ENABLE_HTS
 CPPFLAGS += -DUSE_HTS
 endif

@@ -405,12 +405,11 @@ main(int argc, char *argv[]) {
                       false, forced_file_format);
 
     opt_parse.add_opt("-threads", 't',
-                      "[NOT YET IMPLEMENTED IN FALCO] "
-                      "Specifies the number of files which can be processed "
-                      "simultaneously.  Each thread will be allocated 250MB of "
-                      "memory so you shouldn't run more threads than your "
-                      "available memory will cope with, and not more than "
-                      "6 threads on a 32 bit machine",
+                      "[FalcoAmadeus] Number of threads. With 2 or more, "
+                      "gzipped input is decompressed on a background thread "
+                      "while the reads are parsed, overlapping the two. Output "
+                      "is byte-identical to single-threaded (-t 1, the "
+                      "default).",
                       false, falco_config.threads);
 
     opt_parse.add_opt(

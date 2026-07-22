@@ -773,12 +773,121 @@ FastqReader::read_entry(FastqStats &stats, std::size_t &num_bytes_read) {
 }
 
 /*******************************************************/
+/*************** BACKGROUND GZ DECOMPRESSOR ************/
+/*******************************************************/
+GzBlockDecompressor::GzBlockDecompressor(gzFile f, std::size_t bs, int npool) :
+  file(f), block_size(bs) {
+  blocks.resize(npool);
+  lens.assign(npool, 0);
+  for (int i = 0; i < npool; ++i) {
+    blocks[i].resize(block_size);
+    free_q.push(i);
+  }
+  worker = std::thread(&GzBlockDecompressor::producer_loop, this);
+}
+
+GzBlockDecompressor::~GzBlockDecompressor() {
+  {
+    std::lock_guard<std::mutex> lk(mtx);
+    stop_requested = true;
+  }
+  free_cv.notify_all();
+  filled_cv.notify_all();
+  if (worker.joinable())
+    worker.join();
+}
+
+// Runs on the background thread: inflate fixed-size blocks off the gzFile and
+// hand them to the consumer through filled_q. Only this thread touches the
+// gzFile.
+void
+GzBlockDecompressor::producer_loop() {
+  while (true) {
+    int idx;
+    {
+      std::unique_lock<std::mutex> lk(mtx);
+      free_cv.wait(lk, [&] { return !free_q.empty() || stop_requested; });
+      if (stop_requested)
+        return;
+      idx = free_q.front();
+      free_q.pop();
+    }
+    const int n = gzread(file, blocks[idx].data(), block_size);
+    comp_offset.store(static_cast<std::size_t>(gzoffset(file)));
+    {
+      std::lock_guard<std::mutex> lk(mtx);
+      if (n > 0) {
+        lens[idx] = static_cast<std::size_t>(n);
+        filled_q.push(idx);
+      } else {
+        // n == 0 is EOF, n < 0 is a decompression error; either way we stop.
+        free_q.push(idx);
+        producer_done = true;
+        filled_cv.notify_one();
+        return;
+      }
+    }
+    filled_cv.notify_one();
+  }
+}
+
+bool
+GzBlockDecompressor::ensure_data() {
+  if (cur_idx >= 0 && cur_pos < cur_len)
+    return true;
+  // hand the fully-consumed block back to the producer
+  if (cur_idx >= 0) {
+    {
+      std::lock_guard<std::mutex> lk(mtx);
+      free_q.push(cur_idx);
+    }
+    free_cv.notify_one();
+    cur_idx = -1;
+  }
+  std::unique_lock<std::mutex> lk(mtx);
+  filled_cv.wait(lk, [&] { return !filled_q.empty() || producer_done; });
+  if (filled_q.empty()) {  // producer finished and nothing left to consume
+    consumed_eof = true;
+    return false;
+  }
+  cur_idx = filled_q.front();
+  filled_q.pop();
+  cur_pos = 0;
+  cur_len = lens[cur_idx];
+  return true;
+}
+
+// Copies one line (up to and including '\n', NUL-terminated) into dst, exactly
+// mirroring gzgets so the parser sees an identical line stream.
+std::size_t
+GzBlockDecompressor::getline(char *dst, std::size_t maxlen) {
+  std::size_t i = 0;
+  const std::size_t lim = maxlen - 1;
+  while (i < lim) {
+    if (!ensure_data())
+      break;
+    const std::vector<char> &blk = blocks[cur_idx];
+    while (cur_pos < cur_len && i < lim) {
+      const char c = blk[cur_pos++];
+      dst[i++] = c;
+      if (c == '\n') {
+        dst[i] = '\0';
+        return i;
+      }
+    }
+  }
+  dst[i] = '\0';
+  return i;
+}
+
+/*******************************************************/
 /*************** READ FASTQ GZ RCORD *******************/
 /*******************************************************/
 // the gz fastq constructor is the same as the fastq
 GzFastqReader::GzFastqReader(FalcoConfig &_config,
                              const std::size_t _buffer_size) :
-  StreamReader(_config, _buffer_size, '\n', '\n') {
+  StreamReader(_config, _buffer_size, '\n', '\n'),
+  threaded(_config.threads >= 2), decomp(nullptr) {
   gzbuf = new char[RESERVE_SIZE];
 }
 
@@ -793,16 +902,23 @@ GzFastqReader::load() {
   // reads bigger chunks; must be set before the first gz read.
   gzbuffer(fileobj, (1 << 20));
 
+  // With >= 2 threads, inflate on a background thread so parsing overlaps
+  // decompression. The consumer never touches the gzFile after this point.
+  if (threaded)
+    decomp = new GzBlockDecompressor(fileobj, GZ_BLOCK_SIZE, GZ_NUM_BLOCKS);
+
   return get_file_size(filename);
 }
 
 // straightforward
 inline bool
 GzFastqReader::is_eof() {
-  return gzeof(fileobj);
+  return threaded ? decomp->eof() : gzeof(fileobj);
 }
 
 GzFastqReader::~GzFastqReader() {
+  // join the background thread (if any) before closing the gzFile it reads
+  delete decomp;
   delete[] gzbuf;
   gzclose_r(fileobj);
 }
@@ -810,7 +926,18 @@ GzFastqReader::~GzFastqReader() {
 // Parses fastq gz by reading line by line into the gzbuf
 bool
 GzFastqReader::read_entry(FastqStats &stats, std::size_t &num_bytes_read) {
-  cur_char = gzgets(fileobj, gzbuf, RESERVE_SIZE);
+  // fetch the next line into gzbuf, from the background decompressor when
+  // threaded, otherwise straight from zlib
+  auto next_line = [&] {
+    if (threaded) {
+      decomp->getline(gzbuf, RESERVE_SIZE);
+      cur_char = gzbuf;
+    } else {
+      cur_char = gzgets(fileobj, gzbuf, RESERVE_SIZE);
+    }
+  };
+
+  next_line();
 
   // need to check here if we did not hit eof
   if (is_eof()) {
@@ -821,15 +948,15 @@ GzFastqReader::read_entry(FastqStats &stats, std::size_t &num_bytes_read) {
   read_tile_line(stats);
   skip_separator();
 
-  cur_char = gzgets(fileobj, gzbuf, RESERVE_SIZE);
+  next_line();
   read_sequence_line(stats);
   skip_separator();
 
-  cur_char = gzgets(fileobj, gzbuf, RESERVE_SIZE);
+  next_line();
   read_fast_forward_line();
   skip_separator();
 
-  cur_char = gzgets(fileobj, gzbuf, RESERVE_SIZE);
+  next_line();
   read_quality_line(stats);
   skip_separator();
 
@@ -843,7 +970,7 @@ GzFastqReader::read_entry(FastqStats &stats, std::size_t &num_bytes_read) {
 
   // Returns if file should keep being checked
   if (check_bytes_read(stats.num_reads))
-    num_bytes_read = gzoffset(fileobj);
+    num_bytes_read = threaded ? decomp->compressed_offset() : gzoffset(fileobj);
   return !is_eof();
 }
 
