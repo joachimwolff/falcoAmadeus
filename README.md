@@ -59,13 +59,20 @@ Installing falco
 ## Installing through conda
 If you use [anaconda](https://anaconda.org) to manage your packages,
 and the `conda` binary is in your path, you can install the most
-recent release of `falco` by running
+recent release of `falcoAmadeus` by running
 ```
-$ conda install -c bioconda falco
+$ conda install -c bioconda falcoamadeus
 ```
 
-`falco` can be found inside the `bin` directory of your anaconda
-installer.
+The `falcoAmadeus` binary can be found inside the `bin` directory of your
+anaconda installer.
+
+> **Note:** the bioconda package is being submitted. Until it lands you can
+> build from source (below). The bioconda recipe lives in
+> [`recipe/`](recipe/); publishing it requires pushing a `v1.3.2` release tag
+> to this repository, filling in the tarball `sha256` in
+> [`recipe/meta.yaml`](recipe/meta.yaml), and opening a pull request against
+> [bioconda-recipes](https://github.com/bioconda/bioconda-recipes).
 
 ## Installing from source (code release)
 
