@@ -14,7 +14,7 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
 # General Public License for more details.
 
-EXTRA_DIST = README.md LICENSE Configuration example.fq test
+EXTRA_DIST = README.md LICENSE AUTHORS Configuration example.fq test
 
 ACLOCAL_AMFLAGS = -I m4
 
