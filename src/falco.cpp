@@ -688,8 +688,16 @@ main(int argc, char *argv[]) {
       else if (falco_config.is_fastq_gz) {
         if (!falco_config.quiet)
           log_process("reading file as gzipped FASTQ format");
-        GzFastqReader in(falco_config, stats.SHORT_READ_THRESHOLD);
-        read_stream_into_stats(in, stats, falco_config);
+        // multi-threaded parser: background inflate + parallel per-read stats,
+        // byte-identical to single-threaded. Only for read_step == 1; the
+        // subsampling counter logic is left to the serial path otherwise.
+        if (falco_config.threads >= 2 && falco_config.read_step == 1) {
+          read_gz_parallel(falco_config, stats, falco_config.threads);
+        }
+        else {
+          GzFastqReader in(falco_config, stats.SHORT_READ_THRESHOLD);
+          read_stream_into_stats(in, stats, falco_config);
+        }
       }
       else if (falco_config.is_fastq) {
         if (!falco_config.quiet)

@@ -49,9 +49,31 @@
  ******************** STREAM READER **************************
  *************************************************************/
 
+// Per-read record of a read's contribution to the FastQC GC model. In the
+// multi-threaded path workers cannot accumulate stats.gc_count directly (double
+// addition is not associative, so a reordered sum would not be byte-identical);
+// instead each worker stores one of these and a single serial pass replays them
+// in global read order, reproducing the exact sequential floating-point result.
+struct GCRecord {
+  // 0 = no contribution (empty read or GC module off)
+  // 1 = short read, use the cached gc model with (a=trunc_length, b=trunc_gc)
+  // 2 = long read, discrete bin with (a=read_pos, b=cur_gc_count)
+  uint8_t kind;
+  uint32_t a;
+  uint32_t b;
+};
+
 // Generic class that does as much as possible without assuming file format
 class StreamReader{
  public:
+  // ---- multi-threaded worker support ----
+  // When true this object is a per-thread worker fed pre-split lines by the
+  // dispatcher: read/tile/kmer flags and tile_cur are set externally, GC is
+  // recorded rather than accumulated, and end-of-stream is signalled per line.
+  bool parallel_mode = false;
+  GCRecord *cur_gc_record = nullptr;  // where to store this read's GC record
+  bool force_eof = false;             // is_eof() override for the worker path
+
   // config on how to handle reads
   const bool do_sequence_hash,
              do_kmer,
@@ -286,6 +308,31 @@ class GzFastqReader : public StreamReader {
   bool read_entry(FastqStats &stats, size_t &num_bytes_read);
   ~GzFastqReader();
 };
+
+/*******************************************************/
+/*************** PARALLEL GZ WORKER ********************/
+/*******************************************************/
+// A per-thread worker that runs the normal per-base processing on pre-split
+// lines handed to it by the dispatcher. It never touches a file itself, so the
+// file-format virtuals are stubs.
+class ParallelWorker : public StreamReader {
+ public:
+  ParallelWorker(FalcoConfig &fc, const size_t _buffer_size) :
+    StreamReader(fc, _buffer_size, '\n', '\n') {
+    parallel_mode = true;
+  }
+  size_t load() { return 0; }
+  bool read_entry(FastqStats &, size_t &) { return false; }
+  bool is_eof() { return force_eof; }
+  ~ParallelWorker() {}
+};
+
+// Multi-threaded gzipped-FASTQ driver: one background thread inflates, the
+// calling thread dispatches (line-split, duplication, tile bookkeeping), and
+// `nthreads` workers accumulate the per-base statistics in parallel. The result
+// in `master` is byte-identical to the single-threaded path. Only valid for
+// read_step == 1; the caller falls back otherwise.
+void read_gz_parallel(FalcoConfig &config, FastqStats &master, size_t nthreads);
 
 /*******************************************************/
 /*************** READ SAM RECORD ***********************/
