@@ -1,0 +1,65 @@
+name: CI
+
+# Build falco and run the md5-based test suite (test/falco.test) on every
+# push and pull request. The suite runs FASTQC-style analysis on the bundled
+# SRR inputs and checks each fastqc_data.txt / summary.txt against the
+# reference checksums in test/md5sum.txt, so it fails on any change that is
+# not byte-identical.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: Build and test (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            configure_flags: ""
+            extra_packages: ""
+          - name: hts
+            configure_flags: "--enable-hts"
+            extra_packages: "libhts-dev"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential autoconf automake zlib1g-dev ${{ matrix.extra_packages }}
+
+      - name: Generate the configure script
+        run: ./autogen.sh
+
+      - name: Configure
+        run: ./configure ${{ matrix.configure_flags }}
+
+      - name: Build
+        run: make -j"$(nproc)"
+
+      - name: Run test suite (make check)
+        run: make check
+
+      - name: Show test log on failure
+        if: failure()
+        run: |
+          echo "===== test-suite.log ====="
+          cat test-suite.log 2>/dev/null || true
+          echo "===== test/falco.log ====="
+          cat test/falco.log 2>/dev/null || true
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-${{ matrix.name }}
+          path: |
+            test-suite.log
+            test/falco.log
+          if-no-files-found: ignore
