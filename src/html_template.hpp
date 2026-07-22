@@ -1,5 +1,7 @@
 /* Copyright (C) 2026 Andrew D. Smith
  *
+ * FalcoAmadeus fork modifications Copyright (C) 2026 Joachim Wolff
+ *
  * This program is free software: you can redistribute it and/or
  * modify it under the terms of the GNU General Public License as
  * published by the Free Software Foundation, either version 3 of the
@@ -389,7 +391,7 @@ p {
 
 
 </div>
-<div class="footer">Falco {{version}}
+<div class="footer">FalcoAmadeus {{version}}
 </div>
 </body>
 <script src="https://code.jquery.com/jquery-3.3.1.slim.min.js" 

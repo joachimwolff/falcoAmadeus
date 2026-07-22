@@ -4,6 +4,8 @@
  *                         Andrew D. Smith
  * Authors: Guilherme De Sena Brandine, Andrew Smith, and Masaru Nakajima
  *
+ * FalcoAmadeus fork modifications Copyright (C) 2026 Joachim Wolff
+ *
  * This program is free software: you can redistribute it and/or
  * modify it under the terms of the GNU General Public License as
  * published by the Free Software Foundation, either version 3 of the
@@ -166,7 +168,7 @@ write_results(const FalcoConfig &falco_config, FastqStats &stats,
       log_process("Writing text report to " + qc_data_file);
 
     // put header
-    qc_data_txt << "##Falco\t" + std::string{VERSION} + "\n";
+    qc_data_txt << "##FalcoAmadeus\t" + std::string{VERSION} + "\n";
     if (do_call)
       qc_data_txt << "##Call\t" << falco_config.call << "\n";
   }
