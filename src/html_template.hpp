@@ -120,6 +120,11 @@ a.toggle-all {
   display:inline-block; margin:.1em 0 .7em .5em; font-size:.72rem;
   color:var(--brand); cursor:pointer; font-weight:600;
 }
+p.module-desc {
+  margin:-.3em 0 1.15em; color:var(--muted); font-size:.86rem;
+  line-height:1.5; max-width:78ch;
+}
+p.module-desc a { font-weight:600; white-space:nowrap; }
 div.module > div[id] { width:100%; }
 .pass { color:var(--pass); } .warn { color:var(--warn); } .fail { color:var(--fail); }
 table {
@@ -349,7 +354,27 @@ integrity="sha384-JjSmVgyd0p3pXB1rRibZUAYoIIy6OrQ6VrjIEaFf/nJGzIxFDsf4x0xIM+B07j
 crossorigin="anonymous"></script>
 
 <script>
-  
+// [FalcoAmadeus] apply one clean, consistent theme to every Plotly plot by
+// wrapping newPlot -- keeps transparent backgrounds, light grids, a tidy font,
+// slimmer boxes, an on-hover toolbar and no logo, without touching each call.
+(function(){
+  if (!window.Plotly) return;
+  var FONT={family:'-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif',size:12,color:'#3a4553'};
+  var AX={gridcolor:'#eceff3',zerolinecolor:'#dfe4ea',linecolor:'#cfd6de',ticks:'outside',tickcolor:'#cfd6de',tickfont:{size:11,color:'#697586'},automargin:true};
+  var THEME={paper_bgcolor:'rgba(0,0,0,0)',plot_bgcolor:'rgba(0,0,0,0)',colorway:['#0072b2','#e69f00','#009e73','#d55e00','#56b4e9','#cc79a7','#111111'],boxgap:0.28,boxgroupgap:0.2,legend:{borderwidth:0}};
+  var CFG={displaylogo:false,responsive:true,displayModeBar:'hover',modeBarButtonsToRemove:['select2d','lasso2d','autoScale2d','toggleSpikelines','hoverClosestCartesian','hoverCompareCartesian']};
+  var orig=Plotly.newPlot;
+  Plotly.newPlot=function(id,data,layout,config){
+    layout=layout||{};
+    var L=Object.assign({},THEME,layout);
+    L.font=Object.assign({},FONT,layout.font);
+    L.xaxis=Object.assign({},AX,layout.xaxis);
+    L.yaxis=Object.assign({},AX,layout.yaxis);
+    L.margin=Object.assign({t:12,r:18,b:54,l:60},layout.margin);
+    return orig.call(Plotly,id,data,L,Object.assign({},CFG,config));
+  };
+})();
+
 if (document.getElementById('seqbasequalityboxplot') !== null) {
   Plotly.newPlot('seqbasequalityboxplot', [
    {{perbasesequencequalitydata}}
@@ -458,23 +483,42 @@ if (document.getElementById('kmerlineplot') !== null) {
 // [FalcoAmadeus] make each module collapsible (click its header to toggle).
 // Runs after the plots are drawn, so every plot renders at full width first.
 (function(){
-  var mods = document.querySelectorAll('div.module');
+  var BASE="https://www.bioinformatics.babraham.ac.uk/projects/fastqc/Help/3%20Analysis%20Modules/";
+  var INFO={
+   basicstatistics:["Summary counts for the file - total reads, read-length range, %GC and the inferred quality encoding. Check these match what you expect for the library.","1%20Basic%20Statistics.html"],
+   perbasesequencequality:["Box plots of the quality score at each base position. Quality usually declines toward the end of the read; medians in the low range mean you should consider quality trimming.","2%20Per%20Base%20Sequence%20Quality.html"],
+   persequencequalityscores:["Distribution of the mean quality per read. One peak at high quality is good; a low-quality shoulder means a subset of reads is poor.","3%20Per%20Sequence%20Quality%20Scores.html"],
+   perbasesequencecontent:["Proportion of A/C/G/T at each position - expected flat and parallel for random libraries. Strong bias (often at the read start) is normal for RNA-seq, amplicon and bisulfite data; see the --assay option.","4%20Per%20Base%20Sequence%20Content.html"],
+   persequencegccontent:["Observed GC distribution across reads versus a modeled normal. A shifted or bimodal curve can mean contamination, or is expected for bisulfite and targeted libraries.","5%20Per%20Sequence%20GC%20Content.html"],
+   perbasencontent:["Percentage of ambiguous N base calls per position. More than a fraction of a percent, especially if localized, indicates a sequencing issue.","6%20Per%20Base%20N%20Content.html"],
+   sequencelengthdistribution:["Distribution of read lengths. A single length is typical of untrimmed Illumina reads; a spread is expected after trimming or for small-RNA / long-read libraries.","7%20Sequence%20Length%20Distribution.html"],
+   sequenceduplicationlevels:["Fraction of reads seen more than once - a proxy for PCR/optical duplication and library complexity. High duplication is expected for amplicon, small-RNA and highly-expressed RNA-seq. For paired-end data use the paired report; single-end overcounts.","8%20Duplicate%20Sequences.html"],
+   overrepresentedsequences:["Individual sequences that make up an unusually large share of the library - often adapters or contaminants, or (expected) the amplicons/miRNAs themselves.","9%20Overrepresented%20Sequences.html"],
+   adaptercontent:["Cumulative fraction of reads containing known adapters by position. A rise near the read end means adapter read-through - trim before downstream analysis.","10%20Adapter%20Content.html"],
+   kmercontent:["Positional enrichment of short k-mers. Spikes flag adapters, primers or other position-specific sequence bias.","11%20Kmer%20Content.html"],
+   pertilesequencequality:["Quality deviation per flow-cell tile relative to the run average. Persistent blue/red bands flag a localized sequencing problem on specific tiles.","12%20Per%20Tile%20Sequence%20Quality.html"]
+  };
+  var mods=document.querySelectorAll("div.module");
   mods.forEach(function(m){
-    var h = m.querySelector('h2');
-    if (!h) return;
-    h.classList.add('collapsible');
-    h.addEventListener('click', function(){ m.classList.toggle('collapsed'); });
+    var h=m.querySelector("h2"); if(!h) return;
+    var info=INFO[h.id];
+    if(info){
+      var p=document.createElement("p"); p.className="module-desc";
+      p.innerHTML=info[0]+" <a href='"+BASE+info[1]+"' target='_blank' rel='noopener'>FastQC help ↗</a>";
+      h.parentNode.insertBefore(p,h.nextSibling);
+    }
+    h.classList.add("collapsible");
+    h.addEventListener("click",function(){ m.classList.toggle("collapsed"); });
   });
-  var sum = document.querySelector('div.summary h2');
-  if (sum) {
-    var btn = document.createElement('a');
-    btn.className = 'toggle-all'; btn.textContent = 'collapse all';
-    btn.addEventListener('click', function(){
-      var collapse = btn.textContent === 'collapse all';
-      mods.forEach(function(m){ m.classList.toggle('collapsed', collapse); });
-      btn.textContent = collapse ? 'expand all' : 'collapse all';
+  var sum=document.querySelector("div.summary h2");
+  if(sum){
+    var btn=document.createElement("a"); btn.className="toggle-all"; btn.textContent="collapse all";
+    btn.addEventListener("click",function(){
+      var collapse=btn.textContent==="collapse all";
+      mods.forEach(function(m){ m.classList.toggle("collapsed",collapse); });
+      btn.textContent=collapse?"expand all":"collapse all";
     });
-    sum.parentNode.insertBefore(btn, sum.nextSibling);
+    sum.parentNode.insertBefore(btn,sum.nextSibling);
   }
 })();
 

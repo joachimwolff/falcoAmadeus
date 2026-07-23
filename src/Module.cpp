@@ -776,18 +776,24 @@ ModulePerBaseSequenceQuality::make_html_data() {
     else
       data << base_groups[i].start + 1 << "-" << base_groups[i].end + 1;
     data << "bp', ";
-    data << "marker : {color : '";
-
-    // I will color the boxplot based on whether it passed or failed
+    // colour by pass/warn/fail, with a soft fill and a crisp outline
+    const char *fillc, *linec;
     if (group_median[i] < base_median_error ||
-        group_lquartile[i] < base_lower_error)
-      data << "red";
+        group_lquartile[i] < base_lower_error) {
+      fillc = "rgba(214,69,69,0.35)";
+      linec = "rgb(192,57,43)";
+    }
     else if (group_median[i] < base_median_warn ||
-             group_lquartile[i] < base_lower_warn)
-      data << "yellow";
-    else
-      data << "green";
-    data << "'}}";
+             group_lquartile[i] < base_lower_warn) {
+      fillc = "rgba(214,155,0,0.35)";
+      linec = "rgb(176,125,10)";
+    }
+    else {
+      fillc = "rgba(26,158,95,0.32)";
+      linec = "rgb(21,148,87)";
+    }
+    data << "fillcolor : '" << fillc << "', line : {color : '" << linec
+         << "', width : 1.4}, marker : {color : '" << linec << "'}}";
     if (i < num_bases - 1) {
       data << ", ";
     }
