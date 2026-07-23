@@ -763,41 +763,40 @@ ModulePerBaseSequenceQuality::write_module(std::ostream &os) {
 // Plotly data
 std::string
 ModulePerBaseSequenceQuality::make_html_data() {
-  std::ostringstream data;
+  // Render as clean percentile bands (10-90% and the 25-75% IQR) with a median
+  // line rather than one box glyph per position: far less cluttered than a wall
+  // of boxes, and an honest depiction of the quantile summary we store.
+  std::ostringstream x, med, ud, ld, uq, lq;
   for (std::size_t i = 0; i < num_groups; ++i) {
-    data << "{y : [";
-
-    data << group_ldecile[i] << ", " << group_lquartile[i] << ", "
-         << group_median[i] << ", " << group_uquartile[i] << ", "
-         << group_udecile[i] << "], ";
-    data << "type : 'box', name : ' ";
-    if (base_groups[i].start == base_groups[i].end)
-      data << base_groups[i].start + 1;
-    else
-      data << base_groups[i].start + 1 << "-" << base_groups[i].end + 1;
-    data << "bp', ";
-    // colour by pass/warn/fail, with a soft fill and a crisp outline
-    const char *fillc, *linec;
-    if (group_median[i] < base_median_error ||
-        group_lquartile[i] < base_lower_error) {
-      fillc = "rgba(214,69,69,0.35)";
-      linec = "rgb(192,57,43)";
+    if (i) {
+      x << ","; med << ","; ud << ","; ld << ","; uq << ","; lq << ",";
     }
-    else if (group_median[i] < base_median_warn ||
-             group_lquartile[i] < base_lower_warn) {
-      fillc = "rgba(214,155,0,0.35)";
-      linec = "rgb(176,125,10)";
-    }
-    else {
-      fillc = "rgba(26,158,95,0.32)";
-      linec = "rgb(21,148,87)";
-    }
-    data << "fillcolor : '" << fillc << "', line : {color : '" << linec
-         << "', width : 1.4}, marker : {color : '" << linec << "'}}";
-    if (i < num_bases - 1) {
-      data << ", ";
-    }
+    // representative (1-based) base position: midpoint of the group
+    const double pos = (base_groups[i].start + base_groups[i].end) / 2.0 + 1.0;
+    x << pos;
+    med << group_median[i];
+    ud << group_udecile[i];
+    ld << group_ldecile[i];
+    uq << group_uquartile[i];
+    lq << group_lquartile[i];
   }
+  const std::string xs = x.str();
+  std::ostringstream data;
+  // outer 10-90% band: an invisible upper line, then the lower line fills up
+  data << "{x:[" << xs << "],y:[" << ud.str()
+       << "],mode:'lines',line:{width:0},hoverinfo:'skip',showlegend:false},";
+  data << "{x:[" << xs << "],y:[" << ld.str()
+       << "],mode:'lines',line:{width:0},fill:'tonexty',"
+          "fillcolor:'rgba(11,107,203,0.14)',name:'10-90%',hoverinfo:'skip'},";
+  // inner 25-75% IQR band
+  data << "{x:[" << xs << "],y:[" << uq.str()
+       << "],mode:'lines',line:{width:0},hoverinfo:'skip',showlegend:false},";
+  data << "{x:[" << xs << "],y:[" << lq.str()
+       << "],mode:'lines',line:{width:0},fill:'tonexty',"
+          "fillcolor:'rgba(11,107,203,0.34)',name:'25-75% (IQR)',hoverinfo:'skip'},";
+  // median line
+  data << "{x:[" << xs << "],y:[" << med.str()
+       << "],mode:'lines',line:{width:2.2,color:'#0b6bcb'},name:'median'}";
   return data.str();
 }
 
