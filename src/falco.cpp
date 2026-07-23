@@ -4,6 +4,8 @@
  *                         Andrew D. Smith
  * Authors: Guilherme De Sena Brandine, Andrew Smith, and Masaru Nakajima
  *
+ * FalcoAmadeus fork modifications Copyright (C) 2026 Joachim Wolff
+ *
  * This program is free software: you can redistribute it and/or
  * modify it under the terms of the GNU General Public License as
  * published by the Free Software Foundation, either version 3 of the
@@ -27,11 +29,18 @@
 
 #include "config.h"
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <string>
 #include <vector>
+#include <array>
+#include <unordered_map>
+#include <stdexcept>
+
+#include <zlib.h>
 
 // Function to get seconds elapsed in program
 static std::size_t
@@ -166,7 +175,11 @@ write_results(const FalcoConfig &falco_config, FastqStats &stats,
       log_process("Writing text report to " + qc_data_file);
 
     // put header
-    qc_data_txt << "##Falco\t" + std::string{VERSION} + "\n";
+    qc_data_txt << "##FalcoAmadeus\t" + std::string{VERSION} + "\n";
+    // [FalcoAmadeus] echo the active assay (only when non-default, so generic
+    // output stays byte-identical).
+    if (!falco_config.assay.empty() && falco_config.assay != "generic")
+      qc_data_txt << "##Assay\t" << falco_config.assay << "\n";
     if (do_call)
       qc_data_txt << "##Call\t" << falco_config.call << "\n";
   }
@@ -266,6 +279,423 @@ write_results(const FalcoConfig &falco_config, FastqStats &stats,
     html << html_maker.html_boilerplate;
 }
 
+/*********************************************************************
+ ****************** PAIRED-END DUPLICATION (FalcoAmadeus) *************
+ *********************************************************************/
+// falco/FastQC deduplicate each mate file independently, which overcounts PCR
+// duplication for paired-end data: two distinct fragments that share the same
+// R1 prefix (very common after the 50bp truncation) get miscounted as
+// duplicates. A read PAIR is a true duplicate only if BOTH mates match. This
+// opt-in pass runs a lockstep scan over R1 and R2 and writes a corrected
+// paired-end duplication report, reusing falco's own duplication math.
+
+namespace {
+
+// Duplication counter that mirrors StreamReader::postprocess_fastq_record
+// exactly (same stop-at-100k-unique-keys and count_at_limit bookkeeping), so
+// the numbers stay consistent with the single-end module. num_reads is
+// incremented AFTER the counting logic, matching the single-end code where
+// stats.num_reads is bumped only after postprocess runs.
+struct PairedDupCounter {
+  std::unordered_map<std::string, std::size_t> sequence_count;
+  std::size_t num_reads = 0;
+  std::size_t num_unique_seen = 0;
+  std::size_t count_at_limit = 0;
+  bool continue_storing = true;
+
+  void
+  add(const std::string &key) {
+    const auto it = sequence_count.find(key);
+    if (it == sequence_count.end()) {
+      if (continue_storing) {
+        sequence_count.emplace(key, 1);
+        count_at_limit = num_reads;
+        ++num_unique_seen;
+        if (num_unique_seen == Constants::unique_reads_stop_counting)
+          continue_storing = false;
+      }
+    }
+    else {
+      ++it->second;
+      count_at_limit += continue_storing;
+    }
+    ++num_reads;
+  }
+};
+
+// Corrected duplication-level distribution, reusing the exact computation from
+// ModuleSequenceDuplicationLevels::summarize_module (Module.cpp), including the
+// size_t truncation of the corrected counts, so results match falco's module.
+struct DupResult {
+  double total_deduplicated_pct = 0.0;
+  std::array<double, 16> percentage_deduplicated{};
+  std::array<double, 16> percentage_total{};
+};
+
+DupResult
+summarize_dup(const PairedDupCounter &c) {
+  DupResult r;
+  double seq_total = 0.0;
+  double seq_dedup = 0.0;
+
+  // Key is frequency (r), value is number of sequences seen with that frequency
+  std::unordered_map<std::size_t, std::size_t> counts_by_freq;
+  for (const auto &v : c.sequence_count)
+    counts_by_freq[v.second]++;
+
+  // FastQC corrected extrapolation (note: stored back into a size_t map, so the
+  // double is truncated - this matches summarize_module byte-for-byte)
+  for (auto v : counts_by_freq)
+    counts_by_freq[v.first] =
+      get_corrected_count(c.count_at_limit, c.num_reads, v.first, v.second);
+
+  for (auto v : counts_by_freq) {
+    std::size_t dup_slot = v.first - 1;
+    if (v.first >= 10000)
+      dup_slot = 15;
+    else if (v.first >= 5000)
+      dup_slot = 14;
+    else if (v.first >= 1000)
+      dup_slot = 13;
+    else if (v.first >= 500)
+      dup_slot = 12;
+    else if (v.first >= 100)
+      dup_slot = 11;
+    else if (v.first >= 50)
+      dup_slot = 10;
+    else if (v.first >= 10)
+      dup_slot = 9;
+
+    r.percentage_deduplicated[dup_slot] += v.second;
+    r.percentage_total[dup_slot] += v.second * v.first;
+
+    seq_total += v.second * v.first;
+    seq_dedup += v.second;
+  }
+
+  r.total_deduplicated_pct = 100.0 * seq_dedup / std::max(1.0, seq_total);
+
+  for (auto &v : r.percentage_deduplicated)
+    v = 100.0 * v / std::max(1.0, seq_dedup);
+  for (auto &v : r.percentage_total)
+    v = 100.0 * v / std::max(1.0, seq_total);
+
+  return r;
+}
+
+// Minimal FASTQ reader over zlib. gzopen/gzgets transparently handle both plain
+// and gzipped input, so a single path covers .fastq and .fastq.gz.
+struct GzFastqPairReader {
+  gzFile fp = nullptr;
+  std::string filename;
+  std::vector<char> buf;
+
+  explicit GzFastqPairReader(const std::string &fn) :
+    filename(fn), buf(1 << 16) {
+    fp = gzopen(fn.c_str(), "rb");
+    if (fp == nullptr)
+      throw std::runtime_error("cannot open paired-end input file: " + fn);
+  }
+  ~GzFastqPairReader() {
+    if (fp != nullptr)
+      gzclose(fp);
+  }
+  GzFastqPairReader(const GzFastqPairReader &) = delete;
+  GzFastqPairReader &operator=(const GzFastqPairReader &) = delete;
+
+  // Reads one line into out (without trailing \r/\n). Returns false at EOF.
+  bool
+  read_line(std::string &out) {
+    out.clear();
+    bool got_any = false;
+    while (true) {
+      if (gzgets(fp, buf.data(), static_cast<int>(buf.size())) == nullptr)
+        return got_any;
+      got_any = true;
+      out.append(buf.data());
+      if (!out.empty() && out.back() == '\n') {
+        out.pop_back();
+        if (!out.empty() && out.back() == '\r')
+          out.pop_back();
+        return true;
+      }
+      // line longer than buffer: keep appending
+    }
+  }
+
+  // Reads one FASTQ record, returning the (untruncated) sequence in seq.
+  // Returns false cleanly at end of file; throws on a truncated record.
+  bool
+  next_sequence(std::string &seq) {
+    std::string header, plus, qual;
+    if (!read_line(header)) {
+      if (gzeof(fp))
+        return false;
+      throw std::runtime_error("read error in file: " + filename);
+    }
+    // tolerate blank line(s) at end of file (a FASTQ header is never empty)
+    if (header.empty())
+      return false;
+    if (!read_line(seq) || !read_line(plus) || !read_line(qual))
+      throw std::runtime_error("truncated FASTQ record in file: " + filename);
+    return true;
+  }
+};
+
+void
+run_paired_duplication(const std::string &r1_file, const std::string &r2_file,
+                       const std::string &out_file, const bool quiet) {
+  GzFastqPairReader r1(r1_file);
+  GzFastqPairReader r2(r2_file);
+
+  PairedDupCounter pair_ctr;  // correct: key = R1_trunc \0 R2_trunc
+  PairedDupCounter r1_ctr;    // naive single-end estimate on R1 only
+  PairedDupCounter r2_ctr;    // naive single-end estimate on R2 only
+
+  std::string s1, s2, k1, k2, pair_key;
+  std::size_t num_pairs = 0;
+  while (true) {
+    const bool got1 = r1.next_sequence(s1);
+    const bool got2 = r2.next_sequence(s2);
+    if (got1 != got2)
+      throw std::runtime_error(
+        "paired-end inputs have different numbers of reads: " + r1_file +
+        " and " + r2_file);
+    if (!got1)
+      break;
+
+    k1.assign(s1, 0, get_truncate_point(s1.size()));
+    k2.assign(s2, 0, get_truncate_point(s2.size()));
+    pair_key.clear();
+    pair_key.append(k1);
+    pair_key.push_back('\0');
+    pair_key.append(k2);
+
+    pair_ctr.add(pair_key);
+    r1_ctr.add(k1);
+    r2_ctr.add(k2);
+    ++num_pairs;
+  }
+
+  const DupResult pe = summarize_dup(pair_ctr);
+  const DupResult n1 = summarize_dup(r1_ctr);
+  const DupResult n2 = summarize_dup(r2_ctr);
+
+  std::ofstream os(out_file, std::ofstream::binary);
+  if (!os.good())
+    throw std::runtime_error("Failed to create paired duplication file: " +
+                             out_file);
+
+  os << "##FalcoAmadeus-PairedDuplication\t" << std::string{VERSION} << "\n";
+  os << "Read1 file\t" << r1_file << "\n";
+  os << "Read2 file\t" << r2_file << "\n";
+  os << "Total read pairs\t" << num_pairs << "\n";
+
+  // Explicit PCR-duplicate rate (= 100 - deduplicated%); LOWER is better. The
+  // paired value is the correct one; the naive single-end values OVERESTIMATE
+  // duplication because they collapse fragments that share only one mate. (The
+  // FastQC-style "Total Deduplicated Percentage" below -- the fraction of reads
+  // that are UNIQUE, i.e. 100 - duplicate rate -- is reported for compatibility.)
+  os << "#PCR duplicate rate (%), lower is better:\n";
+  os << "Paired-end (correct)\t" << (100.0 - pe.total_deduplicated_pct) << "\n";
+  os << "Naive Read1-only (overestimate)\t"
+     << (100.0 - n1.total_deduplicated_pct) << "\n";
+  os << "Naive Read2-only (overestimate)\t"
+     << (100.0 - n2.total_deduplicated_pct) << "\n";
+
+  os << "#Paired-end (correct) Total Deduplicated Percentage\t"
+     << pe.total_deduplicated_pct << "\n";
+  os << "#Duplication Level\tPercentage of deduplicated\t"
+     << "Percentage of total\n";
+  static const char *labels[16] = {"1",   "2",   "3",    "4",   "5",  "6",
+                                    "7",   "8",   "9",    ">10", ">50", ">100",
+                                    ">500", ">1k", ">5k", ">10k+"};
+  for (std::size_t i = 0; i < 16; ++i)
+    os << labels[i] << "\t" << pe.percentage_deduplicated[i] << "\t"
+       << pe.percentage_total[i] << "\n";
+
+  // Note: this paired pass always scans every pair, so these naive figures use
+  // read_step == 1 even if --subsample was set for the single-end run; they are
+  // a like-for-like comparison against the paired estimate above.
+  os << "#Naive single-end estimates (overcount PCR duplication):\n";
+  os << "Read1-only Total Deduplicated Percentage\t" << n1.total_deduplicated_pct
+     << "\n";
+  os << "Read2-only Total Deduplicated Percentage\t" << n2.total_deduplicated_pct
+     << "\n";
+
+  if (!quiet)
+    std::cerr << "[paired-end duplication] wrote " << out_file << " ("
+              << num_pairs << " pairs)\n";
+}
+
+}  // namespace
+
+// Case-insensitive check that `s` ends with `suf`.
+static bool
+ci_ends_with(const std::string &s, const std::string &suf) {
+  if (suf.size() > s.size())
+    return false;
+  const std::size_t off = s.size() - suf.size();
+  for (std::size_t i = 0; i < suf.size(); ++i)
+    if (std::tolower(static_cast<unsigned char>(s[off + i])) !=
+        std::tolower(static_cast<unsigned char>(suf[i])))
+      return false;
+  return true;
+}
+
+// Strip a trailing gzip and/or FASTQ extension from a basename
+// (e.g. "s_R1.fastq.gz" -> "s_R1", "s.fq" -> "s"). Case-insensitive.
+static std::string
+strip_fastq_ext(std::string s) {
+  if (ci_ends_with(s, ".gz"))
+    s.erase(s.size() - 3);
+  if (ci_ends_with(s, ".fastq"))
+    s.erase(s.size() - 6);
+  else if (ci_ends_with(s, ".fq"))
+    s.erase(s.size() - 3);
+  return s;
+}
+
+// Strip a trailing mate token (_R1/_1/.R1/.1 and the R2/2 variants) from an
+// extension-stripped basename. Returns true if a token was removed. Tokens
+// require a leading separator so a bare "R1" is left untouched.
+static bool
+strip_mate_token(std::string &s) {
+  static const char *tokens[] = {"_R1", "_R2", ".R1", ".R2",
+                                  "_1",  "_2",  ".1",  ".2"};
+  for (const auto *t : tokens) {
+    const std::string tok(t);
+    if (s.size() > tok.size() && ci_ends_with(s, tok)) {
+      s.erase(s.size() - tok.size());
+      return true;
+    }
+  }
+  return false;
+}
+
+// [FalcoAmadeus] Derive the output-subdir stems for the two mates. Preferred:
+// a common sample stem from the R1 basename (extension + mate token stripped),
+// shared by both mates -> "<stem>_forward" / "<stem>_reverse". If R1 carries no
+// recognisable mate token, fall back to each mate's own extension-stripped
+// basename so the names still reflect the real files.
+static void
+derive_mate_stems(const std::string &r1_file, const std::string &r2_file,
+                  std::string &fwd_stem, std::string &rev_stem) {
+  const std::string e1 =
+    strip_fastq_ext(std::filesystem::path(r1_file).filename().string());
+  const std::string e2 =
+    strip_fastq_ext(std::filesystem::path(r2_file).filename().string());
+  std::string stem = e1;
+  if (strip_mate_token(stem) && !stem.empty()) {
+    fwd_stem = stem + "_forward";
+    rev_stem = stem + "_reverse";
+  }
+  else {
+    fwd_stem = e1 + "_forward";
+    rev_stem = e2 + "_reverse";
+  }
+}
+
+// [FalcoAmadeus] Analyze one sequence file end-to-end and write its three
+// standard outputs (fastqc_data.txt, summary.txt, fastqc_report.html) into
+// `out_dir` with `file_prefix`. Factored out of the main loop so paired mode
+// can run the identical single-file pipeline once per mate without duplicating
+// the module pipeline. `display_suffix` (e.g. " (forward)") is appended to the
+// internal Filename field ONLY, keeping the real basename while giving MultiQC
+// an unambiguous sample name. `forbid_sam_bam` rejects a SAM/BAM input (used in
+// paired mode, which is FASTQ-only).
+static void
+analyze_and_write(FalcoConfig &falco_config, const std::string &filename,
+                  const std::string &forced_file_format,
+                  const std::string &out_dir, const std::string &file_prefix,
+                  const std::string &summary_filename,
+                  const std::string &data_filename,
+                  const std::string &report_filename, const bool skip_text,
+                  const bool skip_html, const bool skip_short_summary,
+                  const bool do_call, const bool forbid_sam_bam,
+                  const std::string &display_suffix) {
+  falco_config.filename = filename;
+
+  // if format was not provided, we have to guess it by the filename
+  falco_config.format = forced_file_format;
+
+  /****************** BEGIN PROCESSING CONFIG ******************/
+  // define file type, read limits, adapters, contaminants and fail
+  // early if any of the required files is not present
+  falco_config.setup();
+
+  // [FalcoAmadeus] fail fast: --paired-with only supports FASTQ; reject a
+  // SAM/BAM input here (format is known after setup) before writing any output.
+  if (forbid_sam_bam && (falco_config.is_sam || falco_config.is_bam))
+    throw std::runtime_error(
+      "--paired-with only supports FASTQ/FASTQ.gz inputs; the R1 file "
+      "was detected as SAM/BAM which is out of scope for v1.");
+
+  // [FalcoAmadeus] tag the internal Filename (report label / MultiQC sample
+  // name only); the real basename is preserved as the prefix of this string.
+  if (!display_suffix.empty())
+    falco_config.filename_stripped += display_suffix;
+
+  /****************** END PROCESSING CONFIG *******************/
+  if (!falco_config.quiet)
+    log_process("Started reading file " + falco_config.filename);
+  FastqStats stats;  // allocate all space to summarize data
+
+  // Initializes a reader given the file format
+  if (falco_config.is_sam) {
+    if (!falco_config.quiet)
+      log_process("reading file as SAM format");
+    SamReader in(falco_config, stats.SHORT_READ_THRESHOLD);
+    read_stream_into_stats(in, stats, falco_config);
+    stats.adjust_tile_maps_len();
+  }
+#ifdef USE_HTS
+  else if (falco_config.is_bam) {
+    if (!falco_config.quiet)
+      log_process("reading file as BAM format");
+    BamReader in(falco_config, stats.SHORT_READ_THRESHOLD);
+    read_stream_into_stats(in, stats, falco_config);
+    stats.adjust_tile_maps_len();
+  }
+#endif
+
+  else if (falco_config.is_fastq_gz) {
+    if (!falco_config.quiet)
+      log_process("reading file as gzipped FASTQ format");
+    // multi-threaded parser: background inflate + parallel per-read stats,
+    // byte-identical to single-threaded. Only for read_step == 1; the
+    // subsampling counter logic is left to the serial path otherwise.
+    if (falco_config.threads >= 2 && falco_config.read_step == 1) {
+      read_gz_parallel(falco_config, stats, falco_config.threads);
+    }
+    else {
+      GzFastqReader in(falco_config, stats.SHORT_READ_THRESHOLD);
+      read_stream_into_stats(in, stats, falco_config);
+    }
+  }
+  else if (falco_config.is_fastq) {
+    if (!falco_config.quiet)
+      log_process("reading file as uncompressed FASTQ format");
+    FastqReader in(falco_config, stats.SHORT_READ_THRESHOLD);
+    read_stream_into_stats(in, stats, falco_config);
+  }
+  else {
+    throw std::runtime_error("Cannot recognize file format for file " +
+                             falco_config.filename);
+  }
+
+  if (!falco_config.quiet) {
+    log_process("Finished reading file");
+  }
+
+  stats.summarize();
+
+  // Write results
+  write_results(falco_config, stats, skip_text, skip_html, skip_short_summary,
+                do_call, file_prefix, out_dir, summary_filename, data_filename,
+                report_filename);
+}
+
 int
 main(int argc, char *argv[]) {
 
@@ -298,6 +728,9 @@ main(int argc, char *argv[]) {
     std::string data_filename = "";
     std::string report_filename = "";
     std::string summary_filename = "";
+
+    // [FalcoAmadeus] optional R2 file for corrected paired-end duplication
+    std::string paired_with_file = "";
 
     /****************** COMMAND LINE OPTIONS ********************/
     OptionParser opt_parse(argv[0],
@@ -403,12 +836,11 @@ main(int argc, char *argv[]) {
                       false, forced_file_format);
 
     opt_parse.add_opt("-threads", 't',
-                      "[NOT YET IMPLEMENTED IN FALCO] "
-                      "Specifies the number of files which can be processed "
-                      "simultaneously.  Each thread will be allocated 250MB of "
-                      "memory so you shouldn't run more threads than your "
-                      "available memory will cope with, and not more than "
-                      "6 threads on a 32 bit machine",
+                      "[FalcoAmadeus] Number of threads. With 2 or more, "
+                      "gzipped input is decompressed on a background thread "
+                      "while the reads are parsed, overlapping the two. Output "
+                      "is byte-identical to single-threaded (-t 1, the "
+                      "default).",
                       false, falco_config.threads);
 
     opt_parse.add_opt(
@@ -482,10 +914,30 @@ main(int argc, char *argv[]) {
       false, falco_config.is_bisulfite);
 
     opt_parse.add_opt(
+      "conversion-residual", '\0',
+      "[FalcoAmadeus] For methylation assays (--assay wgbs/emseq/rrbs): "
+      "residual unmethylated-base fraction (0-1) above which a possible "
+      "incomplete-conversion warning is emitted. Heuristic only; the "
+      "authoritative check is the post-alignment non-CpG conversion rate.",
+      false, falco_config.conversion_residual);
+
+    opt_parse.add_opt(
       "reverse-complement", 'r',
       "[Falco only] The input is a reverse-complement. All modules will "
       "be tested by swapping A/T and C/G",
       false, falco_config.is_reverse_complement);
+
+    opt_parse.add_opt(
+      "-assay", '\0',
+      "[FalcoAmadeus] Assay/library-type-aware grading. FastQC/falco grade "
+      "against a whole-genome-shotgun null and mis-flag expected assay biology "
+      "as failures; this relaxes ONLY the affected modules per library type "
+      "(reported data are unchanged; only pass/warn/fail plus explanatory "
+      "#Assay comments). Valid: " +
+        valid_assay_list() +
+        ". Default 'generic' is byte-identical to stock falco. wgbs/emseq/rrbs "
+        "imply bisulfite handling.",
+      false, falco_config.assay);
 
     opt_parse.add_opt("skip-data", '\0',
                       "[Falco only] Do not create FastQC data text file.",
@@ -542,6 +994,16 @@ main(int argc, char *argv[]) {
                       "[Falco only] Report a progress bar while running.",
                       false, falco_config.progress);
 
+    opt_parse.add_opt(
+      "-paired-with", '\0',
+      "[FalcoAmadeus] Path to the mate (R2) FASTQ/FASTQ.gz file. The primary "
+      "positional input is treated as R1 and analysed single-end exactly as "
+      "usual; ADDITIONALLY a lockstep pass over R1+R2 writes a corrected "
+      "paired-end PCR-duplication report to <outdir>/<prefix>paired_duplication"
+      ".txt. A pair is a duplicate only if BOTH mates match, avoiding the "
+      "overcounting of naive single-end dedup. SAM/BAM not supported.",
+      false, paired_with_file);
+
     std::vector<std::string> leftover_args;
     opt_parse.parse(argc, argv, leftover_args);
     if (argc == 1 || opt_parse.help_requested()) {
@@ -567,6 +1029,19 @@ main(int argc, char *argv[]) {
       return EXIT_SUCCESS;
     }
 
+    // [FalcoAmadeus] validate --assay (case-insensitive) before doing any work.
+    std::transform(std::begin(falco_config.assay), std::end(falco_config.assay),
+                   std::begin(falco_config.assay),
+                   [](const unsigned char c) { return std::tolower(c); });
+    {
+      AssayProfile assay_probe;
+      if (!get_assay_profile(falco_config.assay, assay_probe)) {
+        std::cerr << "ERROR: unknown --assay '" << falco_config.assay
+                  << "'. Valid assay types: " << valid_assay_list() << '\n';
+        return EXIT_FAILURE;
+      }
+    }
+
     if (std::size(leftover_args) > 1 &&
         (!summary_filename.empty() || !report_filename.empty() ||
          !data_filename.empty())) {
@@ -576,6 +1051,21 @@ main(int argc, char *argv[]) {
                 << " require multiple outputs, so they will be resolved by"
                 << " the input filenames instead\n";
       return EXIT_FAILURE;
+    }
+
+    // [FalcoAmadeus] --paired-with requires exactly one R1 input file
+    if (!paired_with_file.empty()) {
+      if (std::size(leftover_args) != 1) {
+        std::cerr << "ERROR: --paired-with requires exactly one positional "
+                  << "input file (the R1 file); got " << std::size(leftover_args)
+                  << ".\n";
+        return EXIT_FAILURE;
+      }
+      if (!std::filesystem::exists(paired_with_file)) {
+        std::cerr << "ERROR: --paired-with file does not exist: "
+                  << paired_with_file << '\n';
+        return EXIT_FAILURE;
+      }
     }
 
     // ADS: make sure all input files are non-empty unless user oks it
@@ -650,69 +1140,11 @@ main(int argc, char *argv[]) {
 
       const auto file_start_time = std::chrono::system_clock::now();
 
-      falco_config.filename = filename;
-
-      // if format was not provided, we have to guess it by the filename
-      falco_config.format = forced_file_format;
-
-      /****************** BEGIN PROCESSING CONFIG ******************/
-      // define file type, read limits, adapters, contaminants and fail
-      // early if any of the required files is not present
-      //
-      falco_config.setup();
-
-      /****************** END PROCESSING CONFIG *******************/
-      if (!falco_config.quiet)
-        log_process("Started reading file " + falco_config.filename);
-      FastqStats stats;  // allocate all space to summarize data
-
-      // Initializes a reader given the file format
-      if (falco_config.is_sam) {
-        if (!falco_config.quiet)
-          log_process("reading file as SAM format");
-        SamReader in(falco_config, stats.SHORT_READ_THRESHOLD);
-        read_stream_into_stats(in, stats, falco_config);
-        stats.adjust_tile_maps_len();
-      }
-#ifdef USE_HTS
-      else if (falco_config.is_bam) {
-        if (!falco_config.quiet)
-          log_process("reading file as BAM format");
-        BamReader in(falco_config, stats.SHORT_READ_THRESHOLD);
-        read_stream_into_stats(in, stats, falco_config);
-        stats.adjust_tile_maps_len();
-      }
-#endif
-
-      else if (falco_config.is_fastq_gz) {
-        if (!falco_config.quiet)
-          log_process("reading file as gzipped FASTQ format");
-        GzFastqReader in(falco_config, stats.SHORT_READ_THRESHOLD);
-        read_stream_into_stats(in, stats, falco_config);
-      }
-      else if (falco_config.is_fastq) {
-        if (!falco_config.quiet)
-          log_process("reading file as uncompressed FASTQ format");
-        FastqReader in(falco_config, stats.SHORT_READ_THRESHOLD);
-        read_stream_into_stats(in, stats, falco_config);
-      }
-      else {
-        throw std::runtime_error("Cannot recognize file format for file " +
-                                 falco_config.filename);
-      }
-
-      if (!falco_config.quiet) {
-        log_process("Finished reading file");
-      }
-
-      stats.summarize();
-
       // if oudir is empty we will set it as the filename path
       std::string cur_outdir;
 
       const std::size_t last_slash_idx = filename.rfind('/');
-      std::string file_basename =
-        falco_config.filename.substr(last_slash_idx + 1);
+      std::string file_basename = filename.substr(last_slash_idx + 1);
       if (outdir.empty()) {
         // if file was given with relative path in the current dir, we set a dot
         if (last_slash_idx == std::string::npos) {
@@ -720,20 +1152,63 @@ main(int argc, char *argv[]) {
           file_basename = filename;
         }
         else {
-          cur_outdir = falco_config.filename.substr(0, last_slash_idx);
+          cur_outdir = filename.substr(0, last_slash_idx);
         }
       }
       else {
         cur_outdir = outdir;
       }
 
-      // Write results
-      const std::string file_prefix = std::size(all_seq_filenames) == 1
-                                        ? std::string{}
-                                        : (file_basename + "_");
-      write_results(falco_config, stats, skip_text, skip_html,
-                    skip_short_summary, do_call, file_prefix, cur_outdir,
-                    summary_filename, data_filename, report_filename);
+      if (paired_with_file.empty()) {
+        // ---- standard single-file path (byte-identical to stock falco) ----
+        const std::string file_prefix = std::size(all_seq_filenames) == 1
+                                           ? std::string{}
+                                           : (file_basename + "_");
+        analyze_and_write(falco_config, filename, forced_file_format,
+                          cur_outdir, file_prefix, summary_filename,
+                          data_filename, report_filename, skip_text, skip_html,
+                          skip_short_summary, do_call, false, std::string{});
+      }
+      else {
+        // ---- [FalcoAmadeus] paired mode: full standard QC on BOTH mates ----
+        // FORWARD = the positional R1 file, REVERSE = the --paired-with R2 file.
+        // Each mate gets the normal three outputs in its own subdirectory so
+        // MultiQC treats them as two samples with the standard file names, then
+        // an extra lockstep pass writes the corrected paired-duplication report
+        // at the top level of the output directory.
+        std::string fwd_stem, rev_stem;
+        derive_mate_stems(filename, paired_with_file, fwd_stem, rev_stem);
+        const std::string fwd_dir = cur_outdir + "/" + fwd_stem;
+        const std::string rev_dir = cur_outdir + "/" + rev_stem;
+
+        std::error_code ec;
+        std::filesystem::create_directories(fwd_dir, ec);
+        if (ec)
+          throw std::runtime_error("Failed to create output directory: " +
+                                   fwd_dir + " (" + ec.message() + ")");
+        std::filesystem::create_directories(rev_dir, ec);
+        if (ec)
+          throw std::runtime_error("Failed to create output directory: " +
+                                   rev_dir + " (" + ec.message() + ")");
+
+        // Standard names within each subdir; custom -D/-R/-S are ignored in
+        // paired mode (two outputs, so single-file names cannot apply).
+        analyze_and_write(falco_config, filename, forced_file_format, fwd_dir,
+                          std::string{}, std::string{}, std::string{},
+                          std::string{}, skip_text, skip_html,
+                          skip_short_summary, do_call, true, " (forward)");
+        analyze_and_write(falco_config, paired_with_file, forced_file_format,
+                          rev_dir, std::string{}, std::string{}, std::string{},
+                          std::string{}, skip_text, skip_html,
+                          skip_short_summary, do_call, true, " (reverse)");
+
+        const std::string paired_out = cur_outdir + "/paired_duplication.txt";
+        if (!falco_config.quiet)
+          log_process("Running paired-end duplication pass with " +
+                      paired_with_file);
+        run_paired_duplication(filename, paired_with_file, paired_out,
+                               falco_config.quiet);
+      }
 
       /************************** TIME SUMMARY *****************************/
       if (!falco_config.quiet)

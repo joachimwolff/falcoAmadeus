@@ -344,6 +344,11 @@ Module::write(std::ostream &os) {
     throw std::runtime_error("Attempted to write module before summarizing : " +
                              module_name);
   os << ">>" << module_name << "\t" << grade << "\n";
+  // [FalcoAmadeus] assay-aware annotations: comment lines (leading '#' is part
+  // of the FastQC format) explaining any grade the active --assay adjusted.
+  // Empty in generic mode, so default output is byte-identical.
+  for (const auto &annotation : assay_annotations)
+    os << annotation << "\n";
   write_module(os);
   os << ">>END_MODULE\n";
 }
@@ -771,18 +776,24 @@ ModulePerBaseSequenceQuality::make_html_data() {
     else
       data << base_groups[i].start + 1 << "-" << base_groups[i].end + 1;
     data << "bp', ";
-    data << "marker : {color : '";
-
-    // I will color the boxplot based on whether it passed or failed
+    // colour by pass/warn/fail, with a soft fill and a crisp outline
+    const char *fillc, *linec;
     if (group_median[i] < base_median_error ||
-        group_lquartile[i] < base_lower_error)
-      data << "red";
+        group_lquartile[i] < base_lower_error) {
+      fillc = "rgba(214,69,69,0.35)";
+      linec = "rgb(192,57,43)";
+    }
     else if (group_median[i] < base_median_warn ||
-             group_lquartile[i] < base_lower_warn)
-      data << "yellow";
-    else
-      data << "green";
-    data << "'}}";
+             group_lquartile[i] < base_lower_warn) {
+      fillc = "rgba(214,155,0,0.35)";
+      linec = "rgb(176,125,10)";
+    }
+    else {
+      fillc = "rgba(26,158,95,0.32)";
+      linec = "rgb(21,148,87)";
+    }
+    data << "fillcolor : '" << fillc << "', line : {color : '" << linec
+         << "', width : 1.4}, marker : {color : '" << linec << "'}}";
     if (i < num_bases - 1) {
       data << ", ";
     }
@@ -1059,6 +1070,20 @@ ModulePerSequenceQualityScores::make_html_data() {
 }
 
 /******************* PER BASE SEQUENCE CONTENT **********************/
+// [FalcoAmadeus] "#Assay(<type>): " prefix for grade-explanation comment lines.
+static inline std::string
+assay_tag(const AssayProfile &assay) {
+  return "#Assay(" + assay.name + "): ";
+}
+
+// [FalcoAmadeus] format a percentage with one decimal place (deterministic).
+static inline std::string
+fmt_pct(const double pct) {
+  std::ostringstream os;
+  os << std::fixed << std::setprecision(1) << pct;
+  return os.str();
+}
+
 const std::string ModulePerBaseSequenceContent::module_name =
   "Per base sequence content";
 ModulePerBaseSequenceContent::ModulePerBaseSequenceContent(
@@ -1069,6 +1094,13 @@ ModulePerBaseSequenceContent::ModulePerBaseSequenceContent(
   sequence_error = sequence_limits.find("error")->second;
   is_bisulfite = config.is_bisulfite;
   is_reverse_complement = config.is_reverse_complement;
+  incomplete_conversion_residual = config.conversion_residual;
+  assay = config.assay_profile;
+  // A methylation assay implies bisulfite-style base-content handling on top of
+  // whatever the user set with --bisulfite. Strand (is_reverse_complement) is
+  // auto-detected per file in summarize_module.
+  if (assay.methylation)
+    is_bisulfite = true;
   do_group = !config.nogroup;
 }
 
@@ -1080,6 +1112,42 @@ ModulePerBaseSequenceContent::summarize_module(FastqStats &stats) {
   max_diff = 0.0;
 
   num_bases = stats.max_read_length;
+
+  // [FalcoAmadeus] Methylation assays: auto-detect the strand role of this file
+  // BEFORE the grading loop, so the bisulfite-aware comparison below uses the
+  // right pair of non-converted bases. A directional bisulfite/EM Read1 (OT) is
+  // C-depleted (C->T); Read2 (OB) is G-depleted (G->A). We pick the role from
+  // the grand-total C vs G composition, and record the residual of the depleted
+  // base for the incomplete-conversion heuristic in make_grade.
+  if (assay.methylation) {
+    double tot_a{}, tot_c{}, tot_g{}, tot_t{};
+    for (std::size_t i = 0; i < num_bases; ++i) {
+      if (i < FastqStats::SHORT_READ_THRESHOLD) {
+        tot_a += stats.base_count[(i << FastqStats::kBitShiftNucleotide)];
+        tot_c += stats.base_count[(i << FastqStats::kBitShiftNucleotide) | 1];
+        tot_t += stats.base_count[(i << FastqStats::kBitShiftNucleotide) | 2];
+        tot_g += stats.base_count[(i << FastqStats::kBitShiftNucleotide) | 3];
+      }
+      else {
+        const std::size_t j = i - FastqStats::SHORT_READ_THRESHOLD;
+        tot_a += stats.long_base_count[(j << FastqStats::kBitShiftNucleotide)];
+        tot_c +=
+          stats.long_base_count[(j << FastqStats::kBitShiftNucleotide) | 1];
+        tot_t +=
+          stats.long_base_count[(j << FastqStats::kBitShiftNucleotide) | 2];
+        tot_g +=
+          stats.long_base_count[(j << FastqStats::kBitShiftNucleotide) | 3];
+      }
+    }
+    const double denom =
+      std::max(std::numeric_limits<double>::min(), tot_a + tot_c + tot_g + tot_t);
+    mean_c_frac = tot_c / denom;
+    mean_g_frac = tot_g / denom;
+    // more-depleted base => that strand's converted base
+    is_reverse_complement = (mean_g_frac < mean_c_frac);  // G-depleted => OB/R2
+    methyl_depleted_base = is_reverse_complement ? 'G' : 'C';
+    methyl_residual = is_reverse_complement ? mean_g_frac : mean_c_frac;
+  }
 
   if (do_group) {
     make_linear_base_groups(base_groups, num_bases);
@@ -1137,15 +1205,23 @@ ModulePerBaseSequenceContent::summarize_module(FastqStats &stats) {
       t_pos =
         100.0 * t_pos / std::max(std::numeric_limits<double>::min(), total_pos);
 
-      if (is_bisulfite) {
-        // for WGBS, we only test non-bisulfite treated bases
-        max_diff =
-          std::max(max_diff, is_reverse_complement ? std::fabs(c_pos - t_pos)
-                                                   : std::fabs(a_pos - g_pos));
-        continue;
+      // [FalcoAmadeus] "MASK positions 1..N": ignore the leading N positions
+      // when grading (5' motif bias from random hexamers / Tn5 / MspI). The
+      // reported data table is unchanged; only max_diff (the grade input) is.
+      // mask_per_base == 0 (generic) leaves this branch always taken, so the
+      // default result is byte-identical.
+      if (i >= assay.mask_per_base) {
+        if (is_bisulfite) {
+          // for WGBS, we only test non-bisulfite treated bases
+          max_diff =
+            std::max(max_diff, is_reverse_complement ? std::fabs(c_pos - t_pos)
+                                                     : std::fabs(a_pos - g_pos));
+        }
+        else {
+          max_diff = std::max(max_diff, std::max(std::fabs(a_pos - t_pos),
+                                                 std::fabs(c_pos - g_pos)));
+        }
       }
-      max_diff = std::max(
-        max_diff, std::max(std::fabs(a_pos - t_pos), std::fabs(c_pos - g_pos)));
     }
 
     // turns above values to percent
@@ -1169,6 +1245,56 @@ ModulePerBaseSequenceContent::make_grade() {
   }
   else if (max_diff > sequence_warn) {
     grade = "warn";
+  }
+
+  // [FalcoAmadeus] assay-aware adjustments. generic == stock behavior.
+  if (assay.name == "generic")
+    return;
+
+  const std::string tag = assay_tag(assay);
+
+  if (assay.methylation) {
+    // The bisulfite-aware max_diff above already EXCLUDES the expected C->T (or
+    // G->A) depletion (it compares only non-converted bases), so a proper
+    // library grades PASS naturally. Annotate the expected depletion, then
+    // apply the incomplete-conversion heuristic.
+    const std::string role =
+      is_reverse_complement ? "G->A Read2" : "C->T Read1";
+    assay_annotations.push_back(
+      tag + "bisulfite/EM library: " + role + " depletion expected");
+
+    if (methyl_residual > incomplete_conversion_residual) {
+      const std::string base(1, methyl_depleted_base);
+      assay_annotations.push_back(
+        tag + "possible incomplete bisulfite conversion (residual " + base +
+        " " + fmt_pct(100.0 * methyl_residual) + "% > " +
+        fmt_pct(100.0 * incomplete_conversion_residual) +
+        "%); verify with CHH/spike-in conversion rate downstream");
+      // soft-flag only; NEVER hard-FAIL on a raw-read conversion estimate.
+      if (grade == "pass")
+        grade = "warn";
+    }
+    return;
+  }
+
+  if (assay.suppress_per_base) {
+    // primer/adapter-locked composition is expected; never warn/fail.
+    if (grade != "pass") {
+      grade = "pass";
+      assay_annotations.push_back(
+        tag + "per-base composition is primer/adapter-locked and expected for "
+              "this assay; not graded");
+    }
+    return;
+  }
+
+  if (assay.mask_per_base > 0) {
+    // grading already ignored the leading masked positions in summarize_module.
+    assay_annotations.push_back(
+      tag + "5' bias in leading " + std::to_string(assay.mask_per_base) +
+      " positions ignored (random-hexamer/Tn5/MspI motif); graded on the "
+      "downstream plateau");
+    return;
   }
 }
 
@@ -1308,6 +1434,7 @@ ModulePerSequenceGCContent::ModulePerSequenceGCContent(
   auto gc_vars = config.limits.find("gc_sequence")->second;
   gc_warn = gc_vars.find("warn")->second;
   gc_error = gc_vars.find("error")->second;
+  assay = config.assay_profile;
 }
 
 void
@@ -1323,6 +1450,26 @@ ModulePerSequenceGCContent::make_grade() {
   }
   else if (gc_deviation >= gc_warn) {
     grade = "warn";
+  }
+
+  // [FalcoAmadeus] assay-aware: some assays have an EXPECTED GC shift away from
+  // the WGS null (exonic GC-high exome, AT-rich amplicons, bisulfite/EM
+  // downshift). Do not treat that as a failure; downgrade FAIL->WARN so it
+  // stays visible, and annotate. generic == stock behavior.
+  if (assay.name == "generic")
+    return;
+  if (assay.relax_gc && grade == "fail") {
+    grade = "warn";
+    const std::string tag = assay_tag(assay);
+    if (assay.methylation)
+      assay_annotations.push_back(
+        tag + "bisulfite/EM conversion shifts the GC distribution down; "
+              "expected, not treated as failure (FAIL->WARN)");
+    else
+      assay_annotations.push_back(
+        tag + "GC distribution shifted from the WGS null is expected for this "
+              "assay (exonic/amplicon capture); not treated as failure "
+              "(FAIL->WARN)");
   }
 }
 
@@ -1609,6 +1756,7 @@ ModuleSequenceDuplicationLevels::ModuleSequenceDuplicationLevels(
   auto grade_dup = config.limits.find("duplication")->second;
   grade_dup_warn = grade_dup.find("warn")->second;
   grade_dup_error = grade_dup.find("error")->second;
+  assay = config.assay_profile;
 }
 
 void
@@ -1678,6 +1826,22 @@ ModuleSequenceDuplicationLevels::make_grade() {
   }
   else if (total_deduplicated_pct <= grade_dup_warn) {
     grade = "warn";
+  }
+
+  // [FalcoAmadeus] assay-aware: targeted/enriched libraries (amplicon, exome,
+  // RNA-seq, ATAC, ChIP, RRBS) have high on-target/expression duplication by
+  // design. Downgrade FAIL->WARN so it stays visible, and annotate. generic ==
+  // stock behavior. NOTE: the appropriate duplication cutoff is depth- and
+  // panel-dependent; this is a coarse relaxation, not a tuned per-assay
+  // threshold.
+  if (assay.name == "generic")
+    return;
+  if (assay.downgrade_dup && grade == "fail") {
+    grade = "warn";
+    assay_annotations.push_back(
+      assay_tag(assay) +
+      "high duplication is expected for targeted/enriched libraries "
+      "(amplicon/exome/RNA-seq/ATAC/ChIP/RRBS); downgraded FAIL->WARN");
   }
 }
 
@@ -1753,6 +1917,7 @@ ModuleOverrepresentedSequences::ModuleOverrepresentedSequences(
   auto grade_overrep = config.limits.find("overrepresented")->second;
   grade_warn = grade_overrep.find("warn")->second;
   grade_error = grade_overrep.find("error")->second;
+  assay = config.assay_profile;
 }
 
 // gets the largest suffix of left which is a prefix of right
@@ -1834,6 +1999,21 @@ ModuleOverrepresentedSequences::make_grade() {
         grade = "warn";
       }
     }
+  }
+
+  // [FalcoAmadeus] assay-aware: for amplicon/16S/small-RNA/RNA-seq the
+  // "overrepresented" sequences ARE the intended signal (PCR products, rRNA,
+  // highly expressed transcripts, and especially miRNAs). Downgrade FAIL->WARN
+  // so it stays visible, and annotate. generic == stock behavior.
+  if (assay.name == "generic")
+    return;
+  if (assay.downgrade_overrep && grade == "fail") {
+    grade = "warn";
+    assay_annotations.push_back(
+      assay_tag(assay) +
+      "overrepresented sequences are expected signal for this assay "
+      "(miRNAs/amplicons/rRNA/high-expression transcripts); downgraded "
+      "FAIL->WARN");
   }
 }
 

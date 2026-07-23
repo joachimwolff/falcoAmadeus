@@ -25,6 +25,60 @@
 
 
 /*************************************************************
+ ****************** ASSAY-AWARE QC PROFILES ******************
+ *************************************************************/
+// FastQC/falco grade every library against a whole-genome-shotgun (WGS) null,
+// so they systematically mis-flag EXPECTED assay biology as failures:
+// primer-locked amplicon base composition, random-hexamer 5' bias in RNA-seq,
+// Tn5 insertion bias in ATAC, bisulfite/EM C->T depletion, high on-target
+// duplication in enriched libraries, miRNAs/rRNA as "overrepresented", etc.
+//
+// An AssayProfile relaxes ONLY the modules that misfire for a given library
+// type. Every other module, and every reported data table, is untouched; the
+// numbers written to fastqc_data.txt do not change, only the pass/warn/fail
+// GRADE (plus explanatory "#Assay(...)" comment lines). The "generic"/"wgs"
+// profile carries no adjustments so the output stays byte-identical to stock
+// falco. All adjustments are opt-in via --assay.
+struct AssayProfile {
+  std::string name{"generic"};
+
+  // --- Per Base Sequence Content ---
+  // ignore this many leading read positions when grading (data unchanged);
+  // used for 5' motif bias (RNA-seq random hexamer, ATAC Tn5, RRBS MspI).
+  std::size_t mask_per_base{0};
+  // never warn/fail: composition is primer/adapter-locked and expected.
+  bool suppress_per_base{false};
+  // bisulfite/EM handling: C->T (Read1/OT) or G->A (Read2/OB) depletion is
+  // expected; grade only non-converted bases and soft-flag incomplete
+  // conversion (see kIncompleteConversionResidual).
+  bool methylation{false};
+
+  // --- Per Sequence GC Content ---
+  bool relax_gc{false};  // do not FAIL on an expected GC shift; annotate
+
+  // --- Sequence Duplication Levels ---
+  bool downgrade_dup{false};  // FAIL -> WARN (expected high on-target dup)
+
+  // --- Overrepresented Sequences ---
+  bool downgrade_overrep{false};  // FAIL -> WARN (miRNAs/amplicons are signal)
+};
+
+// Residual unmethylated-C (or -G) fraction below which a bisulfite/EM library
+// is considered adequately converted. This is only a raw-read HEURISTIC: the
+// genuine residual C scales with the sample's true methylation level, so the
+// authoritative check is the post-alignment non-CpG conversion rate (>99.5%),
+// which a raw-read tool cannot compute. Above this fraction we emit a soft
+// WARN annotation, never a hard FAIL.
+static constexpr double kIncompleteConversionResidual = 0.05;
+
+// Populate `profile` for `assay` (assumed already lower-cased). Returns false
+// for an unknown assay so the caller can print the valid list and exit.
+bool get_assay_profile(const std::string &assay, AssayProfile &profile);
+
+// Comma-separated list of valid assay names, for help text and error messages.
+std::string valid_assay_list();
+
+/*************************************************************
  ******************** CUSTOM CONFIGURATION *******************
  *************************************************************/
 
@@ -99,6 +153,12 @@ struct FalcoConfig {
    ************************************************************/
   bool is_bisulfite;
   bool is_reverse_complement;
+  // [FalcoAmadeus] methylation incomplete-conversion warn threshold (fraction)
+  double conversion_residual;
+
+  // --assay <TYPE>: assay-aware grading. "generic" (default) == stock falco.
+  std::string assay;
+  AssayProfile assay_profile;  // resolved from `assay` in setup()
 
   /*************** DEFINE FILE TYPE ************/
 

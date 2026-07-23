@@ -2,6 +2,8 @@
  *                    Andrew D. Smith
  * Authors: Guilherme De Sena Brandine, Andrew Smith
  *
+ * FalcoAmadeus fork modifications Copyright (C) 2026 Joachim Wolff
+ *
  * This program is free software: you can redistribute it and/or
  * modify it under the terms of the GNU General Public License as
  * published by the Free Software Foundation, either version 3 of the
@@ -19,6 +21,12 @@
 #include <string>
 #include <cmath>
 #include <bitset>
+#include <vector>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <atomic>
 
 // Optional zlib usage
 #include <zlib.h>
@@ -41,9 +49,40 @@
  ******************** STREAM READER **************************
  *************************************************************/
 
+// If reads are >75bp, truncate to 50 akin to FastQC. Defined here (inline) so
+// the paired-end duplication pass can reuse the identical truncation rule.
+inline std::size_t
+get_truncate_point(const std::size_t read_pos) {
+  return (read_pos <= Constants::unique_reads_max_length)
+           ? read_pos
+           : Constants::unique_reads_truncate;
+}
+
+// Per-read record of a read's contribution to the FastQC GC model. In the
+// multi-threaded path workers cannot accumulate stats.gc_count directly (double
+// addition is not associative, so a reordered sum would not be byte-identical);
+// instead each worker stores one of these and a single serial pass replays them
+// in global read order, reproducing the exact sequential floating-point result.
+struct GCRecord {
+  // 0 = no contribution (empty read or GC module off)
+  // 1 = short read, use the cached gc model with (a=trunc_length, b=trunc_gc)
+  // 2 = long read, discrete bin with (a=read_pos, b=cur_gc_count)
+  uint8_t kind;
+  uint32_t a;
+  uint32_t b;
+};
+
 // Generic class that does as much as possible without assuming file format
 class StreamReader{
  public:
+  // ---- multi-threaded worker support ----
+  // When true this object is a per-thread worker fed pre-split lines by the
+  // dispatcher: read/tile/kmer flags and tile_cur are set externally, GC is
+  // recorded rather than accumulated, and end-of-stream is signalled per line.
+  bool parallel_mode = false;
+  GCRecord *cur_gc_record = nullptr;  // where to store this read's GC record
+  bool force_eof = false;             // is_eof() override for the worker path
+
   // config on how to handle reads
   const bool do_sequence_hash,
              do_kmer,
@@ -122,6 +161,13 @@ class StreamReader{
   // tile value parsed from line 1 of each record
   size_t tile_cur;
 
+  // Whether the current read contributes per-tile quality, and cached
+  // pointers to the tile's quality/count vectors so we avoid re-hashing the
+  // tile maps on every base of the quality line.
+  bool do_tile_quality;
+  std::vector<double> *cur_tile_quality;
+  std::vector<size_t> *cur_tile_count;
+
   // Temp variables to be updated as you pass through the file
   size_t read_pos;  // which base we are at in the read
   size_t quality_value;  // to convert from ascii to number
@@ -186,7 +232,11 @@ class StreamReader{
 class FastqReader : public StreamReader {
  private:
   static const size_t RESERVE_SIZE = (1<<26);
+  // dedicated stdio stream buffer; glibc only enlarges the read size when
+  // setvbuf is given an explicit buffer (a NULL buffer stays at ~4 KiB)
+  static const size_t IO_BUFFER_SIZE = (1<<20);
   char *filebuf;
+  char *iobuf;
   FILE *fileobj;
 
  public:
@@ -199,13 +249,66 @@ class FastqReader : public StreamReader {
 };
 
 /*******************************************************/
+/*************** BACKGROUND GZ DECOMPRESSOR ************/
+/*******************************************************/
+// A single background thread that pulls fixed-size blocks of *decompressed*
+// bytes off a gzFile, so the (unchanged) parser can consume them while
+// zlib inflates the next block on another core. The decompressed byte stream
+// handed to the consumer is exactly the one gzgets would have produced, so
+// output stays byte-identical; only the wall-clock overlap changes.
+class GzBlockDecompressor {
+ private:
+  gzFile file;
+  const size_t block_size;
+  std::vector<std::vector<char>> blocks;  // fixed pool of block buffers
+  std::vector<size_t> lens;               // valid bytes per block
+  std::queue<int> free_q;                 // indices ready to be (re)filled
+  std::queue<int> filled_q;               // indices holding data to consume
+  std::mutex mtx;
+  std::condition_variable free_cv, filled_cv;
+  std::thread worker;
+  bool producer_done = false;             // gzread hit EOF/error
+  bool stop_requested = false;
+  // compressed offset after the most recent gzread, for the progress bar
+  // (only the producer thread may touch the gzFile)
+  std::atomic<size_t> comp_offset{0};
+
+  // consumer-side current block state (touched only by the consumer thread)
+  int cur_idx = -1;
+  size_t cur_pos = 0, cur_len = 0;
+  bool consumed_eof = false;
+
+  void producer_loop();
+
+ public:
+  GzBlockDecompressor(gzFile f, size_t bs, int npool);
+  ~GzBlockDecompressor();
+
+  // Make sure the current block still has unread bytes; fetch the next filled
+  // block if not. Returns false once the whole stream has been consumed.
+  bool ensure_data();
+
+  // Copy one line (up to and including '\n', NUL-terminated) into dst, exactly
+  // like gzgets. Returns the number of bytes written (0 only at end of stream).
+  size_t getline(char *dst, size_t maxlen);
+
+  bool eof() const { return consumed_eof; }
+  size_t compressed_offset() const { return comp_offset.load(); }
+};
+
+/*******************************************************/
 /*************** READ FASTQ GZ RCORD *******************/
 /*******************************************************/
 class GzFastqReader : public StreamReader {
  private:
   static const size_t RESERVE_SIZE = (1<<26);
+  // background-decompression tunables (only used when threads >= 2)
+  static const size_t GZ_BLOCK_SIZE = (1<<22);  // 4 MiB decompressed blocks
+  static const int GZ_NUM_BLOCKS = 6;           // bounded prefetch (~24 MiB)
   char *gzbuf;
   gzFile fileobj;
+  const bool threaded;              // overlap decompression on a bg thread
+  GzBlockDecompressor *decomp;      // non-null only when threaded
 
  public:
   GzFastqReader(FalcoConfig &fc, const size_t _buffer_size);
@@ -216,13 +319,40 @@ class GzFastqReader : public StreamReader {
 };
 
 /*******************************************************/
+/*************** PARALLEL GZ WORKER ********************/
+/*******************************************************/
+// A per-thread worker that runs the normal per-base processing on pre-split
+// lines handed to it by the dispatcher. It never touches a file itself, so the
+// file-format virtuals are stubs.
+class ParallelWorker : public StreamReader {
+ public:
+  ParallelWorker(FalcoConfig &fc, const size_t _buffer_size) :
+    StreamReader(fc, _buffer_size, '\n', '\n') {
+    parallel_mode = true;
+  }
+  size_t load() { return 0; }
+  bool read_entry(FastqStats &, size_t &) { return false; }
+  bool is_eof() { return force_eof; }
+  ~ParallelWorker() {}
+};
+
+// Multi-threaded gzipped-FASTQ driver: one background thread inflates, the
+// calling thread dispatches (line-split, duplication, tile bookkeeping), and
+// `nthreads` workers accumulate the per-base statistics in parallel. The result
+// in `master` is byte-identical to the single-threaded path. Only valid for
+// read_step == 1; the caller falls back otherwise.
+void read_gz_parallel(FalcoConfig &config, FastqStats &master, size_t nthreads);
+
+/*******************************************************/
 /*************** READ SAM RECORD ***********************/
 /*******************************************************/
 
 class SamReader : public StreamReader {
  private:
   static const size_t RESERVE_SIZE = (1<<26);
+  static const size_t IO_BUFFER_SIZE = (1<<20);
   char *filebuf;
+  char *iobuf;
   FILE *fileobj;
 
  public:

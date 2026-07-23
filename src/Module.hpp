@@ -26,6 +26,13 @@
 #include <utility>
 #include <vector>
 
+// FastQC extrapolation of counts to the full file size. Declared here so the
+// paired-end duplication pass (falco.cpp) can reuse the exact same math as
+// ModuleSequenceDuplicationLevels instead of forking it.
+double
+get_corrected_count(std::size_t count_at_limit, std::size_t num_reads,
+                    std::size_t dup_level, std::size_t num_obs);
+
 /* base groups for longer reads, copied from FastQC*/
 struct BaseGroup {
   std::size_t start{};
@@ -60,6 +67,11 @@ struct Module {
 
   // pass warn fail
   std::string grade;
+
+  // [FalcoAmadeus] assay-aware grading: explanatory "#Assay(<type>): ..."
+  // comment lines emitted inside this module's fastqc_data.txt block whenever
+  // the active --assay adjusted this module's grade. Empty for generic.
+  std::vector<std::string> assay_annotations;
 
   std::string html_data;
   Module(const std::string &module_name);
@@ -214,6 +226,17 @@ struct ModulePerBaseSequenceContent : public Module {
 
   bool is_bisulfite{};           // flag for dataset is WGBS
   bool is_reverse_complement{};  // indicates test T vs C instead of A vs G
+  // [FalcoAmadeus] methylation incomplete-conversion warn threshold (fraction)
+  double incomplete_conversion_residual{kIncompleteConversionResidual};
+
+  // [FalcoAmadeus] assay-aware grading
+  AssayProfile assay;
+  // mean C / G fraction (0..1) across all read positions, used for methylation
+  // strand auto-detection and the incomplete-conversion residual heuristic.
+  double mean_c_frac{};
+  double mean_g_frac{};
+  double methyl_residual{};       // residual fraction of the depleted base
+  char methyl_depleted_base{'C'}; // 'C' for Read1/OT, 'G' for Read2/OB
 
   double sequence_error{};  // for grade
   double sequence_warn{};   // for grade
@@ -241,6 +264,7 @@ struct ModulePerSequenceGCContent : public Module {
   std::array<double, 101> gc_count;
   std::array<double, 101> theoretical_gc_count;
 
+  AssayProfile assay;  // [FalcoAmadeus] assay-aware grading
   ModulePerSequenceGCContent(const FalcoConfig &config);
   ~ModulePerSequenceGCContent() {}
   void
@@ -319,6 +343,7 @@ struct ModuleSequenceDuplicationLevels : public Module {
   std::array<double, 16> percentage_total{};
   std::unordered_map<std::size_t, std::size_t> counts_by_freq;
 
+  AssayProfile assay;  // [FalcoAmadeus] assay-aware grading
   ModuleSequenceDuplicationLevels(const FalcoConfig &config);
   ~ModuleSequenceDuplicationLevels() {}
   void
@@ -340,6 +365,8 @@ struct ModuleOverrepresentedSequences : public Module {
   double grade_warn{};
   double grade_error{};
   std::vector<std::pair<std::string, std::string>> contaminants;
+
+  AssayProfile assay;  // [FalcoAmadeus] assay-aware grading
 
   // Function to find the matching contaminant within the list
   std::string

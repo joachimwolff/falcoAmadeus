@@ -1,0 +1,26 @@
+FalcoAmadeus authors and attribution
+=====================================
+
+FalcoAmadeus is a fork of falco (https://github.com/smithlabcode/falco),
+which is itself an emulation of FastQC. It is distributed under the same
+GNU General Public License v3 as the original (see LICENSE).
+
+Original authors (falco)
+------------------------
+Guilherme De Sena Brandine
+Andrew D. Smith
+Masaru Nakajima
+
+All credit for the original falco design and implementation belongs to the
+authors above. The original copyright notices are retained in the source
+files.
+
+FalcoAmadeus fork
+-----------------
+Joachim Wolff <wolff.joachim@mh-hannover.de> -- performance optimizations of
+the read-parsing hot path and fork maintenance.
+
+The fork keeps the analysis and report output identical to upstream falco
+(apart from the "##FalcoAmadeus" identifier line in fastqc_data.txt and the
+report footer). The optimizations were offered to upstream falco as a patch,
+which the maintainers declined to merge.

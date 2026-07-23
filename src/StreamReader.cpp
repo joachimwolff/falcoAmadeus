@@ -2,6 +2,8 @@
  *                    Andrew D. Smith
  * Authors: Guilherme De Sena Brandine, Andrew Smith
  *
+ * FalcoAmadeus fork modifications Copyright (C) 2026 Joachim Wolff
+ *
  * This program is free software: you can redistribute it and/or
  * modify it under the terms of the GNU General Public License as
  * published by the Free Software Foundation, either version 3 of the
@@ -20,6 +22,11 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include <memory>
+#include <unordered_map>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 // this is faster than std::min
 template <class T>
@@ -177,6 +184,11 @@ StreamReader::StreamReader(FalcoConfig &config, const std::size_t _buffer_size,
 
   // GS: test
   leftover_ind = 0;
+
+  // per-read tile-quality caching
+  do_tile_quality = false;
+  cur_tile_quality = nullptr;
+  cur_tile_count = nullptr;
 }
 
 // Makes sure that any subclass deletes the buffer
@@ -227,8 +239,12 @@ StreamReader::read_fast_forward_line() {
 
 inline void
 StreamReader::read_fast_forward_line_eof() {
-  for (; (*cur_char != field_separator) && (*cur_char != line_separator) &&
-         !is_eof();
+  // is_eof() cannot change while scanning an already-buffered line (there is
+  // no read from the stream inside this loop), so evaluate the virtual call
+  // once instead of on every character.
+  if (is_eof())
+    return;
+  for (; (*cur_char != field_separator) && (*cur_char != line_separator);
        ++cur_char) {
   }
 }
@@ -392,16 +408,34 @@ StreamReader::postprocess_sequence_line(FastqStats &stats) {
         truncated_length = read_pos;
         truncated_gc_count = cur_gc_count;
       }
-      for (const auto &v :
-           stats.gc_models[truncated_length].models[truncated_gc_count]) {
-        stats.gc_count[v.percent] += v.increment;
+      if (parallel_mode) {
+        // defer to the ordered replay (see GCRecord)
+        cur_gc_record->kind = 1;
+        cur_gc_record->a = truncated_length;
+        cur_gc_record->b = truncated_gc_count;
+      }
+      else {
+        for (const auto &v :
+             stats.gc_models[truncated_length].models[truncated_gc_count]) {
+          stats.gc_count[v.percent] += v.increment;
+        }
       }
 
       // if the read length is too large, we just use the discrete percentage
     }
     else {
-      ++stats.gc_count[100 * cur_gc_count / read_pos];
+      if (parallel_mode) {
+        cur_gc_record->kind = 2;
+        cur_gc_record->a = read_pos;
+        cur_gc_record->b = cur_gc_count;
+      }
+      else {
+        ++stats.gc_count[100 * cur_gc_count / read_pos];
+      }
     }
+  }
+  else if (parallel_mode) {
+    cur_gc_record->kind = 0;  // no GC contribution from this read
   }
 }
 
@@ -419,7 +453,10 @@ StreamReader::read_sequence_line(FastqStats &stats) {
   num_bases_after_n = 1;
   still_in_buffer = true;
   next_truncation = 100;
-  do_kmer_read = (stats.num_reads == next_kmer_read);
+  // in the worker path do_kmer_read is set by the dispatcher from the global
+  // read index; otherwise derive it from the running counter as usual
+  if (!parallel_mode)
+    do_kmer_read = (stats.num_reads == next_kmer_read);
   adapters_found.reset();
 
   if (do_adapters_slow) {
@@ -490,15 +527,16 @@ StreamReader::process_quality_base_from_buffer(FastqStats &stats) {
   ++stats.position_quality_count[(read_pos << Constants::bit_shift_quality) |
                                  quality_value];
 
-  // Tile processing
-  if (!tile_ignore && do_tile_read && tile_cur != 0) {
+  // Tile processing (cur_tile_* point into the tile maps, resolved once per
+  // read in read_quality_line, so we avoid three hash lookups per base)
+  if (do_tile_quality) {
     // allocate more base space if necessary
-    if (std::size(stats.tile_position_quality[tile_cur]) == read_pos) {
-      stats.tile_position_quality[tile_cur].push_back(0.0);
-      stats.tile_position_count[tile_cur].push_back(0);
+    if (std::size(*cur_tile_quality) == read_pos) {
+      cur_tile_quality->push_back(0.0);
+      cur_tile_count->push_back(0);
     }
-    stats.tile_position_quality[tile_cur][read_pos] += quality_value;
-    ++stats.tile_position_count[tile_cur][read_pos];
+    (*cur_tile_quality)[read_pos] += quality_value;
+    ++(*cur_tile_count)[read_pos];
   }
 }
 
@@ -510,12 +548,10 @@ StreamReader::process_quality_base_from_leftover(FastqStats &stats) {
                                        << Constants::bit_shift_quality) |
                                       quality_value];
 
-  // Tile processing
-  if (!tile_ignore) {
-    if (do_tile_read && tile_cur != 0) {
-      stats.tile_position_quality[tile_cur][read_pos] += quality_value;
-      ++stats.tile_position_count[tile_cur][read_pos];
-    }
+  // Tile processing (see process_quality_base_from_buffer)
+  if (do_tile_quality) {
+    (*cur_tile_quality)[read_pos] += quality_value;
+    ++(*cur_tile_count)[read_pos];
   }
 }
 
@@ -535,19 +571,29 @@ StreamReader::read_quality_line(FastqStats &stats) {
   cur_quality = 0;
   still_in_buffer = true;
 
+  // Resolve the tile quality/count vectors once for this read so the per-base
+  // loop does not re-hash the tile maps (see process_quality_base_from_buffer)
+  do_tile_quality = (!tile_ignore && do_tile_read && tile_cur != 0);
+  if (do_tile_quality) {
+    cur_tile_quality = &stats.tile_position_quality[tile_cur];
+    cur_tile_count = &stats.tile_position_count[tile_cur];
+  }
+
+  // is_eof() cannot change while scanning this already-buffered line, so read
+  // the (virtual) end-of-file state once rather than on every base.
+  const bool line_at_eof = is_eof();
+
   // For quality, we do not look for the separator, but rather for an explicit
   // newline or EOF in case the file does not end with newline or we are getting
   // decompressed strings from a stream
   for (; (*cur_char != field_separator) && (*cur_char != line_separator) &&
-         !is_eof();
+         !line_at_eof;
        ++cur_char) {
 
     if (read_pos == buffer_size) {
       still_in_buffer = false;
       leftover_ind = 0;
     }
-
-    get_base_from_buffer();
 
     // update lowest quality
     stats.lowest_char = min8(
@@ -585,23 +631,23 @@ StreamReader::read_quality_line(FastqStats &stats) {
 /*************** POST LINE PROCESSING ******************/
 /*******************************************************/
 /*************** THIS IS VERY SLOW ********************/
-// if reads are >75pb, truncate to 50 akin to FastQC
-inline std::size_t
-get_truncate_point(const std::size_t read_pos) {
-  return (read_pos <= Constants::unique_reads_max_length)
-           ? read_pos
-           : Constants::unique_reads_truncate;
-}
+// get_truncate_point() is defined inline in StreamReader.hpp so it can be
+// shared with the paired-end duplication pass.
 
 void
 StreamReader::postprocess_fastq_record(FastqStats &stats) {
   if (do_sequence_hash) {
     buffer[get_truncate_point(read_pos)] = '\0';
-    sequence_to_hash = std::string(buffer);
+    // assign() reuses the string's existing capacity instead of allocating a
+    // fresh std::string every read
+    sequence_to_hash.assign(buffer);
+    // Single hash lookup: reuse the iterator for both the insert and the
+    // increment branches
+    const auto it = stats.sequence_count.find(sequence_to_hash);
     // New sequence found
-    if (stats.sequence_count.count(sequence_to_hash) == 0) {
+    if (it == stats.sequence_count.end()) {
       if (continue_storing_sequences) {
-        stats.sequence_count.insert({{sequence_to_hash, 1}});
+        stats.sequence_count.emplace(sequence_to_hash, 1);
         stats.count_at_limit = stats.num_reads;
         ++stats.num_unique_seen;
 
@@ -611,7 +657,7 @@ StreamReader::postprocess_fastq_record(FastqStats &stats) {
       }
     }
     else {
-      ++stats.sequence_count[sequence_to_hash];
+      ++it->second;
       stats.count_at_limit += continue_storing_sequences;
     }
   }
@@ -654,6 +700,7 @@ FastqReader::FastqReader(FalcoConfig &_config, const std::size_t _buffer_size) :
   StreamReader(_config, _buffer_size, get_line_separator(_config.filename),
                get_line_separator(_config.filename)) {
   filebuf = new char[RESERVE_SIZE];
+  iobuf = new char[IO_BUFFER_SIZE];
 }
 
 std::size_t
@@ -675,6 +722,9 @@ FastqReader::load() {
   fileobj = fopen(std::data(filename), "r");
   if (fileobj == NULL)
     throw std::runtime_error("Cannot open FASTQ file : " + filename);
+  // Use a large fully-buffered stdio buffer so fgets issues far fewer read()
+  // syscalls (glibc defaults to ~4 KiB).
+  setvbuf(fileobj, iobuf, _IOFBF, IO_BUFFER_SIZE);
   return get_file_size(filename);
 }
 
@@ -686,7 +736,9 @@ FastqReader::is_eof() {
 
 FastqReader::~FastqReader() {
   delete[] filebuf;
+  // close the stream (which flushes) before releasing its stdio buffer
   fclose(fileobj);
+  delete[] iobuf;
 }
 
 // Parses fastq gz by reading line by line into the gzbuf
@@ -742,12 +794,121 @@ FastqReader::read_entry(FastqStats &stats, std::size_t &num_bytes_read) {
 }
 
 /*******************************************************/
+/*************** BACKGROUND GZ DECOMPRESSOR ************/
+/*******************************************************/
+GzBlockDecompressor::GzBlockDecompressor(gzFile f, std::size_t bs, int npool) :
+  file(f), block_size(bs) {
+  blocks.resize(npool);
+  lens.assign(npool, 0);
+  for (int i = 0; i < npool; ++i) {
+    blocks[i].resize(block_size);
+    free_q.push(i);
+  }
+  worker = std::thread(&GzBlockDecompressor::producer_loop, this);
+}
+
+GzBlockDecompressor::~GzBlockDecompressor() {
+  {
+    std::lock_guard<std::mutex> lk(mtx);
+    stop_requested = true;
+  }
+  free_cv.notify_all();
+  filled_cv.notify_all();
+  if (worker.joinable())
+    worker.join();
+}
+
+// Runs on the background thread: inflate fixed-size blocks off the gzFile and
+// hand them to the consumer through filled_q. Only this thread touches the
+// gzFile.
+void
+GzBlockDecompressor::producer_loop() {
+  while (true) {
+    int idx;
+    {
+      std::unique_lock<std::mutex> lk(mtx);
+      free_cv.wait(lk, [&] { return !free_q.empty() || stop_requested; });
+      if (stop_requested)
+        return;
+      idx = free_q.front();
+      free_q.pop();
+    }
+    const int n = gzread(file, blocks[idx].data(), block_size);
+    comp_offset.store(static_cast<std::size_t>(gzoffset(file)));
+    {
+      std::lock_guard<std::mutex> lk(mtx);
+      if (n > 0) {
+        lens[idx] = static_cast<std::size_t>(n);
+        filled_q.push(idx);
+      } else {
+        // n == 0 is EOF, n < 0 is a decompression error; either way we stop.
+        free_q.push(idx);
+        producer_done = true;
+        filled_cv.notify_one();
+        return;
+      }
+    }
+    filled_cv.notify_one();
+  }
+}
+
+bool
+GzBlockDecompressor::ensure_data() {
+  if (cur_idx >= 0 && cur_pos < cur_len)
+    return true;
+  // hand the fully-consumed block back to the producer
+  if (cur_idx >= 0) {
+    {
+      std::lock_guard<std::mutex> lk(mtx);
+      free_q.push(cur_idx);
+    }
+    free_cv.notify_one();
+    cur_idx = -1;
+  }
+  std::unique_lock<std::mutex> lk(mtx);
+  filled_cv.wait(lk, [&] { return !filled_q.empty() || producer_done; });
+  if (filled_q.empty()) {  // producer finished and nothing left to consume
+    consumed_eof = true;
+    return false;
+  }
+  cur_idx = filled_q.front();
+  filled_q.pop();
+  cur_pos = 0;
+  cur_len = lens[cur_idx];
+  return true;
+}
+
+// Copies one line (up to and including '\n', NUL-terminated) into dst, exactly
+// mirroring gzgets so the parser sees an identical line stream.
+std::size_t
+GzBlockDecompressor::getline(char *dst, std::size_t maxlen) {
+  std::size_t i = 0;
+  const std::size_t lim = maxlen - 1;
+  while (i < lim) {
+    if (!ensure_data())
+      break;
+    const std::vector<char> &blk = blocks[cur_idx];
+    while (cur_pos < cur_len && i < lim) {
+      const char c = blk[cur_pos++];
+      dst[i++] = c;
+      if (c == '\n') {
+        dst[i] = '\0';
+        return i;
+      }
+    }
+  }
+  dst[i] = '\0';
+  return i;
+}
+
+/*******************************************************/
 /*************** READ FASTQ GZ RCORD *******************/
 /*******************************************************/
 // the gz fastq constructor is the same as the fastq
 GzFastqReader::GzFastqReader(FalcoConfig &_config,
                              const std::size_t _buffer_size) :
-  StreamReader(_config, _buffer_size, '\n', '\n') {
+  StreamReader(_config, _buffer_size, '\n', '\n'),
+  threaded(_config.threads >= 2), decomp(nullptr) {
   gzbuf = new char[RESERVE_SIZE];
 }
 
@@ -758,16 +919,27 @@ GzFastqReader::load() {
   if (fileobj == Z_NULL)
     throw std::runtime_error("Cannot open gzip FASTQ file : " + filename);
 
+  // Enlarge zlib's internal inflate buffer (default 8 KiB) so decompression
+  // reads bigger chunks; must be set before the first gz read.
+  gzbuffer(fileobj, (1 << 20));
+
+  // With >= 2 threads, inflate on a background thread so parsing overlaps
+  // decompression. The consumer never touches the gzFile after this point.
+  if (threaded)
+    decomp = new GzBlockDecompressor(fileobj, GZ_BLOCK_SIZE, GZ_NUM_BLOCKS);
+
   return get_file_size(filename);
 }
 
 // straightforward
 inline bool
 GzFastqReader::is_eof() {
-  return gzeof(fileobj);
+  return threaded ? decomp->eof() : gzeof(fileobj);
 }
 
 GzFastqReader::~GzFastqReader() {
+  // join the background thread (if any) before closing the gzFile it reads
+  delete decomp;
   delete[] gzbuf;
   gzclose_r(fileobj);
 }
@@ -775,7 +947,18 @@ GzFastqReader::~GzFastqReader() {
 // Parses fastq gz by reading line by line into the gzbuf
 bool
 GzFastqReader::read_entry(FastqStats &stats, std::size_t &num_bytes_read) {
-  cur_char = gzgets(fileobj, gzbuf, RESERVE_SIZE);
+  // fetch the next line into gzbuf, from the background decompressor when
+  // threaded, otherwise straight from zlib
+  auto next_line = [&] {
+    if (threaded) {
+      decomp->getline(gzbuf, RESERVE_SIZE);
+      cur_char = gzbuf;
+    } else {
+      cur_char = gzgets(fileobj, gzbuf, RESERVE_SIZE);
+    }
+  };
+
+  next_line();
 
   // need to check here if we did not hit eof
   if (is_eof()) {
@@ -786,15 +969,15 @@ GzFastqReader::read_entry(FastqStats &stats, std::size_t &num_bytes_read) {
   read_tile_line(stats);
   skip_separator();
 
-  cur_char = gzgets(fileobj, gzbuf, RESERVE_SIZE);
+  next_line();
   read_sequence_line(stats);
   skip_separator();
 
-  cur_char = gzgets(fileobj, gzbuf, RESERVE_SIZE);
+  next_line();
   read_fast_forward_line();
   skip_separator();
 
-  cur_char = gzgets(fileobj, gzbuf, RESERVE_SIZE);
+  next_line();
   read_quality_line(stats);
   skip_separator();
 
@@ -808,8 +991,257 @@ GzFastqReader::read_entry(FastqStats &stats, std::size_t &num_bytes_read) {
 
   // Returns if file should keep being checked
   if (check_bytes_read(stats.num_reads))
-    num_bytes_read = gzoffset(fileobj);
+    num_bytes_read = threaded ? decomp->compressed_offset() : gzoffset(fileobj);
   return !is_eof();
+}
+
+/*******************************************************/
+/*********** PARALLEL GZ DRIVER (byte-identical) *******/
+/*******************************************************/
+// One read as staged by the dispatcher for the workers to process.
+namespace {
+struct ParRec {
+  std::size_t seq_off;   // offset of the sequence line in the chunk arena
+  std::size_t qual_off;  // offset of the quality line in the chunk arena
+  std::size_t seqlen;    // sequence length excluding the newline
+  std::size_t tile_cur;
+  bool do_tile_read;
+  bool do_kmer_read;
+  bool qual_no_nl;       // final record without a trailing newline
+};
+}  // namespace
+
+void
+read_gz_parallel(FalcoConfig &config, FastqStats &master,
+                 std::size_t nthreads) {
+  const std::size_t BUF = FastqStats::SHORT_READ_THRESHOLD;
+
+  gzFile gz = gzopen(std::data(config.filename), "r");
+  if (gz == Z_NULL)
+    throw std::runtime_error("Cannot open gzip FASTQ file : " + config.filename);
+  gzbuffer(gz, (1 << 20));
+
+  // dispatcher-only reader (parses the tile field from headers)
+  ParallelWorker disp(config, BUF);
+  const bool tile_ignore = disp.tile_ignore;
+  const bool do_hash = disp.do_sequence_hash;
+
+  // per-thread workers and accumulators
+  std::vector<FastqStats> wstats(nthreads);
+  std::vector<std::unique_ptr<ParallelWorker>> workers;
+  workers.reserve(nthreads);
+  for (std::size_t t = 0; t < nthreads; ++t)
+    workers.emplace_back(new ParallelWorker(config, BUF));
+
+  // serial dispatcher state (kept identical to the single-threaded pass)
+  bool continue_storing = true;
+  std::size_t disp_max_read_length = 0;
+  std::unordered_map<std::size_t, std::size_t> tile_len;  // tile -> vector length
+  std::string dup_key;
+
+  std::vector<char> lb(1u << 26);  // line buffer, matches RESERVE_SIZE
+  char *const lbp = lb.data();
+  const std::size_t lbsz = lb.size();
+
+  const std::size_t CHUNK = (1u << 18);  // reads per chunk
+  std::vector<char> arena;
+  std::vector<ParRec> recs;
+  std::vector<GCRecord> gcrec;
+
+  {
+    GzBlockDecompressor decomp(gz, (1u << 22), 8);
+    bool eof = false;
+    while (!eof) {
+      // ---- serial dispatch: stage up to CHUNK reads ----
+      arena.clear();
+      recs.clear();
+      while (recs.size() < CHUNK) {
+        const std::size_t hlen = decomp.getline(lbp, lbsz);  // header
+        if (hlen == 0 && decomp.eof()) {
+          eof = true;
+          break;
+        }
+        const std::size_t g = master.num_reads;
+        const bool do_tile_read =
+          !tile_ignore && (g % StreamReader::num_reads_for_tile == 0);
+        const bool do_kmer_read = (g % StreamReader::num_reads_for_kmer == 0);
+        std::size_t tile_cur = 0;
+        if (do_tile_read) {
+          disp.cur_char = lbp;
+          disp.get_tile_value();
+          tile_cur = disp.tile_cur;
+        }
+
+        // sequence line
+        const std::size_t slen = decomp.getline(lbp, lbsz);
+        std::size_t seqlen = slen;
+        if (seqlen > 0 && lbp[seqlen - 1] == '\n')
+          --seqlen;
+
+        // duplication counting (serial, in read order -> identical map state)
+        if (do_hash) {
+          dup_key.assign(lbp, get_truncate_point(seqlen));
+          const auto it = master.sequence_count.find(dup_key);
+          if (it == master.sequence_count.end()) {
+            if (continue_storing) {
+              master.sequence_count.emplace(dup_key, 1);
+              master.count_at_limit = master.num_reads;
+              ++master.num_unique_seen;
+              if (master.num_unique_seen ==
+                  Constants::unique_reads_stop_counting)
+                continue_storing = false;
+            }
+          }
+          else {
+            ++it->second;
+            master.count_at_limit += continue_storing;
+          }
+        }
+
+        const std::size_t seq_off = arena.size();
+        arena.insert(arena.end(), lbp, lbp + slen);
+        if (!(slen > 0 && lbp[slen - 1] == '\n'))
+          arena.push_back('\n');  // workers scan until '\n'
+
+        decomp.getline(lbp, lbsz);  // '+' line, ignored
+
+        // quality line
+        const std::size_t qlen = decomp.getline(lbp, lbsz);
+        const bool qual_no_nl = !(qlen > 0 && lbp[qlen - 1] == '\n');
+        const std::size_t qual_off = arena.size();
+        arena.insert(arena.end(), lbp, lbp + qlen);
+
+        // per-tile vector length bookkeeping (mirrors read_tile_line growth)
+        if (do_tile_read) {
+          const auto it = tile_len.find(tile_cur);
+          if (it == tile_len.end())
+            tile_len[tile_cur] = disp_max_read_length;  // length at first sight
+          if (tile_cur != 0)
+            tile_len[tile_cur] = std::max(tile_len[tile_cur], seqlen);
+        }
+        disp_max_read_length = std::max(disp_max_read_length, seqlen);
+
+        recs.push_back({seq_off, qual_off, seqlen, tile_cur, do_tile_read,
+                        do_kmer_read, qual_no_nl});
+        ++master.num_reads;
+      }
+      if (recs.empty())
+        break;
+
+      // ---- parallel: workers accumulate per-base stats + GC records ----
+      gcrec.assign(recs.size(), GCRecord{0, 0, 0});
+      char *const base = arena.data();
+      const std::size_t n = recs.size();
+#ifdef _OPENMP
+#pragma omp parallel num_threads(nthreads)
+#endif
+      {
+#ifdef _OPENMP
+        const int tid = omp_get_thread_num();
+#else
+        const int tid = 0;
+#endif
+        ParallelWorker &w = *workers[tid];
+        FastqStats &ws = wstats[tid];
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+        for (std::size_t i = 0; i < n; ++i) {
+          const ParRec &r = recs[i];
+          w.cur_char = base + r.seq_off;
+          w.do_read = true;
+          w.do_kmer_read = r.do_kmer_read;
+          w.cur_gc_record = &gcrec[i];
+          w.read_sequence_line(ws);
+
+          w.cur_char = base + r.qual_off;
+          w.do_tile_read = r.do_tile_read;
+          w.tile_cur = r.tile_cur;
+          w.force_eof = r.qual_no_nl;
+          w.read_quality_line(ws);
+        }
+      }
+
+      // ---- serial GC replay in global read order (exact FP reproduction) ----
+      for (std::size_t i = 0; i < n; ++i) {
+        const GCRecord &gr = gcrec[i];
+        if (gr.kind == 1) {
+          for (const auto &v : master.gc_models[gr.a].models[gr.b])
+            master.gc_count[v.percent] += v.increment;
+        }
+        else if (gr.kind == 2) {
+          ++master.gc_count[100 * gr.b / gr.a];
+        }
+      }
+    }
+  }  // decomp destroyed here: background thread joined
+  gzclose_r(gz);
+
+  // ---- merge worker accumulators into master ----
+  auto add_arr = [](auto &dst, const auto &src) {
+    for (std::size_t i = 0; i < dst.size(); ++i)
+      dst[i] += src[i];
+  };
+  auto add_vec = [](std::vector<std::size_t> &dst,
+                    const std::vector<std::size_t> &src) {
+    if (dst.size() < src.size())
+      dst.resize(src.size(), 0);
+    for (std::size_t i = 0; i < src.size(); ++i)
+      dst[i] += src[i];
+  };
+  for (std::size_t t = 0; t < nthreads; ++t) {
+    FastqStats &ws = wstats[t];
+    add_arr(master.base_count, ws.base_count);
+    add_arr(master.n_base_count, ws.n_base_count);
+    add_arr(master.position_quality_count, ws.position_quality_count);
+    add_arr(master.quality_count, ws.quality_count);
+    add_arr(master.read_length_freq, ws.read_length_freq);
+    add_arr(master.pos_kmer_count, ws.pos_kmer_count);
+    add_arr(master.pos_adapter_count, ws.pos_adapter_count);
+    for (std::size_t i = 0; i < master.kmer_count.size(); ++i)
+      master.kmer_count[i] += ws.kmer_count[i];
+    master.total_bases += ws.total_bases;
+    master.total_gc += ws.total_gc;
+    master.empty_reads += ws.empty_reads;
+    master.max_read_length =
+      std::max(master.max_read_length, ws.max_read_length);
+    master.lowest_char = std::min(master.lowest_char, ws.lowest_char);
+    add_vec(master.long_base_count, ws.long_base_count);
+    add_vec(master.long_n_base_count, ws.long_n_base_count);
+    add_vec(master.long_position_quality_count, ws.long_position_quality_count);
+    add_vec(master.long_read_length_freq, ws.long_read_length_freq);
+    master.num_extra_bases = std::max(master.num_extra_bases, ws.num_extra_bases);
+  }
+
+  // tile maps: create master vectors at the reconstructed lengths, then sum
+  if (!tile_ignore) {
+    for (const auto &kv : tile_len) {
+      master.tile_position_quality[kv.first] =
+        std::vector<double>(kv.second, 0.0);
+      master.tile_position_count[kv.first] =
+        std::vector<std::size_t>(kv.second, 0);
+    }
+    for (std::size_t t = 0; t < nthreads; ++t) {
+      for (const auto &kv : wstats[t].tile_position_quality) {
+        auto &dst = master.tile_position_quality[kv.first];
+        const auto &src = kv.second;
+        const std::size_t lim = std::min(src.size(), dst.size());
+        for (std::size_t i = 0; i < lim; ++i)
+          dst[i] += src[i];
+      }
+      for (const auto &kv : wstats[t].tile_position_count) {
+        auto &dst = master.tile_position_count[kv.first];
+        const auto &src = kv.second;
+        const std::size_t lim = std::min(src.size(), dst.size());
+        for (std::size_t i = 0; i < lim; ++i)
+          dst[i] += src[i];
+      }
+    }
+  }
+
+  // as in read_stream_into_stats: drop tile reporting if there was no tile info
+  if (tile_ignore)
+    config.do_tile = false;
 }
 
 /*******************************************************/
@@ -820,6 +1252,7 @@ SamReader::SamReader(FalcoConfig &_config, const std::size_t _buffer_size) :
   StreamReader(_config, _buffer_size, '\t',
                get_line_separator(_config.filename)) {
   filebuf = new char[RESERVE_SIZE];
+  iobuf = new char[IO_BUFFER_SIZE];
 }
 
 std::size_t
@@ -827,6 +1260,9 @@ SamReader::load() {
   fileobj = fopen(std::data(filename), "r");
   if (fileobj == NULL)
     throw std::runtime_error("Cannot open SAM file : " + filename);
+
+  // Large fully-buffered stdio buffer to cut read() syscalls (see FastqReader)
+  setvbuf(fileobj, iobuf, _IOFBF, IO_BUFFER_SIZE);
 
   // skip sam header
   char first_char_in_line;
@@ -883,6 +1319,7 @@ SamReader::read_entry(FastqStats &stats, std::size_t &num_bytes_read) {
 SamReader::~SamReader() {
   delete[] filebuf;
   fclose(fileobj);
+  delete[] iobuf;
 }
 
 #ifdef USE_HTS
@@ -995,6 +1432,14 @@ BamReader::read_quality_line(FastqStats &stats) {
   read_pos = 0;
   cur_quality = 0;
   still_in_buffer = true;
+
+  // Resolve the tile quality/count vectors once for this read (see
+  // process_quality_base_from_buffer)
+  do_tile_quality = (!tile_ignore && do_tile_read && tile_cur != 0);
+  if (do_tile_quality) {
+    cur_tile_quality = &stats.tile_position_quality[tile_cur];
+    cur_tile_count = &stats.tile_position_count[tile_cur];
+  }
 
   const std::size_t seq_len = b->core.l_qseq;
   for (std::size_t i = 0; i < seq_len; ++cur_char, i++) {

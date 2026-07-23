@@ -1,6 +1,6 @@
 # Falco: FastQC Alternative Code
 
-[![GitHub Downloads](https://img.shields.io/github/downloads/smithlabcode/falco/total.svg?style=social&logo=github&label=Download)](https://github.com/smithlabcode/falco/releases/latest)
+[![GitHub Downloads](https://img.shields.io/github/downloads/joachimwolff/falco/total.svg?style=social&logo=github&label=Download)](https://github.com/joachimwolff/falco/releases/latest)
 [![DOI](https://zenodo.org/badge/214499063.svg)](https://zenodo.org/badge/latestdoi/214499063)
 [![Install on conda](https://anaconda.org/bioconda/falco/badges/platforms.svg)](https://anaconda.org/bioconda/falco)
 [![Install on conda](https://anaconda.org/bioconda/falco/badges/license.svg)](https://anaconda.org/bioconda/falco)
@@ -27,7 +27,7 @@ installer.
 ## Installing from source (code release)
 
 Compilation from source can be done by downloading a `falco` release
-from the [releases](https://github.com/smithlabcode/falco/releases)
+from the [releases](https://github.com/joachimwolff/falco/releases)
 section above. Upon downloading the release (in `.tar.gz` or `.zip`
 format), and inflating the downloaded file to a directory
 (e.g. `falco`), move to the target directory the file was inflated
@@ -57,7 +57,7 @@ bugs. For the more advanced users who wish to test the most recent
 code, `falco` can be installed by first cloning the repository
 
 ```
-$ git clone https://github.com/smithlabcode/falco.git
+$ git clone https://github.com/joachimwolff/falco.git
 $ cd falco
 ```
 

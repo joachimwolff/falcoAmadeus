@@ -1,5 +1,7 @@
 /* Copyright (C) 2026 Andrew D. Smith
  *
+ * FalcoAmadeus fork modifications Copyright (C) 2026 Joachim Wolff
+ *
  * This program is free software: you can redistribute it and/or
  * modify it under the terms of the GNU General Public License as
  * published by the Free Software Foundation, either version 3 of the
@@ -31,196 +33,143 @@ constexpr auto falco_config_html_template = R"(<html>
 <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.3.1/css/bootstrap.min.css" integrity="sha384-ggOyR0iXCbMQv3Xipma34MD+dH/1fQ784/j6cY/iJTQUOhcWr7x9JvoRxT2MZw1T" crossorigin="anonymous">
 <link href="https://stackpath.bootstrapcdn.com/font-awesome/4.7.0/css/font-awesome.min.css" rel="stylesheet" integrity="sha384-wvfXpqpZZVQGK6TAh5PVlGOfQNHSoD2xbE+QkPxCAFlNEevoEH3Sl0sibVcOQVnN" crossorigin="anonymous">
 <style type="text/css">
- @media screen {
-  div.summary {
-    width: 18em;
-    position:fixed;
-    top: 4em;
-    margin:1em 0 0 1em;
-  }
-  
-  div.main {
-    display:block;
-    position:absolute;
-    overflow:auto;
-    height:auto;
-    width:auto;
-    top:4.5em;
-    bottom:2.3em;
-    left:18em;
-    right:0;
-    border-left: 1px solid #CCC;
-    padding:0 0 0 1em;
-    background-color: white;
-    z-index:1;
-  }
-  
-  div.header {
-    background-color: #EEE;
-    border:0;
-    margin:0;
-    padding: 0.2em;
-    font-size: 200%;
-    position:fixed;
-    width:100%;
-    top:0;
-    left:0;
-    z-index:2;
-  }
-
-  div.footer {
-    background-color: #EEE;
-    border:0;
-    margin:0;
-	padding:0.5em;
-    height: 2.5em;
-	overflow:hidden;
-    font-size: 100%;
-    position:fixed;
-    bottom:0;
-    width:100%;
-    z-index:2;
-  }
-  
-  img.indented {
-    margin-left: 3em;
-  }
- }
- 
- @media print {
-	img {
-		max-width:100% !important;
-		page-break-inside: avoid;
-	}
-	h2, h3 {
-		page-break-after: avoid;
-	}
-	div.header {
-      background-color: #FFF;
-    }
-	
- }
- 
- body {    
-  color: #000;   
-  background-color: #FFF;
-  border: 0;
-  margin: 0;
-  padding: 0;
-  }
-  
-  div.header {
-  border:0;
-  margin:0;
-  padding: 0.5em;
-  font-size: 200%;
-  width:100%;
-  }    
-  
-  #header_title {
-  display:inline-block;
-  float:left;
-  clear:left;
-  }
-  #header_filename {
-  display:inline-block;
-  float:right;
-  clear:right;
-  font-size: 50%;
-  margin-right:2em;
-  text-align: right;
-  }
-
-  div.header h3 {
-  font-size: 50%;
-  margin-bottom: 0;
-  }
-  
-  div.summary ul {
-  padding-left:0;
-  list-style-type:none;
-  }
-  
-  div.summary ul li img {
-  margin-bottom:-0.5em;
-  margin-top:0.5em;
-  }
-	  
-  div.main {
-  background-color: white;
-  }
-      
-  div.module {
-  padding-bottom:3em;
-  padding-top:3em;
-  border-bottom: 1px solid #990000
-  }
-	  
-  div.footer {
-  background-color: #EEE;
-  border:0;
-  margin:0;
-  padding: 0.5em;
-  font-size: 100%;
-  width:100%;
-  }
-
-  h2 {
-  color: #2a5e8c;
-  padding-bottom: 0;
-  margin-bottom: 0;
-  clear:left;
-  }
-
+:root {
+  --bg:#f4f6f9; --surface:#ffffff; --surface-2:#f7f9fc; --border:#e4e9f0;
+  --text:#1f2733; --muted:#697586; --brand:#0b6bcb; --brand-2:#37a0f4;
+  --pass:#1a9e5f; --warn:#d69b00; --fail:#d64545;
+  --shadow:0 1px 3px rgba(16,24,40,.06),0 1px 2px rgba(16,24,40,.04);
+  --radius:12px; --sidebar-w:19em;
+}
+* { box-sizing:border-box; }
+html { scroll-behavior:smooth; }
+body {
+  color:var(--text); background:var(--bg); margin:0; padding:0;
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
+  font-size:15px; line-height:1.55; -webkit-font-smoothing:antialiased;
+}
+a { color:var(--brand); text-decoration:none; }
+div.header {
+  position:sticky; top:0; z-index:20; display:flex; align-items:baseline;
+  justify-content:space-between; gap:1em; flex-wrap:wrap; width:100%; margin:0;
+  background:var(--surface); border-bottom:1px solid var(--border);
+  box-shadow:var(--shadow); padding:.85em 1.4em; font-size:100%;
+}
+#header_title {
+  float:none; display:inline-flex; align-items:center; gap:.5em;
+  font-size:1.5rem; font-weight:700; letter-spacing:-.01em; color:var(--brand);
+}
+#header_title::before {
+  content:""; width:.72em; height:.72em; border-radius:4px;
+  background:linear-gradient(135deg,var(--brand),var(--brand-2));
+}
+#header_filename {
+  float:none; text-align:right; font-size:.82rem; color:var(--muted);
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+div.header h3 { font-size:50%; margin:0; }
+div.summary {
+  position:fixed; top:4.6em; left:0; width:var(--sidebar-w);
+  height:calc(100vh - 6.6em); overflow-y:auto; margin:0; padding:1em .9em;
+}
+div.summary h2 {
+  font-size:.72rem; text-transform:uppercase; letter-spacing:.08em;
+  color:var(--muted); font-weight:700; margin:.2em 0 .7em .5em;
+}
+div.summary ul { padding:0; margin:0; list-style:none; }
+div.summary ul li img { display:none; }
+div.summary ul li a {
+  display:flex; align-items:center; gap:.6em; padding:.5em .7em;
+  margin-bottom:2px; border-radius:8px; color:var(--text);
+  font-size:.9rem; font-weight:500; transition:background .12s;
+}
+div.summary ul li a:hover { background:var(--surface-2); }
+div.summary ul li a::before {
+  content:""; flex:0 0 auto; width:9px; height:9px; border-radius:50%; background:var(--muted);
+}
+div.summary ul li a.pass::before { background:var(--pass); }
+div.summary ul li a.warn::before { background:var(--warn); }
+div.summary ul li a.fail::before { background:var(--fail); }
+div.main { margin-left:var(--sidebar-w); padding:1.5em 2em 4.5em; max-width:1180px; }
+div.module {
+  background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
+  box-shadow:var(--shadow); padding:1.2em 1.5em 1.5em; margin-bottom:1.4em;
+}
+div.module h2 {
+  display:flex; align-items:center; gap:.55em; flex-wrap:wrap; clear:none;
+  font-size:1.12rem; font-weight:650; color:var(--text);
+  margin:0 0 1em; padding:0 0 .7em; border-bottom:1px solid var(--border);
+}
+div.module h2::before {
+  content:""; flex:0 0 auto; width:11px; height:11px; border-radius:50%; background:var(--muted);
+}
+div.module h2.pass::before { background:var(--pass); }
+div.module h2.warn::before { background:var(--warn); }
+div.module h2.fail::before { background:var(--fail); }
+div.module h2.pass, div.module h2.warn, div.module h2.fail { color:var(--text); }
+div.module h2.collapsible { cursor:pointer; user-select:none; }
+div.module h2.collapsible::after {
+  content:""; margin-left:auto; flex:0 0 auto; width:.5em; height:.5em; margin-top:-.15em;
+  border-right:2px solid var(--muted); border-bottom:2px solid var(--muted);
+  transform:rotate(45deg); transition:transform .15s;
+}
+div.module.collapsed h2.collapsible { margin-bottom:0; padding-bottom:0; border-bottom:0; }
+div.module.collapsed h2.collapsible::after { transform:rotate(-45deg); margin-top:.15em; }
+div.module.collapsed { padding-bottom:1em; }
+div.module.collapsed > :not(h2) { display:none; }
+a.toggle-all {
+  display:inline-block; margin:.1em 0 .7em .5em; font-size:.72rem;
+  color:var(--brand); cursor:pointer; font-weight:600;
+}
+p.module-desc {
+  margin:-.3em 0 1.15em; color:var(--muted); font-size:.86rem;
+  line-height:1.5; max-width:78ch;
+}
+p.module-desc a { font-weight:600; white-space:nowrap; }
+div.module > div[id] { width:100%; }
+.pass { color:var(--pass); } .warn { color:var(--warn); } .fail { color:var(--fail); }
 table {
-  margin-left: 3em;
-  text-align: center;
-  }
-  
+  margin:.4em 0; border-collapse:collapse; min-width:55%; text-align:left;
+  font-size:.87rem; border:1px solid var(--border); border-radius:10px; overflow:hidden;
+}
 th {
-  text-align: center;
-  background-color: #000080;
-  color: #FFF;
-  padding: 0.4em;
+  background:var(--surface-2); color:var(--muted); text-align:left;
+  text-transform:uppercase; font-size:.71rem; letter-spacing:.04em; font-weight:700;
+  padding:.6em .9em; border-bottom:1px solid var(--border);
 }
-  
 td {
-  font-family: monospace;
-  text-align: left;
-  background-color: #EEE;
-  color: #000;
-  padding: 0.4em;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace; text-align:left;
+  background:var(--surface); color:var(--text); padding:.52em .9em;
+  border-bottom:1px solid var(--border);
 }
-
-img {
-  padding-top: 0;
-  margin-top: 0;
-  border-top: 0;
+tr:last-child td { border-bottom:0; }
+tr:hover td { background:var(--surface-2); }
+div.footer {
+  position:fixed; bottom:0; left:0; width:100%; z-index:20; margin:0;
+  background:var(--surface); border-top:1px solid var(--border);
+  color:var(--muted); font-size:.8rem; padding:.55em 1.4em;
 }
-
-  
-p {
-  padding-top: 0;
-  margin-top: 0;
+img.indented { margin-left:3em; } p { margin-top:0; }
+@media (max-width:820px) {
+  div.summary { position:static; width:auto; height:auto; margin:.8em;
+    background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); }
+  div.summary ul { display:flex; flex-wrap:wrap; gap:.25em; }
+  div.main { margin-left:0; padding:1em; }
 }
-
-.pass {
-  color : #009900;
+@media print {
+  div.summary, div.footer { position:static; width:auto; height:auto; }
+  div.main { margin-left:0; } div.module { break-inside:avoid; box-shadow:none; }
 }
-
-.warn {
-  color : #999900;
-}
-
-.fail {
-  color : #990000;
+@media (prefers-color-scheme:dark) {
+  :root { --bg:#0f141a; --surface:#171d25; --surface-2:#1e2732; --border:#2a333f;
+    --text:#e6ebf2; --muted:#9aa6b2; --brand:#4aa3f0; --brand-2:#7cc0ff;
+    --shadow:0 1px 3px rgba(0,0,0,.45); }
 }
 </style>
 <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
 </head>
 <body>
 <div class="header">
-	<div id="header_title">Report</div>
+	<div id="header_title">FalcoAmadeus</div>
   <div id="header_filename">{{date}}<br/> {{filename}}
 	</div>
 </div>
@@ -389,7 +338,7 @@ p {
 
 
 </div>
-<div class="footer">Falco {{version}}
+<div class="footer">FalcoAmadeus {{version}}
 </div>
 </body>
 <script src="https://code.jquery.com/jquery-3.3.1.slim.min.js" 
@@ -405,7 +354,27 @@ integrity="sha384-JjSmVgyd0p3pXB1rRibZUAYoIIy6OrQ6VrjIEaFf/nJGzIxFDsf4x0xIM+B07j
 crossorigin="anonymous"></script>
 
 <script>
-  
+// [FalcoAmadeus] apply one clean, consistent theme to every Plotly plot by
+// wrapping newPlot -- keeps transparent backgrounds, light grids, a tidy font,
+// slimmer boxes, an on-hover toolbar and no logo, without touching each call.
+(function(){
+  if (!window.Plotly) return;
+  var FONT={family:'-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif',size:12,color:'#3a4553'};
+  var AX={gridcolor:'#eceff3',zerolinecolor:'#dfe4ea',linecolor:'#cfd6de',ticks:'outside',tickcolor:'#cfd6de',tickfont:{size:11,color:'#697586'},automargin:true};
+  var THEME={paper_bgcolor:'rgba(0,0,0,0)',plot_bgcolor:'rgba(0,0,0,0)',colorway:['#0072b2','#e69f00','#009e73','#d55e00','#56b4e9','#cc79a7','#111111'],boxgap:0.28,boxgroupgap:0.2,legend:{borderwidth:0}};
+  var CFG={displaylogo:false,responsive:true,displayModeBar:'hover',modeBarButtonsToRemove:['select2d','lasso2d','autoScale2d','toggleSpikelines','hoverClosestCartesian','hoverCompareCartesian']};
+  var orig=Plotly.newPlot;
+  Plotly.newPlot=function(id,data,layout,config){
+    layout=layout||{};
+    var L=Object.assign({},THEME,layout);
+    L.font=Object.assign({},FONT,layout.font);
+    L.xaxis=Object.assign({},AX,layout.xaxis);
+    L.yaxis=Object.assign({},AX,layout.yaxis);
+    L.margin=Object.assign({t:12,r:18,b:54,l:60},layout.margin);
+    return orig.call(Plotly,id,data,L,Object.assign({},CFG,config));
+  };
+})();
+
 if (document.getElementById('seqbasequalityboxplot') !== null) {
   Plotly.newPlot('seqbasequalityboxplot', [
    {{perbasesequencequalitydata}}
@@ -510,6 +479,48 @@ if (document.getElementById('kmerlineplot') !== null) {
     yaxis : {title : 'log2(obs/ exp max)'}
   } );
 }
+
+// [FalcoAmadeus] make each module collapsible (click its header to toggle).
+// Runs after the plots are drawn, so every plot renders at full width first.
+(function(){
+  var BASE="https://www.bioinformatics.babraham.ac.uk/projects/fastqc/Help/3%20Analysis%20Modules/";
+  var INFO={
+   basicstatistics:["Summary counts for the file - total reads, read-length range, %GC and the inferred quality encoding. Check these match what you expect for the library.","1%20Basic%20Statistics.html"],
+   perbasesequencequality:["Box plots of the quality score at each base position. Quality usually declines toward the end of the read; medians in the low range mean you should consider quality trimming.","2%20Per%20Base%20Sequence%20Quality.html"],
+   persequencequalityscores:["Distribution of the mean quality per read. One peak at high quality is good; a low-quality shoulder means a subset of reads is poor.","3%20Per%20Sequence%20Quality%20Scores.html"],
+   perbasesequencecontent:["Proportion of A/C/G/T at each position - expected flat and parallel for random libraries. Strong bias (often at the read start) is normal for RNA-seq, amplicon and bisulfite data; see the --assay option.","4%20Per%20Base%20Sequence%20Content.html"],
+   persequencegccontent:["Observed GC distribution across reads versus a modeled normal. A shifted or bimodal curve can mean contamination, or is expected for bisulfite and targeted libraries.","5%20Per%20Sequence%20GC%20Content.html"],
+   perbasencontent:["Percentage of ambiguous N base calls per position. More than a fraction of a percent, especially if localized, indicates a sequencing issue.","6%20Per%20Base%20N%20Content.html"],
+   sequencelengthdistribution:["Distribution of read lengths. A single length is typical of untrimmed Illumina reads; a spread is expected after trimming or for small-RNA / long-read libraries.","7%20Sequence%20Length%20Distribution.html"],
+   sequenceduplicationlevels:["Fraction of reads seen more than once - a proxy for PCR/optical duplication and library complexity. High duplication is expected for amplicon, small-RNA and highly-expressed RNA-seq. For paired-end data use the paired report; single-end overcounts.","8%20Duplicate%20Sequences.html"],
+   overrepresentedsequences:["Individual sequences that make up an unusually large share of the library - often adapters or contaminants, or (expected) the amplicons/miRNAs themselves.","9%20Overrepresented%20Sequences.html"],
+   adaptercontent:["Cumulative fraction of reads containing known adapters by position. A rise near the read end means adapter read-through - trim before downstream analysis.","10%20Adapter%20Content.html"],
+   kmercontent:["Positional enrichment of short k-mers. Spikes flag adapters, primers or other position-specific sequence bias.","11%20Kmer%20Content.html"],
+   pertilesequencequality:["Quality deviation per flow-cell tile relative to the run average. Persistent blue/red bands flag a localized sequencing problem on specific tiles.","12%20Per%20Tile%20Sequence%20Quality.html"]
+  };
+  var mods=document.querySelectorAll("div.module");
+  mods.forEach(function(m){
+    var h=m.querySelector("h2"); if(!h) return;
+    var info=INFO[h.id];
+    if(info){
+      var p=document.createElement("p"); p.className="module-desc";
+      p.innerHTML=info[0]+" <a href='"+BASE+info[1]+"' target='_blank' rel='noopener'>FastQC help ↗</a>";
+      h.parentNode.insertBefore(p,h.nextSibling);
+    }
+    h.classList.add("collapsible");
+    h.addEventListener("click",function(){ m.classList.toggle("collapsed"); });
+  });
+  var sum=document.querySelector("div.summary h2");
+  if(sum){
+    var btn=document.createElement("a"); btn.className="toggle-all"; btn.textContent="collapse all";
+    btn.addEventListener("click",function(){
+      var collapse=btn.textContent==="collapse all";
+      mods.forEach(function(m){ m.classList.toggle("collapsed",collapse); });
+      btn.textContent=collapse?"expand all":"collapse all";
+    });
+    sum.parentNode.insertBefore(btn,sum.nextSibling);
+  }
+})();
 
 </script>
 </html>;)";

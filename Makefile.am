@@ -14,20 +14,23 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
 # General Public License for more details.
 
-EXTRA_DIST = README.md LICENSE Configuration example.fq test
+EXTRA_DIST = README.md LICENSE AUTHORS Configuration example.fq test
 
 ACLOCAL_AMFLAGS = -I m4
 
 # ADS: fix the order of user and project set vars; shouldn't need to worry about
 # setting CXXFLAGS in configure.ac
-AM_CXXFLAGS = -Wall -Wextra -Wpedantic
+# -pthread: std::thread overlaps gzip decompression with parsing
+# OPENMP_CXXFLAGS: OpenMP powers the multi-threaded (-t) parser (from AC_OPENMP)
+AM_CXXFLAGS = -Wall -Wextra -Wpedantic -pthread $(OPENMP_CXXFLAGS)
+AM_LDFLAGS = -pthread $(OPENMP_CXXFLAGS)
 if ENABLE_HTS
 CPPFLAGS += -DUSE_HTS
 endif
 
-bin_PROGRAMS = falco
+bin_PROGRAMS = falcoAmadeus
 
-falco_SOURCES = \
+falcoAmadeus_SOURCES = \
 	src/falco.cpp \
 	src/FastqStats.cpp \
 	src/HtmlMaker.cpp \
