@@ -780,23 +780,15 @@ ModulePerBaseSequenceQuality::make_html_data() {
     uq << group_uquartile[i];
     lq << group_lquartile[i];
   }
-  const std::string xs = x.str();
+  // One precomputed box trace (box = 25-75% IQR, whiskers = 10-90%, line =
+  // median) instead of a separate box glyph per position -- the recognizable
+  // FastQC standard, rendered cleanly.
   std::ostringstream data;
-  // outer 10-90% band: an invisible upper line, then the lower line fills up
-  data << "{x:[" << xs << "],y:[" << ud.str()
-       << "],mode:'lines',line:{width:0},hoverinfo:'skip',showlegend:false},";
-  data << "{x:[" << xs << "],y:[" << ld.str()
-       << "],mode:'lines',line:{width:0},fill:'tonexty',"
-          "fillcolor:'rgba(11,107,203,0.14)',name:'10-90%',hoverinfo:'skip'},";
-  // inner 25-75% IQR band
-  data << "{x:[" << xs << "],y:[" << uq.str()
-       << "],mode:'lines',line:{width:0},hoverinfo:'skip',showlegend:false},";
-  data << "{x:[" << xs << "],y:[" << lq.str()
-       << "],mode:'lines',line:{width:0},fill:'tonexty',"
-          "fillcolor:'rgba(11,107,203,0.34)',name:'25-75% (IQR)',hoverinfo:'skip'},";
-  // median line
-  data << "{x:[" << xs << "],y:[" << med.str()
-       << "],mode:'lines',line:{width:2.2,color:'#0b6bcb'},name:'median'}";
+  data << "{type:'box',x:[" << x.str() << "],lowerfence:[" << ld.str()
+       << "],q1:[" << lq.str() << "],median:[" << med.str() << "],q3:[" << uq.str()
+       << "],upperfence:[" << ud.str()
+       << "],fillcolor:'rgba(221,170,51,0.6)',line:{color:'#8a6d1f',width:1},"
+          "marker:{color:'#8a6d1f'},whiskerwidth:0.35,showlegend:false,hoverinfo:'x'}";
   return data.str();
 }
 

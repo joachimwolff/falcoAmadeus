@@ -387,7 +387,8 @@ if (document.getElementById('seqbasequalityboxplot') !== null) {
   Plotly.newPlot('seqbasequalityboxplot', [
    {{perbasesequencequalitydata}}
   ], {
-    showlegend: true,
+    showlegend: false,
+    boxgap: 0.45,
     xaxis : {title : 'Base position'},
     yaxis : {title : 'Phred quality', range : [0, 42]},
     shapes : [
