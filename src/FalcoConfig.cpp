@@ -271,6 +271,61 @@ endswith(const std::string &fn, const std::string &extn) {
 }
 
 /********************************************************************/
+/******************** ASSAY PROFILE TABLE **************************/
+/********************************************************************/
+// Each row relaxes ONLY the modules that misfire against the WGS null for that
+// library type; see AssayProfile in FalcoConfig.hpp. Adjustments are grounded
+// in the expected biology of each assay:
+//   exome    : exonic GC is shifted high; on-target reads duplicate.
+//   amplicon : base composition is primer-locked; PCR products duplicate and
+//              read as "overrepresented" by design.
+//   16s      : conserved-primer amplicon; like amplicon.
+//   rnaseq   : random-hexamer priming skews the first ~13 bases (5' bias);
+//              highly expressed transcripts duplicate / look overrepresented.
+//   smallrna : reads ARE the (short) miRNAs, so they are all "overrepresented"
+//              and heavily duplicated by design.
+//   atac     : Tn5 transposition imposes a ~11bp insertion-site motif at 5';
+//              open-chromatin pileups duplicate.
+//   chipseq  : peak pileups duplicate.
+//   wgbs/emseq/rrbs : bisulfite/EM conversion depletes C (or G) and shifts GC
+//              down; rrbs additionally has an MspI CGG/TGG motif in bases 1-3.
+static const std::unordered_map<std::string, AssayProfile> assay_profiles = [] {
+  std::unordered_map<std::string, AssayProfile> m;
+  auto add = [&m](AssayProfile p) { m[p.name] = p; };
+
+  // name, mask, suppress, methylation, relax_gc, downgrade_dup, downgrade_over
+  add({"generic", 0, false, false, false, false, false});
+  add({"wgs",     0, false, false, false, false, false});
+  add({"exome",   0, false, false, true,  true,  false});
+  add({"amplicon",0, true,  false, true,  true,  true});
+  add({"16s",     0, true,  false, true,  true,  true});
+  add({"rnaseq",  13, false, false, true,  true,  true});
+  add({"smallrna",0, true,  false, true,  true,  true});
+  add({"atac",    11, false, false, false, true,  false});
+  add({"chipseq", 0, false, false, false, true,  false});
+  add({"wgbs",    0, false, true,  true,  false, false});
+  add({"emseq",   0, false, true,  true,  false, false});
+  add({"rrbs",    3, false, true,  true,  true,  false});
+  return m;
+}();
+
+bool
+get_assay_profile(const std::string &assay, AssayProfile &profile) {
+  const auto it = assay_profiles.find(assay);
+  if (it == std::cend(assay_profiles))
+    return false;
+  profile = it->second;
+  return true;
+}
+
+std::string
+valid_assay_list() {
+  // deterministic, human-friendly ordering (not the hash-map order)
+  return "generic, wgs, exome, amplicon, 16s, rnaseq, smallrna, atac, "
+         "chipseq, wgbs, emseq, rrbs";
+}
+
+/********************************************************************/
 /******************** FALCOCONFIG FUNCTIONS *************************/
 /********************************************************************/
 // Default config properties
@@ -282,6 +337,7 @@ FalcoConfig::FalcoConfig(const int argc, char *argv[]) {
   nogroup = false;
   is_bisulfite = false;
   is_reverse_complement = false;
+  assay = "generic";
   read_step = 1;
   format = "";
   threads = 1;
@@ -360,6 +416,11 @@ FalcoConfig::setup() {
 
   // Get filename without absolute path
   filename_stripped = std::filesystem::path(filename).filename().string();
+
+  // resolve the assay-aware grading profile (validated already in main; fall
+  // back to the no-op generic profile if something slipped through).
+  if (!get_assay_profile(assay, assay_profile))
+    get_assay_profile("generic", assay_profile);
 
   // read which modules to run and the cutoffs for pass/warn/fail
   read_limits();

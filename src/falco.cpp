@@ -29,6 +29,8 @@
 
 #include "config.h"
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -174,6 +176,10 @@ write_results(const FalcoConfig &falco_config, FastqStats &stats,
 
     // put header
     qc_data_txt << "##FalcoAmadeus\t" + std::string{VERSION} + "\n";
+    // [FalcoAmadeus] echo the active assay (only when non-default, so generic
+    // output stays byte-identical).
+    if (!falco_config.assay.empty() && falco_config.assay != "generic")
+      qc_data_txt << "##Assay\t" << falco_config.assay << "\n";
     if (do_call)
       qc_data_txt << "##Call\t" << falco_config.call << "\n";
   }
@@ -729,6 +735,18 @@ main(int argc, char *argv[]) {
       "be tested by swapping A/T and C/G",
       false, falco_config.is_reverse_complement);
 
+    opt_parse.add_opt(
+      "-assay", '\0',
+      "[FalcoAmadeus] Assay/library-type-aware grading. FastQC/falco grade "
+      "against a whole-genome-shotgun null and mis-flag expected assay biology "
+      "as failures; this relaxes ONLY the affected modules per library type "
+      "(reported data are unchanged; only pass/warn/fail plus explanatory "
+      "#Assay comments). Valid: " +
+        valid_assay_list() +
+        ". Default 'generic' is byte-identical to stock falco. wgbs/emseq/rrbs "
+        "imply bisulfite handling.",
+      false, falco_config.assay);
+
     opt_parse.add_opt("skip-data", '\0',
                       "[Falco only] Do not create FastQC data text file.",
                       false, skip_text);
@@ -817,6 +835,19 @@ main(int argc, char *argv[]) {
     if (std::size(leftover_args) == 0) {
       std::cerr << opt_parse.help_message() << '\n';
       return EXIT_SUCCESS;
+    }
+
+    // [FalcoAmadeus] validate --assay (case-insensitive) before doing any work.
+    std::transform(std::begin(falco_config.assay), std::end(falco_config.assay),
+                   std::begin(falco_config.assay),
+                   [](const unsigned char c) { return std::tolower(c); });
+    {
+      AssayProfile assay_probe;
+      if (!get_assay_profile(falco_config.assay, assay_probe)) {
+        std::cerr << "ERROR: unknown --assay '" << falco_config.assay
+                  << "'. Valid assay types: " << valid_assay_list() << '\n';
+        return EXIT_FAILURE;
+      }
     }
 
     if (std::size(leftover_args) > 1 &&
