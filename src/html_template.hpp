@@ -424,9 +424,9 @@ if (document.getElementById('seqbasequalityboxplot') !== null) {
     xaxis : {title : 'Base position'},
     yaxis : {title : 'Phred quality', range : [0, 42]},
     shapes : [
-      {type:'rect',xref:'paper',yref:'y',x0:0,x1:1,y0:28,y1:42,fillcolor:'rgba(26,158,95,0.06)',line:{width:0},layer:'below'},
-      {type:'rect',xref:'paper',yref:'y',x0:0,x1:1,y0:20,y1:28,fillcolor:'rgba(214,155,0,0.07)',line:{width:0},layer:'below'},
-      {type:'rect',xref:'paper',yref:'y',x0:0,x1:1,y0:0,y1:20,fillcolor:'rgba(214,69,69,0.08)',line:{width:0},layer:'below'}
+      {type:'rect',xref:'paper',yref:'y',x0:0,x1:1,y0:28,y1:42,fillcolor:'rgba(52,199,89,0.20)',line:{width:0},layer:'below'},
+      {type:'rect',xref:'paper',yref:'y',x0:0,x1:1,y0:20,y1:28,fillcolor:'rgba(255,159,10,0.22)',line:{width:0},layer:'below'},
+      {type:'rect',xref:'paper',yref:'y',x0:0,x1:1,y0:0,y1:20,fillcolor:'rgba(255,59,48,0.20)',line:{width:0},layer:'below'}
     ]
   });
 }
