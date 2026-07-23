@@ -1088,6 +1088,7 @@ ModulePerBaseSequenceContent::ModulePerBaseSequenceContent(
   sequence_error = sequence_limits.find("error")->second;
   is_bisulfite = config.is_bisulfite;
   is_reverse_complement = config.is_reverse_complement;
+  incomplete_conversion_residual = config.conversion_residual;
   assay = config.assay_profile;
   // A methylation assay implies bisulfite-style base-content handling on top of
   // whatever the user set with --bisulfite. Strand (is_reverse_complement) is
@@ -1256,12 +1257,12 @@ ModulePerBaseSequenceContent::make_grade() {
     assay_annotations.push_back(
       tag + "bisulfite/EM library: " + role + " depletion expected");
 
-    if (methyl_residual > kIncompleteConversionResidual) {
+    if (methyl_residual > incomplete_conversion_residual) {
       const std::string base(1, methyl_depleted_base);
       assay_annotations.push_back(
         tag + "possible incomplete bisulfite conversion (residual " + base +
         " " + fmt_pct(100.0 * methyl_residual) + "% > " +
-        fmt_pct(100.0 * kIncompleteConversionResidual) +
+        fmt_pct(100.0 * incomplete_conversion_residual) +
         "%); verify with CHH/spike-in conversion rate downstream");
       // soft-flag only; NEVER hard-FAIL on a raw-read conversion estimate.
       if (grade == "pass")

@@ -153,6 +153,8 @@ struct FalcoConfig {
    ************************************************************/
   bool is_bisulfite;
   bool is_reverse_complement;
+  // [FalcoAmadeus] methylation incomplete-conversion warn threshold (fraction)
+  double conversion_residual;
 
   // --assay <TYPE>: assay-aware grading. "generic" (default) == stock falco.
   std::string assay;

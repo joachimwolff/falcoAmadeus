@@ -337,6 +337,7 @@ FalcoConfig::FalcoConfig(const int argc, char *argv[]) {
   nogroup = false;
   is_bisulfite = false;
   is_reverse_complement = false;
+  conversion_residual = kIncompleteConversionResidual;
   assay = "generic";
   read_step = 1;
   format = "";

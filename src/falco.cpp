@@ -433,6 +433,9 @@ struct GzFastqPairReader {
         return false;
       throw std::runtime_error("read error in file: " + filename);
     }
+    // tolerate blank line(s) at end of file (a FASTQ header is never empty)
+    if (header.empty())
+      return false;
     if (!read_line(seq) || !read_line(plus) || !read_line(qual))
       throw std::runtime_error("truncated FASTQ record in file: " + filename);
     return true;
@@ -499,6 +502,9 @@ run_paired_duplication(const std::string &r1_file, const std::string &r2_file,
     os << labels[i] << "\t" << pe.percentage_deduplicated[i] << "\t"
        << pe.percentage_total[i] << "\n";
 
+  // Note: this paired pass always scans every pair, so these naive figures use
+  // read_step == 1 even if --subsample was set for the single-end run; they are
+  // a like-for-like comparison against the paired estimate above.
   os << "#Naive single-end estimates (overcount PCR duplication):\n";
   os << "Read1-only Total Deduplicated Percentage\t" << n1.total_deduplicated_pct
      << "\n";
@@ -730,6 +736,14 @@ main(int argc, char *argv[]) {
       false, falco_config.is_bisulfite);
 
     opt_parse.add_opt(
+      "conversion-residual", '\0',
+      "[FalcoAmadeus] For methylation assays (--assay wgbs/emseq/rrbs): "
+      "residual unmethylated-base fraction (0-1) above which a possible "
+      "incomplete-conversion warning is emitted. Heuristic only; the "
+      "authoritative check is the post-alignment non-CpG conversion rate.",
+      false, falco_config.conversion_residual);
+
+    opt_parse.add_opt(
       "reverse-complement", 'r',
       "[Falco only] The input is a reverse-complement. All modules will "
       "be tested by swapping A/T and C/G",
@@ -959,6 +973,14 @@ main(int argc, char *argv[]) {
       //
       falco_config.setup();
 
+      // [FalcoAmadeus] fail fast: --paired-with only supports FASTQ; reject a
+      // SAM/BAM R1 here (format is known after setup) before writing any output.
+      if (!paired_with_file.empty() &&
+          (falco_config.is_sam || falco_config.is_bam))
+        throw std::runtime_error(
+          "--paired-with only supports FASTQ/FASTQ.gz inputs; the R1 file "
+          "was detected as SAM/BAM which is out of scope for v1.");
+
       /****************** END PROCESSING CONFIG *******************/
       if (!falco_config.quiet)
         log_process("Started reading file " + falco_config.filename);
@@ -1045,11 +1067,7 @@ main(int argc, char *argv[]) {
       // extra lockstep pass over R1 (this file) and R2 (--paired-with) without
       // touching the single-end output above.
       if (!paired_with_file.empty()) {
-        if (falco_config.is_sam || falco_config.is_bam) {
-          throw std::runtime_error(
-            "--paired-with only supports FASTQ/FASTQ.gz inputs; the R1 file "
-            "was detected as SAM/BAM which is out of scope for v1.");
-        }
+        // R1 format was already validated as FASTQ right after setup() above
         const std::string paired_out =
           cur_outdir + "/" + file_prefix + "paired_duplication.txt";
         if (!falco_config.quiet)

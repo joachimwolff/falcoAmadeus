@@ -226,6 +226,8 @@ struct ModulePerBaseSequenceContent : public Module {
 
   bool is_bisulfite{};           // flag for dataset is WGBS
   bool is_reverse_complement{};  // indicates test T vs C instead of A vs G
+  // [FalcoAmadeus] methylation incomplete-conversion warn threshold (fraction)
+  double incomplete_conversion_residual{kIncompleteConversionResidual};
 
   // [FalcoAmadeus] assay-aware grading
   AssayProfile assay;
