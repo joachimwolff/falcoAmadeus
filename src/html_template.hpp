@@ -25,7 +25,7 @@
 constexpr auto falco_config_html_template = R"(<html>
 <head>
     <meta charset="utf-8">
-    <script>(function(){var t;try{t=localStorage.getItem('falco-theme');}catch(e){}if(!t)t=(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light';document.documentElement.setAttribute('data-theme',t);})();</script>
+    <script>(function(){var d=document.documentElement,t;try{t=localStorage.getItem('falco-theme');}catch(e){}if(!t)t=(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light';d.setAttribute('data-theme',t);try{if(localStorage.getItem('falco-contrast')==='high')d.setAttribute('data-contrast','high');}catch(e){}})();</script>
     <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
 
 	<title>
@@ -39,6 +39,7 @@ constexpr auto falco_config_html_template = R"(<html>
   --text:#1d1d1f; --muted:#6e6e73; --brand:#0071e3; --brand-2:#42a5ff;
   --pass:#34c759; --warn:#ff9f0a; --fail:#ff3b30;
   --header-bg:rgba(255,255,255,.72);
+  --wash-1:rgba(0,113,227,.38); --wash-2:rgba(124,77,255,.32); --wash-3:rgba(0,199,190,.26);
   --shadow:0 8px 30px rgba(0,0,0,.06),0 1px 2px rgba(0,0,0,.05);
   --shadow-lg:0 18px 50px rgba(0,0,0,.10);
   --radius:18px; --sidebar-w:19em;
@@ -46,7 +47,13 @@ constexpr auto falco_config_html_template = R"(<html>
 * { box-sizing:border-box; }
 html { scroll-behavior:smooth; }
 body {
-  color:var(--text); background:var(--bg); margin:0; padding:0;
+  color:var(--text); margin:0; padding:0;
+  background:
+    radial-gradient(1100px 620px at 8% -8%, var(--wash-1), transparent 62%),
+    radial-gradient(1000px 560px at 102% 4%, var(--wash-2), transparent 58%),
+    radial-gradient(900px 700px at 60% 108%, var(--wash-3), transparent 60%),
+    var(--bg);
+  background-attachment:fixed;
   font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display','SF Pro Text','Segoe UI',Roboto,Helvetica,Arial,sans-serif;
   font-size:15px; line-height:1.55; -webkit-font-smoothing:antialiased;
   letter-spacing:-.006em;
@@ -61,15 +68,8 @@ div.header {
   padding:.9em 1.6em; font-size:100%;
 }
 #header_title {
-  float:none; display:inline-flex; align-items:center; gap:.55em;
-  font-size:1.6rem; font-weight:700; letter-spacing:-.022em;
-  background:linear-gradient(135deg,var(--brand),#7c4dff);
-  -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent;
-}
-#header_title::before {
-  content:""; width:1.55em; height:1.55em; border-radius:.42em; -webkit-text-fill-color:initial;
-  background:linear-gradient(135deg,var(--brand),#7c4dff);
-  box-shadow:0 4px 12px rgba(0,113,227,.4);
+  float:none; display:inline-flex; align-items:center;
+  font-size:1.6rem; font-weight:700; letter-spacing:-.022em; color:var(--text);
 }
 #header_filename {
   float:none; text-align:right; font-size:.82rem; color:var(--muted);
@@ -182,11 +182,22 @@ img.indented { margin-left:3em; } p { margin-top:0; }
   --text:#f5f5f7; --muted:#98989d; --brand:#0a84ff; --brand-2:#64d2ff;
   --pass:#30d158; --warn:#ff9f0a; --fail:#ff453a;
   --header-bg:rgba(28,28,30,.72);
+  --wash-1:rgba(10,132,255,.26); --wash-2:rgba(191,90,242,.20); --wash-3:rgba(0,199,190,.15);
   --shadow:0 8px 30px rgba(0,0,0,.5),0 1px 2px rgba(0,0,0,.6);
   --shadow-lg:0 18px 50px rgba(0,0,0,.6);
 }
-:root[data-theme="dark"] #header_title { background:linear-gradient(135deg,#0a84ff,#bf5af2); -webkit-background-clip:text; background-clip:text; }
-:root[data-theme="dark"] #header_title::before { background:linear-gradient(135deg,#0a84ff,#bf5af2); box-shadow:0 4px 12px rgba(10,132,255,.5); }
+/* High-contrast mode: darker ink, stronger borders, flat (untinted) surfaces */
+:root[data-contrast="high"] {
+  --text:#000000; --muted:#3a3a3c; --border:#9a9aa2;
+  --wash-1:transparent; --wash-2:transparent; --wash-3:transparent;
+  --surface-2:#eaeaef; --header-bg:rgba(255,255,255,.92);
+}
+:root[data-contrast="high"][data-theme="dark"] {
+  --text:#ffffff; --muted:#d0d0d6; --border:#70707a;
+  --surface-2:#3a3a3e; --header-bg:rgba(20,20,22,.92);
+}
+:root[data-contrast="high"] div.module { border-width:1.5px; }
+:root[data-contrast="high"] a { text-decoration:underline; }
 button.theme-toggle {
   border:1px solid var(--border); background:var(--surface-2); color:var(--text);
   border-radius:999px; width:2.1em; height:2.1em; font-size:1rem; line-height:1;
@@ -194,6 +205,7 @@ button.theme-toggle {
   padding:0; margin-left:.15em; flex:0 0 auto; transition:background .15s, transform .15s;
 }
 button.theme-toggle:hover { background:var(--brand); color:#fff; transform:scale(1.08); }
+:root[data-contrast="high"] button.theme-toggle.contrast-toggle { background:var(--brand); color:#fff; }
 </style>
 <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
 </head>
@@ -579,8 +591,14 @@ if (document.getElementById('kmerlineplot') !== null) {
     try{localStorage.setItem('falco-theme',t);}catch(e){}
     btn.textContent=(t==='dark')?'☀':'☾'; applyPlotTheme(t==='dark'); }
   btn.onclick=function(){ set(root.getAttribute('data-theme')==='dark'?'light':'dark'); };
+  // contrast toggle: normal <-> high-contrast
+  var cbtn=document.createElement('button');
+  cbtn.className='theme-toggle contrast-toggle'; cbtn.title='Toggle high contrast'; cbtn.textContent='◐';
+  function setc(c){ if(c==='high'){root.setAttribute('data-contrast','high');}else{root.removeAttribute('data-contrast');}
+    try{localStorage.setItem('falco-contrast',c);}catch(e){} }
+  cbtn.onclick=function(){ setc(root.getAttribute('data-contrast')==='high'?'normal':'high'); };
   var title=document.querySelector('#header_title');
-  if(title) title.parentNode.insertBefore(btn,title.nextSibling);
+  if(title){ title.parentNode.insertBefore(btn,title.nextSibling); btn.parentNode.insertBefore(cbtn,btn.nextSibling); }
   set(root.getAttribute('data-theme')||'light');
   window.addEventListener('load',function(){ applyPlotTheme(root.getAttribute('data-theme')==='dark'); });
 })();
