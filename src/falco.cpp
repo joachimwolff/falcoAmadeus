@@ -491,6 +491,18 @@ run_paired_duplication(const std::string &r1_file, const std::string &r2_file,
   os << "Read2 file\t" << r2_file << "\n";
   os << "Total read pairs\t" << num_pairs << "\n";
 
+  // Explicit PCR-duplicate rate (= 100 - deduplicated%); LOWER is better. The
+  // paired value is the correct one; the naive single-end values OVERESTIMATE
+  // duplication because they collapse fragments that share only one mate. (The
+  // FastQC-style "Total Deduplicated Percentage" below -- the fraction of reads
+  // that are UNIQUE, i.e. 100 - duplicate rate -- is reported for compatibility.)
+  os << "#PCR duplicate rate (%), lower is better:\n";
+  os << "Paired-end (correct)\t" << (100.0 - pe.total_deduplicated_pct) << "\n";
+  os << "Naive Read1-only (overestimate)\t"
+     << (100.0 - n1.total_deduplicated_pct) << "\n";
+  os << "Naive Read2-only (overestimate)\t"
+     << (100.0 - n2.total_deduplicated_pct) << "\n";
+
   os << "#Paired-end (correct) Total Deduplicated Percentage\t"
      << pe.total_deduplicated_pct << "\n";
   os << "#Duplication Level\tPercentage of deduplicated\t"

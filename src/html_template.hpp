@@ -106,6 +106,20 @@ div.module h2.pass::before { background:var(--pass); }
 div.module h2.warn::before { background:var(--warn); }
 div.module h2.fail::before { background:var(--fail); }
 div.module h2.pass, div.module h2.warn, div.module h2.fail { color:var(--text); }
+div.module h2.collapsible { cursor:pointer; user-select:none; }
+div.module h2.collapsible::after {
+  content:""; margin-left:auto; flex:0 0 auto; width:.5em; height:.5em; margin-top:-.15em;
+  border-right:2px solid var(--muted); border-bottom:2px solid var(--muted);
+  transform:rotate(45deg); transition:transform .15s;
+}
+div.module.collapsed h2.collapsible { margin-bottom:0; padding-bottom:0; border-bottom:0; }
+div.module.collapsed h2.collapsible::after { transform:rotate(-45deg); margin-top:.15em; }
+div.module.collapsed { padding-bottom:1em; }
+div.module.collapsed > :not(h2) { display:none; }
+a.toggle-all {
+  display:inline-block; margin:.1em 0 .7em .5em; font-size:.72rem;
+  color:var(--brand); cursor:pointer; font-weight:600;
+}
 div.module > div[id] { width:100%; }
 .pass { color:var(--pass); } .warn { color:var(--warn); } .fail { color:var(--fail); }
 table {
@@ -440,6 +454,29 @@ if (document.getElementById('kmerlineplot') !== null) {
     yaxis : {title : 'log2(obs/ exp max)'}
   } );
 }
+
+// [FalcoAmadeus] make each module collapsible (click its header to toggle).
+// Runs after the plots are drawn, so every plot renders at full width first.
+(function(){
+  var mods = document.querySelectorAll('div.module');
+  mods.forEach(function(m){
+    var h = m.querySelector('h2');
+    if (!h) return;
+    h.classList.add('collapsible');
+    h.addEventListener('click', function(){ m.classList.toggle('collapsed'); });
+  });
+  var sum = document.querySelector('div.summary h2');
+  if (sum) {
+    var btn = document.createElement('a');
+    btn.className = 'toggle-all'; btn.textContent = 'collapse all';
+    btn.addEventListener('click', function(){
+      var collapse = btn.textContent === 'collapse all';
+      mods.forEach(function(m){ m.classList.toggle('collapsed', collapse); });
+      btn.textContent = collapse ? 'expand all' : 'collapse all';
+    });
+    sum.parentNode.insertBefore(btn, sum.nextSibling);
+  }
+})();
 
 </script>
 </html>;)";
