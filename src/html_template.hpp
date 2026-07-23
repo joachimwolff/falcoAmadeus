@@ -401,7 +401,10 @@ crossorigin="anonymous"></script>
   var FONT={family:'-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif',size:12,color:'#3a4553'};
   // Grid is visible by default (a clear reference grid on every plot).
   var AX={gridcolor:'#d6dbe3',zerolinecolor:'#c4cbd4',linecolor:'#b7bec9',ticks:'outside',tickcolor:'#b7bec9',tickfont:{size:11,color:'#697586'},gridwidth:1,automargin:true};
-  var THEME={paper_bgcolor:'rgba(0,0,0,0)',plot_bgcolor:'rgba(0,0,0,0)',colorway:window.FALCO_PALETTES[PAL].slice(),boxgap:0.28,boxgroupgap:0.2,legend:{borderwidth:0}};
+  // Legend as a horizontal row BELOW the figure so it never collides with the
+  // modebar (camera/zoom toolbar), which Plotly pins to the top-right corner.
+  var LEGEND={orientation:'h',xanchor:'center',x:0.5,yanchor:'top',y:-0.22,borderwidth:0,font:{size:11}};
+  var THEME={paper_bgcolor:'rgba(0,0,0,0)',plot_bgcolor:'rgba(0,0,0,0)',colorway:window.FALCO_PALETTES[PAL].slice(),boxgap:0.28,boxgroupgap:0.2,legend:LEGEND};
   var CFG={displaylogo:false,responsive:true,displayModeBar:'hover',modeBarButtonsToRemove:['select2d','lasso2d','autoScale2d','toggleSpikelines','hoverClosestCartesian','hoverCompareCartesian']};
   var orig=Plotly.newPlot;
   Plotly.newPlot=function(id,data,layout,config){
@@ -410,7 +413,8 @@ crossorigin="anonymous"></script>
     L.font=Object.assign({},FONT,layout.font);
     L.xaxis=Object.assign({},AX,layout.xaxis);
     L.yaxis=Object.assign({},AX,layout.yaxis);
-    L.margin=Object.assign({t:12,r:18,b:54,l:60},layout.margin);
+    L.legend=Object.assign({},LEGEND,layout.legend);
+    L.margin=Object.assign({t:34,r:18,b:70,l:60},layout.margin);
     return orig.call(Plotly,id,data,L,Object.assign({},CFG,config));
   };
 })();
