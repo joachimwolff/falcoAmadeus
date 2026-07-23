@@ -631,13 +631,8 @@ StreamReader::read_quality_line(FastqStats &stats) {
 /*************** POST LINE PROCESSING ******************/
 /*******************************************************/
 /*************** THIS IS VERY SLOW ********************/
-// if reads are >75pb, truncate to 50 akin to FastQC
-inline std::size_t
-get_truncate_point(const std::size_t read_pos) {
-  return (read_pos <= Constants::unique_reads_max_length)
-           ? read_pos
-           : Constants::unique_reads_truncate;
-}
+// get_truncate_point() is defined inline in StreamReader.hpp so it can be
+// shared with the paired-end duplication pass.
 
 void
 StreamReader::postprocess_fastq_record(FastqStats &stats) {

@@ -49,6 +49,15 @@
  ******************** STREAM READER **************************
  *************************************************************/
 
+// If reads are >75bp, truncate to 50 akin to FastQC. Defined here (inline) so
+// the paired-end duplication pass can reuse the identical truncation rule.
+inline std::size_t
+get_truncate_point(const std::size_t read_pos) {
+  return (read_pos <= Constants::unique_reads_max_length)
+           ? read_pos
+           : Constants::unique_reads_truncate;
+}
+
 // Per-read record of a read's contribution to the FastQC GC model. In the
 // multi-threaded path workers cannot accumulate stats.gc_count directly (double
 // addition is not associative, so a reordered sum would not be byte-identical);

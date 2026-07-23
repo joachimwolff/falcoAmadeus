@@ -26,6 +26,13 @@
 #include <utility>
 #include <vector>
 
+// FastQC extrapolation of counts to the full file size. Declared here so the
+// paired-end duplication pass (falco.cpp) can reuse the exact same math as
+// ModuleSequenceDuplicationLevels instead of forking it.
+double
+get_corrected_count(std::size_t count_at_limit, std::size_t num_reads,
+                    std::size_t dup_level, std::size_t num_obs);
+
 /* base groups for longer reads, copied from FastQC*/
 struct BaseGroup {
   std::size_t start{};

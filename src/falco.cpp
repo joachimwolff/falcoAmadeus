@@ -34,6 +34,11 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include <array>
+#include <unordered_map>
+#include <stdexcept>
+
+#include <zlib.h>
 
 // Function to get seconds elapsed in program
 static std::size_t
@@ -268,6 +273,239 @@ write_results(const FalcoConfig &falco_config, FastqStats &stats,
     html << html_maker.html_boilerplate;
 }
 
+/*********************************************************************
+ ****************** PAIRED-END DUPLICATION (FalcoAmadeus) *************
+ *********************************************************************/
+// falco/FastQC deduplicate each mate file independently, which overcounts PCR
+// duplication for paired-end data: two distinct fragments that share the same
+// R1 prefix (very common after the 50bp truncation) get miscounted as
+// duplicates. A read PAIR is a true duplicate only if BOTH mates match. This
+// opt-in pass runs a lockstep scan over R1 and R2 and writes a corrected
+// paired-end duplication report, reusing falco's own duplication math.
+
+namespace {
+
+// Duplication counter that mirrors StreamReader::postprocess_fastq_record
+// exactly (same stop-at-100k-unique-keys and count_at_limit bookkeeping), so
+// the numbers stay consistent with the single-end module. num_reads is
+// incremented AFTER the counting logic, matching the single-end code where
+// stats.num_reads is bumped only after postprocess runs.
+struct PairedDupCounter {
+  std::unordered_map<std::string, std::size_t> sequence_count;
+  std::size_t num_reads = 0;
+  std::size_t num_unique_seen = 0;
+  std::size_t count_at_limit = 0;
+  bool continue_storing = true;
+
+  void
+  add(const std::string &key) {
+    const auto it = sequence_count.find(key);
+    if (it == sequence_count.end()) {
+      if (continue_storing) {
+        sequence_count.emplace(key, 1);
+        count_at_limit = num_reads;
+        ++num_unique_seen;
+        if (num_unique_seen == Constants::unique_reads_stop_counting)
+          continue_storing = false;
+      }
+    }
+    else {
+      ++it->second;
+      count_at_limit += continue_storing;
+    }
+    ++num_reads;
+  }
+};
+
+// Corrected duplication-level distribution, reusing the exact computation from
+// ModuleSequenceDuplicationLevels::summarize_module (Module.cpp), including the
+// size_t truncation of the corrected counts, so results match falco's module.
+struct DupResult {
+  double total_deduplicated_pct = 0.0;
+  std::array<double, 16> percentage_deduplicated{};
+  std::array<double, 16> percentage_total{};
+};
+
+DupResult
+summarize_dup(const PairedDupCounter &c) {
+  DupResult r;
+  double seq_total = 0.0;
+  double seq_dedup = 0.0;
+
+  // Key is frequency (r), value is number of sequences seen with that frequency
+  std::unordered_map<std::size_t, std::size_t> counts_by_freq;
+  for (const auto &v : c.sequence_count)
+    counts_by_freq[v.second]++;
+
+  // FastQC corrected extrapolation (note: stored back into a size_t map, so the
+  // double is truncated - this matches summarize_module byte-for-byte)
+  for (auto v : counts_by_freq)
+    counts_by_freq[v.first] =
+      get_corrected_count(c.count_at_limit, c.num_reads, v.first, v.second);
+
+  for (auto v : counts_by_freq) {
+    std::size_t dup_slot = v.first - 1;
+    if (v.first >= 10000)
+      dup_slot = 15;
+    else if (v.first >= 5000)
+      dup_slot = 14;
+    else if (v.first >= 1000)
+      dup_slot = 13;
+    else if (v.first >= 500)
+      dup_slot = 12;
+    else if (v.first >= 100)
+      dup_slot = 11;
+    else if (v.first >= 50)
+      dup_slot = 10;
+    else if (v.first >= 10)
+      dup_slot = 9;
+
+    r.percentage_deduplicated[dup_slot] += v.second;
+    r.percentage_total[dup_slot] += v.second * v.first;
+
+    seq_total += v.second * v.first;
+    seq_dedup += v.second;
+  }
+
+  r.total_deduplicated_pct = 100.0 * seq_dedup / std::max(1.0, seq_total);
+
+  for (auto &v : r.percentage_deduplicated)
+    v = 100.0 * v / std::max(1.0, seq_dedup);
+  for (auto &v : r.percentage_total)
+    v = 100.0 * v / std::max(1.0, seq_total);
+
+  return r;
+}
+
+// Minimal FASTQ reader over zlib. gzopen/gzgets transparently handle both plain
+// and gzipped input, so a single path covers .fastq and .fastq.gz.
+struct GzFastqPairReader {
+  gzFile fp = nullptr;
+  std::string filename;
+  std::vector<char> buf;
+
+  explicit GzFastqPairReader(const std::string &fn) :
+    filename(fn), buf(1 << 16) {
+    fp = gzopen(fn.c_str(), "rb");
+    if (fp == nullptr)
+      throw std::runtime_error("cannot open paired-end input file: " + fn);
+  }
+  ~GzFastqPairReader() {
+    if (fp != nullptr)
+      gzclose(fp);
+  }
+  GzFastqPairReader(const GzFastqPairReader &) = delete;
+  GzFastqPairReader &operator=(const GzFastqPairReader &) = delete;
+
+  // Reads one line into out (without trailing \r/\n). Returns false at EOF.
+  bool
+  read_line(std::string &out) {
+    out.clear();
+    bool got_any = false;
+    while (true) {
+      if (gzgets(fp, buf.data(), static_cast<int>(buf.size())) == nullptr)
+        return got_any;
+      got_any = true;
+      out.append(buf.data());
+      if (!out.empty() && out.back() == '\n') {
+        out.pop_back();
+        if (!out.empty() && out.back() == '\r')
+          out.pop_back();
+        return true;
+      }
+      // line longer than buffer: keep appending
+    }
+  }
+
+  // Reads one FASTQ record, returning the (untruncated) sequence in seq.
+  // Returns false cleanly at end of file; throws on a truncated record.
+  bool
+  next_sequence(std::string &seq) {
+    std::string header, plus, qual;
+    if (!read_line(header)) {
+      if (gzeof(fp))
+        return false;
+      throw std::runtime_error("read error in file: " + filename);
+    }
+    if (!read_line(seq) || !read_line(plus) || !read_line(qual))
+      throw std::runtime_error("truncated FASTQ record in file: " + filename);
+    return true;
+  }
+};
+
+void
+run_paired_duplication(const std::string &r1_file, const std::string &r2_file,
+                       const std::string &out_file, const bool quiet) {
+  GzFastqPairReader r1(r1_file);
+  GzFastqPairReader r2(r2_file);
+
+  PairedDupCounter pair_ctr;  // correct: key = R1_trunc \0 R2_trunc
+  PairedDupCounter r1_ctr;    // naive single-end estimate on R1 only
+  PairedDupCounter r2_ctr;    // naive single-end estimate on R2 only
+
+  std::string s1, s2, k1, k2, pair_key;
+  std::size_t num_pairs = 0;
+  while (true) {
+    const bool got1 = r1.next_sequence(s1);
+    const bool got2 = r2.next_sequence(s2);
+    if (got1 != got2)
+      throw std::runtime_error(
+        "paired-end inputs have different numbers of reads: " + r1_file +
+        " and " + r2_file);
+    if (!got1)
+      break;
+
+    k1.assign(s1, 0, get_truncate_point(s1.size()));
+    k2.assign(s2, 0, get_truncate_point(s2.size()));
+    pair_key.clear();
+    pair_key.append(k1);
+    pair_key.push_back('\0');
+    pair_key.append(k2);
+
+    pair_ctr.add(pair_key);
+    r1_ctr.add(k1);
+    r2_ctr.add(k2);
+    ++num_pairs;
+  }
+
+  const DupResult pe = summarize_dup(pair_ctr);
+  const DupResult n1 = summarize_dup(r1_ctr);
+  const DupResult n2 = summarize_dup(r2_ctr);
+
+  std::ofstream os(out_file, std::ofstream::binary);
+  if (!os.good())
+    throw std::runtime_error("Failed to create paired duplication file: " +
+                             out_file);
+
+  os << "##FalcoAmadeus-PairedDuplication\t" << std::string{VERSION} << "\n";
+  os << "Read1 file\t" << r1_file << "\n";
+  os << "Read2 file\t" << r2_file << "\n";
+  os << "Total read pairs\t" << num_pairs << "\n";
+
+  os << "#Paired-end (correct) Total Deduplicated Percentage\t"
+     << pe.total_deduplicated_pct << "\n";
+  os << "#Duplication Level\tPercentage of deduplicated\t"
+     << "Percentage of total\n";
+  static const char *labels[16] = {"1",   "2",   "3",    "4",   "5",  "6",
+                                    "7",   "8",   "9",    ">10", ">50", ">100",
+                                    ">500", ">1k", ">5k", ">10k+"};
+  for (std::size_t i = 0; i < 16; ++i)
+    os << labels[i] << "\t" << pe.percentage_deduplicated[i] << "\t"
+       << pe.percentage_total[i] << "\n";
+
+  os << "#Naive single-end estimates (overcount PCR duplication):\n";
+  os << "Read1-only Total Deduplicated Percentage\t" << n1.total_deduplicated_pct
+     << "\n";
+  os << "Read2-only Total Deduplicated Percentage\t" << n2.total_deduplicated_pct
+     << "\n";
+
+  if (!quiet)
+    std::cerr << "[paired-end duplication] wrote " << out_file << " ("
+              << num_pairs << " pairs)\n";
+}
+
+}  // namespace
+
 int
 main(int argc, char *argv[]) {
 
@@ -300,6 +538,9 @@ main(int argc, char *argv[]) {
     std::string data_filename = "";
     std::string report_filename = "";
     std::string summary_filename = "";
+
+    // [FalcoAmadeus] optional R2 file for corrected paired-end duplication
+    std::string paired_with_file = "";
 
     /****************** COMMAND LINE OPTIONS ********************/
     OptionParser opt_parse(argv[0],
@@ -543,6 +784,16 @@ main(int argc, char *argv[]) {
                       "[Falco only] Report a progress bar while running.",
                       false, falco_config.progress);
 
+    opt_parse.add_opt(
+      "-paired-with", '\0',
+      "[FalcoAmadeus] Path to the mate (R2) FASTQ/FASTQ.gz file. The primary "
+      "positional input is treated as R1 and analysed single-end exactly as "
+      "usual; ADDITIONALLY a lockstep pass over R1+R2 writes a corrected "
+      "paired-end PCR-duplication report to <outdir>/<prefix>paired_duplication"
+      ".txt. A pair is a duplicate only if BOTH mates match, avoiding the "
+      "overcounting of naive single-end dedup. SAM/BAM not supported.",
+      false, paired_with_file);
+
     std::vector<std::string> leftover_args;
     opt_parse.parse(argc, argv, leftover_args);
     if (argc == 1 || opt_parse.help_requested()) {
@@ -577,6 +828,21 @@ main(int argc, char *argv[]) {
                 << " require multiple outputs, so they will be resolved by"
                 << " the input filenames instead\n";
       return EXIT_FAILURE;
+    }
+
+    // [FalcoAmadeus] --paired-with requires exactly one R1 input file
+    if (!paired_with_file.empty()) {
+      if (std::size(leftover_args) != 1) {
+        std::cerr << "ERROR: --paired-with requires exactly one positional "
+                  << "input file (the R1 file); got " << std::size(leftover_args)
+                  << ".\n";
+        return EXIT_FAILURE;
+      }
+      if (!std::filesystem::exists(paired_with_file)) {
+        std::cerr << "ERROR: --paired-with file does not exist: "
+                  << paired_with_file << '\n';
+        return EXIT_FAILURE;
+      }
     }
 
     // ADS: make sure all input files are non-empty unless user oks it
@@ -743,6 +1009,24 @@ main(int argc, char *argv[]) {
       write_results(falco_config, stats, skip_text, skip_html,
                     skip_short_summary, do_call, file_prefix, cur_outdir,
                     summary_filename, data_filename, report_filename);
+
+      // [FalcoAmadeus] corrected paired-end duplication report (opt-in). Runs an
+      // extra lockstep pass over R1 (this file) and R2 (--paired-with) without
+      // touching the single-end output above.
+      if (!paired_with_file.empty()) {
+        if (falco_config.is_sam || falco_config.is_bam) {
+          throw std::runtime_error(
+            "--paired-with only supports FASTQ/FASTQ.gz inputs; the R1 file "
+            "was detected as SAM/BAM which is out of scope for v1.");
+        }
+        const std::string paired_out =
+          cur_outdir + "/" + file_prefix + "paired_duplication.txt";
+        if (!falco_config.quiet)
+          log_process("Running paired-end duplication pass with " +
+                      paired_with_file);
+        run_paired_duplication(filename, paired_with_file, paired_out,
+                               falco_config.quiet);
+      }
 
       /************************** TIME SUMMARY *****************************/
       if (!falco_config.quiet)
