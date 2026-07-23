@@ -69,7 +69,7 @@ anaconda installer.
 
 > **Note:** the bioconda package is being submitted. Until it lands you can
 > build from source (below). The bioconda recipe lives in
-> [`recipe/`](recipe/); publishing it requires pushing a `v1.3.2` release tag
+> [`recipe/`](recipe/); publishing it requires pushing a `v1` release tag
 > to this repository, filling in the tarball `sha256` in
 > [`recipe/meta.yaml`](recipe/meta.yaml), and opening a pull request against
 > [bioconda-recipes](https://github.com/bioconda/bioconda-recipes).
@@ -77,7 +77,7 @@ anaconda installer.
 ## Installing from source (code release)
 
 Compilation from source can be done by downloading a `falco` release
-from the [releases](https://github.com/smithlabcode/falco/releases)
+from the [releases](https://github.com/joachimwolff/falco/releases)
 section above. Upon downloading the release (in `.tar.gz` or `.zip`
 format), and inflating the downloaded file to a directory
 (e.g. `falco`), move to the target directory the file was inflated
@@ -107,7 +107,7 @@ bugs. For the more advanced users who wish to test the most recent
 code, `falco` can be installed by first cloning the repository
 
 ```
-$ git clone https://github.com/smithlabcode/falco.git
+$ git clone https://github.com/joachimwolff/falco.git
 $ cd falco
 ```
 
