@@ -25,6 +25,7 @@
 constexpr auto falco_config_html_template = R"(<html>
 <head>
     <meta charset="utf-8">
+    <script>(function(){var t;try{t=localStorage.getItem('falco-theme');}catch(e){}if(!t)t=(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light';document.documentElement.setAttribute('data-theme',t);})();</script>
     <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
 
 	<title>
@@ -159,11 +160,18 @@ img.indented { margin-left:3em; } p { margin-top:0; }
   div.summary, div.footer { position:static; width:auto; height:auto; }
   div.main { margin-left:0; } div.module { break-inside:avoid; box-shadow:none; }
 }
-@media (prefers-color-scheme:dark) {
-  :root { --bg:#0f141a; --surface:#171d25; --surface-2:#1e2732; --border:#2a333f;
-    --text:#e6ebf2; --muted:#9aa6b2; --brand:#4aa3f0; --brand-2:#7cc0ff;
-    --shadow:0 1px 3px rgba(0,0,0,.45); }
+:root[data-theme="dark"] {
+  --bg:#0f141a; --surface:#171d25; --surface-2:#1e2732; --border:#2a333f;
+  --text:#e6ebf2; --muted:#9aa6b2; --brand:#4aa3f0; --brand-2:#7cc0ff;
+  --shadow:0 1px 3px rgba(0,0,0,.45);
 }
+button.theme-toggle {
+  border:1px solid var(--border); background:var(--surface); color:var(--text);
+  border-radius:8px; width:1.9em; height:1.9em; font-size:1rem; line-height:1;
+  cursor:pointer; display:inline-flex; align-items:center; justify-content:center;
+  padding:0; margin-left:.15em; flex:0 0 auto;
+}
+button.theme-toggle:hover { background:var(--surface-2); }
 </style>
 <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
 </head>
@@ -525,6 +533,33 @@ if (document.getElementById('kmerlineplot') !== null) {
     });
     sum.parentNode.insertBefore(btn,sum.nextSibling);
   }
+})();
+
+// [FalcoAmadeus] dark-mode toggle (persisted) that also re-themes the plots
+(function(){
+  var root=document.documentElement;
+  function applyPlotTheme(dark){
+    if(!window.Plotly) return;
+    var fg=dark?'#c9d3de':'#3a4553', grid=dark?'#28313c':'#eceff3',
+        line=dark?'#3a4552':'#cfd6de', tick=dark?'#9aa6b2':'#697586';
+    document.querySelectorAll('.js-plotly-plot').forEach(function(d){
+      Plotly.relayout(d,{'font.color':fg,'xaxis.gridcolor':grid,'yaxis.gridcolor':grid,
+        'xaxis.linecolor':line,'yaxis.linecolor':line,'xaxis.tickcolor':line,'yaxis.tickcolor':line,
+        'xaxis.tickfont.color':tick,'yaxis.tickfont.color':tick,'xaxis.zerolinecolor':grid,
+        'yaxis.zerolinecolor':grid,'xaxis.title.font.color':fg,'yaxis.title.font.color':fg,
+        'legend.font.color':fg});
+    });
+  }
+  var btn=document.createElement('button'); btn.className='theme-toggle';
+  btn.title='Toggle light / dark';
+  function set(t){ root.setAttribute('data-theme',t);
+    try{localStorage.setItem('falco-theme',t);}catch(e){}
+    btn.textContent=(t==='dark')?'☀':'☾'; applyPlotTheme(t==='dark'); }
+  btn.onclick=function(){ set(root.getAttribute('data-theme')==='dark'?'light':'dark'); };
+  var title=document.querySelector('#header_title');
+  if(title) title.parentNode.insertBefore(btn,title.nextSibling);
+  set(root.getAttribute('data-theme')||'light');
+  window.addEventListener('load',function(){ applyPlotTheme(root.getAttribute('data-theme')==='dark'); });
 })();
 
 </script>
