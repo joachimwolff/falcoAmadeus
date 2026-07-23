@@ -186,18 +186,8 @@ img.indented { margin-left:3em; } p { margin-top:0; }
   --shadow:0 8px 30px rgba(0,0,0,.5),0 1px 2px rgba(0,0,0,.6);
   --shadow-lg:0 18px 50px rgba(0,0,0,.6);
 }
-/* High-contrast mode: darker ink, stronger borders, flat (untinted) surfaces */
-:root[data-contrast="high"] {
-  --text:#000000; --muted:#3a3a3c; --border:#9a9aa2;
-  --wash-1:transparent; --wash-2:transparent; --wash-3:transparent;
-  --surface-2:#eaeaef; --header-bg:rgba(255,255,255,.92);
-}
-:root[data-contrast="high"][data-theme="dark"] {
-  --text:#ffffff; --muted:#d0d0d6; --border:#70707a;
-  --surface-2:#3a3a3e; --header-bg:rgba(20,20,22,.92);
-}
-:root[data-contrast="high"] div.module { border-width:1.5px; }
-:root[data-contrast="high"] a { text-decoration:underline; }
+/* High-contrast mode applies to the PLOTS only (see applyPlotStyle); the page
+   chrome is unchanged. */
 button.theme-toggle {
   border:1px solid var(--border); background:var(--surface-2); color:var(--text);
   border-radius:999px; width:2.1em; height:2.1em; font-size:1rem; line-height:1;
@@ -573,13 +563,27 @@ if (document.getElementById('kmerlineplot') !== null) {
 // [FalcoAmadeus] dark-mode toggle (persisted) that also re-themes the plots
 (function(){
   var root=document.documentElement;
-  function applyPlotTheme(dark){
+  function applyPlotStyle(){
     if(!window.Plotly) return;
-    var fg=dark?'#c9d3de':'#3a4553', grid=dark?'#28313c':'#eceff3',
-        line=dark?'#3a4552':'#cfd6de', tick=dark?'#9aa6b2':'#697586';
+    var dark=root.getAttribute('data-theme')==='dark';
+    var hc=root.getAttribute('data-contrast')==='high';
+    // Normal: soft grid/axes. High contrast: pure black/white ink, darker and
+    // thicker gridlines + axes so the graphics themselves pop.
+    var fg,grid,line,tick,gw,lw;
+    if(hc){
+      fg=dark?'#ffffff':'#000000';
+      grid=dark?'#5b6672':'#9aa1ab'; line=dark?'#c7ced6':'#2a2f37'; tick=fg;
+      gw=1.6; lw=2;
+    } else {
+      fg=dark?'#c9d3de':'#3a4553';
+      grid=dark?'#28313c':'#eceff3'; line=dark?'#3a4552':'#cfd6de'; tick=dark?'#9aa6b2':'#697586';
+      gw=1; lw=1;
+    }
     document.querySelectorAll('.js-plotly-plot').forEach(function(d){
       Plotly.relayout(d,{'font.color':fg,'xaxis.gridcolor':grid,'yaxis.gridcolor':grid,
-        'xaxis.linecolor':line,'yaxis.linecolor':line,'xaxis.tickcolor':line,'yaxis.tickcolor':line,
+        'xaxis.gridwidth':gw,'yaxis.gridwidth':gw,
+        'xaxis.linecolor':line,'yaxis.linecolor':line,'xaxis.linewidth':lw,'yaxis.linewidth':lw,
+        'xaxis.tickcolor':line,'yaxis.tickcolor':line,
         'xaxis.tickfont.color':tick,'yaxis.tickfont.color':tick,'xaxis.zerolinecolor':grid,
         'yaxis.zerolinecolor':grid,'xaxis.title.font.color':fg,'yaxis.title.font.color':fg,
         'legend.font.color':fg});
@@ -589,18 +593,18 @@ if (document.getElementById('kmerlineplot') !== null) {
   btn.title='Toggle light / dark';
   function set(t){ root.setAttribute('data-theme',t);
     try{localStorage.setItem('falco-theme',t);}catch(e){}
-    btn.textContent=(t==='dark')?'☀':'☾'; applyPlotTheme(t==='dark'); }
+    btn.textContent=(t==='dark')?'☀':'☾'; applyPlotStyle(); }
   btn.onclick=function(){ set(root.getAttribute('data-theme')==='dark'?'light':'dark'); };
-  // contrast toggle: normal <-> high-contrast
+  // contrast toggle: normal <-> high-contrast graphics (plots only)
   var cbtn=document.createElement('button');
-  cbtn.className='theme-toggle contrast-toggle'; cbtn.title='Toggle high contrast'; cbtn.textContent='◐';
+  cbtn.className='theme-toggle contrast-toggle'; cbtn.title='Toggle high-contrast plots'; cbtn.textContent='◐';
   function setc(c){ if(c==='high'){root.setAttribute('data-contrast','high');}else{root.removeAttribute('data-contrast');}
-    try{localStorage.setItem('falco-contrast',c);}catch(e){} }
+    try{localStorage.setItem('falco-contrast',c);}catch(e){} applyPlotStyle(); }
   cbtn.onclick=function(){ setc(root.getAttribute('data-contrast')==='high'?'normal':'high'); };
   var title=document.querySelector('#header_title');
   if(title){ title.parentNode.insertBefore(btn,title.nextSibling); btn.parentNode.insertBefore(cbtn,btn.nextSibling); }
   set(root.getAttribute('data-theme')||'light');
-  window.addEventListener('load',function(){ applyPlotTheme(root.getAttribute('data-theme')==='dark'); });
+  window.addEventListener('load',applyPlotStyle);
 })();
 
 </script>
