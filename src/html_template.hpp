@@ -25,7 +25,7 @@
 constexpr auto falco_config_html_template = R"(<html>
 <head>
     <meta charset="utf-8">
-    <script>(function(){var d=document.documentElement,t;try{t=localStorage.getItem('falco-theme');}catch(e){}if(!t)t=(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light';d.setAttribute('data-theme',t);try{if(localStorage.getItem('falco-contrast')==='high')d.setAttribute('data-contrast','high');}catch(e){}})();</script>
+    <script>(function(){var d=document.documentElement,t;try{t=localStorage.getItem('falco-theme');}catch(e){}if(!t)t=(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light';d.setAttribute('data-theme',t);})();</script>
     <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
 
 	<title>
@@ -39,7 +39,6 @@ constexpr auto falco_config_html_template = R"(<html>
   --text:#1d1d1f; --muted:#6e6e73; --brand:#0071e3; --brand-2:#42a5ff;
   --pass:#34c759; --warn:#ff9f0a; --fail:#ff3b30;
   --header-bg:rgba(255,255,255,.72);
-  --wash-1:rgba(0,113,227,.38); --wash-2:rgba(124,77,255,.32); --wash-3:rgba(0,199,190,.26);
   --shadow:0 8px 30px rgba(0,0,0,.06),0 1px 2px rgba(0,0,0,.05);
   --shadow-lg:0 18px 50px rgba(0,0,0,.10);
   --radius:18px; --sidebar-w:19em;
@@ -47,13 +46,7 @@ constexpr auto falco_config_html_template = R"(<html>
 * { box-sizing:border-box; }
 html { scroll-behavior:smooth; }
 body {
-  color:var(--text); margin:0; padding:0;
-  background:
-    radial-gradient(1100px 620px at 8% -8%, var(--wash-1), transparent 62%),
-    radial-gradient(1000px 560px at 102% 4%, var(--wash-2), transparent 58%),
-    radial-gradient(900px 700px at 60% 108%, var(--wash-3), transparent 60%),
-    var(--bg);
-  background-attachment:fixed;
+  color:var(--text); margin:0; padding:0; background:var(--bg);
   font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display','SF Pro Text','Segoe UI',Roboto,Helvetica,Arial,sans-serif;
   font-size:15px; line-height:1.55; -webkit-font-smoothing:antialiased;
   letter-spacing:-.006em;
@@ -182,12 +175,9 @@ img.indented { margin-left:3em; } p { margin-top:0; }
   --text:#f5f5f7; --muted:#98989d; --brand:#0a84ff; --brand-2:#64d2ff;
   --pass:#30d158; --warn:#ff9f0a; --fail:#ff453a;
   --header-bg:rgba(28,28,30,.72);
-  --wash-1:rgba(10,132,255,.26); --wash-2:rgba(191,90,242,.20); --wash-3:rgba(0,199,190,.15);
   --shadow:0 8px 30px rgba(0,0,0,.5),0 1px 2px rgba(0,0,0,.6);
   --shadow-lg:0 18px 50px rgba(0,0,0,.6);
 }
-/* High-contrast mode applies to the PLOTS only (see applyPlotStyle); the page
-   chrome is unchanged. */
 button.theme-toggle {
   border:1px solid var(--border); background:var(--surface-2); color:var(--text);
   border-radius:999px; width:2.1em; height:2.1em; font-size:1rem; line-height:1;
@@ -195,7 +185,15 @@ button.theme-toggle {
   padding:0; margin-left:.15em; flex:0 0 auto; transition:background .15s, transform .15s;
 }
 button.theme-toggle:hover { background:var(--brand); color:#fff; transform:scale(1.08); }
-:root[data-contrast="high"] button.theme-toggle.contrast-toggle { background:var(--brand); color:#fff; }
+select.palette-select {
+  border:1px solid var(--border); background:var(--surface-2); color:var(--text);
+  border-radius:999px; height:2.1em; font-size:.82rem; font-weight:600; line-height:1;
+  cursor:pointer; padding:0 1.9em 0 .9em; margin-left:.35em; flex:0 0 auto;
+  font-family:inherit; -webkit-appearance:none; appearance:none;
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6'><path d='M1 1l4 4 4-4' fill='none' stroke='%236e6e73' stroke-width='1.6'/></svg>");
+  background-repeat:no-repeat; background-position:right .8em center;
+}
+select.palette-select:hover { border-color:var(--brand); }
 </style>
 <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
 </head>
@@ -391,9 +389,19 @@ crossorigin="anonymous"></script>
 // slimmer boxes, an on-hover toolbar and no logo, without touching each call.
 (function(){
   if (!window.Plotly) return;
+  // Selectable colorblind-safe palettes. Each one never mixes red WITH green:
+  // 'ocean' has no red, 'sunset'/'ink' have no green -- so within any single
+  // plot (which draws from one palette) red and green never co-occur.
+  window.FALCO_PALETTES={
+    ocean:['#0071e3','#00c7be','#5856d6','#ff9500','#111111','#8e8e93'],
+    sunset:['#ff9500','#ff2d55','#af52de','#a2845e','#111111','#0071e3'],
+    ink:['#111111','#0071e3','#ff9500','#af52de','#8a6d1f','#6e6e73']
+  };
+  var PAL='ocean'; try{var _p=localStorage.getItem('falco-palette'); if(_p&&window.FALCO_PALETTES[_p])PAL=_p;}catch(e){}
   var FONT={family:'-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif',size:12,color:'#3a4553'};
-  var AX={gridcolor:'#eceff3',zerolinecolor:'#dfe4ea',linecolor:'#cfd6de',ticks:'outside',tickcolor:'#cfd6de',tickfont:{size:11,color:'#697586'},automargin:true};
-  var THEME={paper_bgcolor:'rgba(0,0,0,0)',plot_bgcolor:'rgba(0,0,0,0)',colorway:['#0072b2','#e69f00','#009e73','#d55e00','#56b4e9','#cc79a7','#111111'],boxgap:0.28,boxgroupgap:0.2,legend:{borderwidth:0}};
+  // Grid is visible by default (a clear reference grid on every plot).
+  var AX={gridcolor:'#d6dbe3',zerolinecolor:'#c4cbd4',linecolor:'#b7bec9',ticks:'outside',tickcolor:'#b7bec9',tickfont:{size:11,color:'#697586'},gridwidth:1,automargin:true};
+  var THEME={paper_bgcolor:'rgba(0,0,0,0)',plot_bgcolor:'rgba(0,0,0,0)',colorway:window.FALCO_PALETTES[PAL].slice(),boxgap:0.28,boxgroupgap:0.2,legend:{borderwidth:0}};
   var CFG={displaylogo:false,responsive:true,displayModeBar:'hover',modeBarButtonsToRemove:['select2d','lasso2d','autoScale2d','toggleSpikelines','hoverClosestCartesian','hoverCompareCartesian']};
   var orig=Plotly.newPlot;
   Plotly.newPlot=function(id,data,layout,config){
@@ -563,30 +571,45 @@ if (document.getElementById('kmerlineplot') !== null) {
 // [FalcoAmadeus] dark-mode toggle (persisted) that also re-themes the plots
 (function(){
   var root=document.documentElement;
+  // Theme the plot chrome: a clear reference grid on every plot by default,
+  // recoloured for dark mode. (No separate contrast mode -- the grid is default.)
   function applyPlotStyle(){
     if(!window.Plotly) return;
     var dark=root.getAttribute('data-theme')==='dark';
-    var hc=root.getAttribute('data-contrast')==='high';
-    // Normal: soft grid/axes. High contrast: pure black/white ink, darker and
-    // thicker gridlines + axes so the graphics themselves pop.
-    var fg,grid,line,tick,gw,lw;
-    if(hc){
-      fg=dark?'#ffffff':'#000000';
-      grid=dark?'#5b6672':'#9aa1ab'; line=dark?'#c7ced6':'#2a2f37'; tick=fg;
-      gw=1.6; lw=2;
-    } else {
-      fg=dark?'#c9d3de':'#3a4553';
-      grid=dark?'#28313c':'#eceff3'; line=dark?'#3a4552':'#cfd6de'; tick=dark?'#9aa6b2':'#697586';
-      gw=1; lw=1;
-    }
+    var fg=dark?'#e6ebf2':'#2a3441', grid=dark?'#3a4451':'#d6dbe3',
+        line=dark?'#4a5462':'#b7bec9', tick=dark?'#9aa6b2':'#697586';
     document.querySelectorAll('.js-plotly-plot').forEach(function(d){
       Plotly.relayout(d,{'font.color':fg,'xaxis.gridcolor':grid,'yaxis.gridcolor':grid,
-        'xaxis.gridwidth':gw,'yaxis.gridwidth':gw,
-        'xaxis.linecolor':line,'yaxis.linecolor':line,'xaxis.linewidth':lw,'yaxis.linewidth':lw,
+        'xaxis.gridwidth':1,'yaxis.gridwidth':1,
+        'xaxis.linecolor':line,'yaxis.linecolor':line,
         'xaxis.tickcolor':line,'yaxis.tickcolor':line,
         'xaxis.tickfont.color':tick,'yaxis.tickfont.color':tick,'xaxis.zerolinecolor':grid,
         'yaxis.zerolinecolor':grid,'xaxis.title.font.color':fg,'yaxis.title.font.color':fg,
         'legend.font.color':fg});
+    });
+  }
+  // Recolour every categorical plot from the chosen palette, cycling colours
+  // across each plot's solid line/bar traces (dashed reference lines, the box
+  // plot and heatmaps keep their own colours).
+  function applyPalette(name){
+    if(!window.Plotly) return;
+    var pal=(window.FALCO_PALETTES&&window.FALCO_PALETTES[name])||window.FALCO_PALETTES.ocean;
+    document.querySelectorAll('.js-plotly-plot').forEach(function(gd){
+      if(!gd.data) return;
+      var lc=[],mc=[],k=0,touch=false;
+      var SKIP={box:1,heatmap:1,histogram2d:1,histogram2dcontour:1,contour:1,pie:1,violin:1};
+      gd.data.forEach(function(tr){
+        var t=tr.type||'scatter';
+        var colorable=!SKIP[t];
+        var dashed=tr.line&&tr.line.dash&&tr.line.dash!=='solid';
+        if(colorable&&!dashed){
+          var c=pal[k%pal.length]; k++; touch=true; lc.push(c); mc.push(c);
+        } else {
+          lc.push((tr.line&&tr.line.color)||null);
+          mc.push((tr.marker&&tr.marker.color)||null);
+        }
+      });
+      if(touch){ try{Plotly.restyle(gd,{'line.color':lc,'marker.color':mc});}catch(e){} }
     });
   }
   var btn=document.createElement('button'); btn.className='theme-toggle';
@@ -595,16 +618,19 @@ if (document.getElementById('kmerlineplot') !== null) {
     try{localStorage.setItem('falco-theme',t);}catch(e){}
     btn.textContent=(t==='dark')?'☀':'☾'; applyPlotStyle(); }
   btn.onclick=function(){ set(root.getAttribute('data-theme')==='dark'?'light':'dark'); };
-  // contrast toggle: normal <-> high-contrast graphics (plots only)
-  var cbtn=document.createElement('button');
-  cbtn.className='theme-toggle contrast-toggle'; cbtn.title='Toggle high-contrast plots'; cbtn.textContent='◐';
-  function setc(c){ if(c==='high'){root.setAttribute('data-contrast','high');}else{root.removeAttribute('data-contrast');}
-    try{localStorage.setItem('falco-contrast',c);}catch(e){} applyPlotStyle(); }
-  cbtn.onclick=function(){ setc(root.getAttribute('data-contrast')==='high'?'normal':'high'); };
+  // palette picker
+  var sel=document.createElement('select'); sel.className='palette-select';
+  sel.title='Plot colour scheme';
+  var NAMES={ocean:'Ocean',sunset:'Sunset',ink:'Ink'};
+  ['ocean','sunset','ink'].forEach(function(k){
+    var o=document.createElement('option'); o.value=k; o.textContent=NAMES[k]; sel.appendChild(o); });
+  var curPal='ocean'; try{var sp=localStorage.getItem('falco-palette'); if(sp&&NAMES[sp])curPal=sp;}catch(e){}
+  sel.value=curPal;
+  sel.onchange=function(){ try{localStorage.setItem('falco-palette',sel.value);}catch(e){} applyPalette(sel.value); };
   var title=document.querySelector('#header_title');
-  if(title){ title.parentNode.insertBefore(btn,title.nextSibling); btn.parentNode.insertBefore(cbtn,btn.nextSibling); }
+  if(title){ title.parentNode.insertBefore(btn,title.nextSibling); btn.parentNode.insertBefore(sel,btn.nextSibling); }
   set(root.getAttribute('data-theme')||'light');
-  window.addEventListener('load',applyPlotStyle);
+  window.addEventListener('load',function(){ applyPlotStyle(); applyPalette(sel.value); });
 })();
 
 </script>

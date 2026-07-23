@@ -1343,16 +1343,17 @@ ModulePerBaseSequenceContent::make_html_data() {
     }
     data << "], mode : 'lines', name : '" + size_t_to_seq(base, 1) + "', ";
 
-    // color
+    // color: colorblind-safe defaults (Ocean palette order) that never place a
+    // red next to a green; the report's palette picker can recolour these live.
     data << "line :{ color : '";
     if (base == 0)
-      data << "green";
+      data << "#0071e3";       // A - blue
     else if (base == 1)
-      data << "blue";
+      data << "#00c7be";       // C - teal
     else if (base == 2)
-      data << "red";
+      data << "#5856d6";       // T - indigo
     else
-      data << "black";
+      data << "#ff9500";       // G - orange
     data << "'}";
     // end color
 
