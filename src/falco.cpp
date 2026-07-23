@@ -191,7 +191,7 @@ write_results(const FalcoConfig &falco_config, FastqStats &stats,
     // Decide html filename based on input
     const std::string html_file =
       (report_filename.empty()
-         ? (outdir + "/" + file_prefix + "fastqc_report.html")
+         ? (outdir + "/" + file_prefix + "falcoAmadeus_report.html")
          : (report_filename));
 
     if (!falco_config.quiet)
@@ -962,7 +962,7 @@ main(int argc, char *argv[]) {
     opt_parse.add_opt(
       "report-filename", 'R',
       "[Falco only] Specify filename for FastQC report output (HTML). "
-      "If not specified, it will be called fastq_report.html in either "
+      "If not specified, it will be called falcoAmadeus_report.html in either "
       "the input file's directory or the one specified in the --output "
       "flag. Only available when running falco with a single input.",
       false, report_filename);
