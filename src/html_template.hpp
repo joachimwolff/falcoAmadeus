@@ -35,33 +35,41 @@ constexpr auto falco_config_html_template = R"(<html>
 <link href="https://stackpath.bootstrapcdn.com/font-awesome/4.7.0/css/font-awesome.min.css" rel="stylesheet" integrity="sha384-wvfXpqpZZVQGK6TAh5PVlGOfQNHSoD2xbE+QkPxCAFlNEevoEH3Sl0sibVcOQVnN" crossorigin="anonymous">
 <style type="text/css">
 :root {
-  --bg:#f4f6f9; --surface:#ffffff; --surface-2:#f7f9fc; --border:#e4e9f0;
-  --text:#1f2733; --muted:#697586; --brand:#0b6bcb; --brand-2:#37a0f4;
-  --pass:#1a9e5f; --warn:#d69b00; --fail:#d64545;
-  --shadow:0 1px 3px rgba(16,24,40,.06),0 1px 2px rgba(16,24,40,.04);
-  --radius:12px; --sidebar-w:19em;
+  --bg:#f5f5f7; --surface:#ffffff; --surface-2:#f5f5f7; --border:#e3e3e8;
+  --text:#1d1d1f; --muted:#6e6e73; --brand:#0071e3; --brand-2:#42a5ff;
+  --pass:#34c759; --warn:#ff9f0a; --fail:#ff3b30;
+  --header-bg:rgba(255,255,255,.72);
+  --shadow:0 8px 30px rgba(0,0,0,.06),0 1px 2px rgba(0,0,0,.05);
+  --shadow-lg:0 18px 50px rgba(0,0,0,.10);
+  --radius:18px; --sidebar-w:19em;
 }
 * { box-sizing:border-box; }
 html { scroll-behavior:smooth; }
 body {
   color:var(--text); background:var(--bg); margin:0; padding:0;
-  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
+  font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display','SF Pro Text','Segoe UI',Roboto,Helvetica,Arial,sans-serif;
   font-size:15px; line-height:1.55; -webkit-font-smoothing:antialiased;
+  letter-spacing:-.006em;
 }
 a { color:var(--brand); text-decoration:none; }
+a:hover { text-decoration:underline; }
 div.header {
-  position:sticky; top:0; z-index:20; display:flex; align-items:baseline;
+  position:sticky; top:0; z-index:20; display:flex; align-items:center;
   justify-content:space-between; gap:1em; flex-wrap:wrap; width:100%; margin:0;
-  background:var(--surface); border-bottom:1px solid var(--border);
-  box-shadow:var(--shadow); padding:.85em 1.4em; font-size:100%;
+  background:var(--header-bg); border-bottom:1px solid var(--border);
+  -webkit-backdrop-filter:saturate(180%) blur(20px); backdrop-filter:saturate(180%) blur(20px);
+  padding:.9em 1.6em; font-size:100%;
 }
 #header_title {
-  float:none; display:inline-flex; align-items:center; gap:.5em;
-  font-size:1.5rem; font-weight:700; letter-spacing:-.01em; color:var(--brand);
+  float:none; display:inline-flex; align-items:center; gap:.55em;
+  font-size:1.6rem; font-weight:700; letter-spacing:-.022em;
+  background:linear-gradient(135deg,var(--brand),#7c4dff);
+  -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent;
 }
 #header_title::before {
-  content:""; width:.72em; height:.72em; border-radius:4px;
-  background:linear-gradient(135deg,var(--brand),var(--brand-2));
+  content:""; width:1.55em; height:1.55em; border-radius:.42em; -webkit-text-fill-color:initial;
+  background:linear-gradient(135deg,var(--brand),#7c4dff);
+  box-shadow:0 4px 12px rgba(0,113,227,.4);
 }
 #header_filename {
   float:none; text-align:right; font-size:.82rem; color:var(--muted);
@@ -93,8 +101,10 @@ div.summary ul li a.fail::before { background:var(--fail); }
 div.main { margin-left:var(--sidebar-w); padding:1.5em 2em 4.5em; max-width:1180px; }
 div.module {
   background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
-  box-shadow:var(--shadow); padding:1.2em 1.5em 1.5em; margin-bottom:1.4em;
+  box-shadow:var(--shadow); padding:1.35em 1.7em 1.6em; margin-bottom:1.5em;
+  transition:box-shadow .2s ease, transform .2s ease;
 }
+div.module:hover { box-shadow:var(--shadow-lg); transform:translateY(-2px); }
 div.module h2 {
   display:flex; align-items:center; gap:.55em; flex-wrap:wrap; clear:none;
   font-size:1.12rem; font-weight:650; color:var(--text);
@@ -146,9 +156,16 @@ tr:last-child td { border-bottom:0; }
 tr:hover td { background:var(--surface-2); }
 div.footer {
   position:fixed; bottom:0; left:0; width:100%; z-index:20; margin:0;
-  background:var(--surface); border-top:1px solid var(--border);
-  color:var(--muted); font-size:.8rem; padding:.55em 1.4em;
+  background:var(--header-bg); border-top:1px solid var(--border);
+  -webkit-backdrop-filter:saturate(180%) blur(20px); backdrop-filter:saturate(180%) blur(20px);
+  color:var(--muted); font-size:.8rem; padding:.55em 1.6em;
 }
+div.summary ul li a.pass::before { box-shadow:0 0 0 3px rgba(52,199,89,.16); }
+div.summary ul li a.warn::before { box-shadow:0 0 0 3px rgba(255,159,10,.16); }
+div.summary ul li a.fail::before { box-shadow:0 0 0 3px rgba(255,59,48,.16); }
+div.module h2.pass::before { box-shadow:0 0 0 4px rgba(52,199,89,.15); }
+div.module h2.warn::before { box-shadow:0 0 0 4px rgba(255,159,10,.15); }
+div.module h2.fail::before { box-shadow:0 0 0 4px rgba(255,59,48,.15); }
 img.indented { margin-left:3em; } p { margin-top:0; }
 @media (max-width:820px) {
   div.summary { position:static; width:auto; height:auto; margin:.8em;
@@ -161,17 +178,22 @@ img.indented { margin-left:3em; } p { margin-top:0; }
   div.main { margin-left:0; } div.module { break-inside:avoid; box-shadow:none; }
 }
 :root[data-theme="dark"] {
-  --bg:#0f141a; --surface:#171d25; --surface-2:#1e2732; --border:#2a333f;
-  --text:#e6ebf2; --muted:#9aa6b2; --brand:#4aa3f0; --brand-2:#7cc0ff;
-  --shadow:0 1px 3px rgba(0,0,0,.45);
+  --bg:#000000; --surface:#1c1c1e; --surface-2:#2c2c2e; --border:#38383a;
+  --text:#f5f5f7; --muted:#98989d; --brand:#0a84ff; --brand-2:#64d2ff;
+  --pass:#30d158; --warn:#ff9f0a; --fail:#ff453a;
+  --header-bg:rgba(28,28,30,.72);
+  --shadow:0 8px 30px rgba(0,0,0,.5),0 1px 2px rgba(0,0,0,.6);
+  --shadow-lg:0 18px 50px rgba(0,0,0,.6);
 }
+:root[data-theme="dark"] #header_title { background:linear-gradient(135deg,#0a84ff,#bf5af2); -webkit-background-clip:text; background-clip:text; }
+:root[data-theme="dark"] #header_title::before { background:linear-gradient(135deg,#0a84ff,#bf5af2); box-shadow:0 4px 12px rgba(10,132,255,.5); }
 button.theme-toggle {
-  border:1px solid var(--border); background:var(--surface); color:var(--text);
-  border-radius:8px; width:1.9em; height:1.9em; font-size:1rem; line-height:1;
+  border:1px solid var(--border); background:var(--surface-2); color:var(--text);
+  border-radius:999px; width:2.1em; height:2.1em; font-size:1rem; line-height:1;
   cursor:pointer; display:inline-flex; align-items:center; justify-content:center;
-  padding:0; margin-left:.15em; flex:0 0 auto;
+  padding:0; margin-left:.15em; flex:0 0 auto; transition:background .15s, transform .15s;
 }
-button.theme-toggle:hover { background:var(--surface-2); }
+button.theme-toggle:hover { background:var(--brand); color:#fff; transform:scale(1.08); }
 </style>
 <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
 </head>
