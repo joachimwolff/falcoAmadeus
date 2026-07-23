@@ -25,7 +25,7 @@
 constexpr auto falco_config_html_template = R"(<html>
 <head>
     <meta charset="utf-8">
-    <script>(function(){var d=document.documentElement,t;try{t=localStorage.getItem('falco-theme');}catch(e){}if(!t)t=(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light';d.setAttribute('data-theme',t);})();</script>
+    <script>(function(){var d=document.documentElement,t;try{t=localStorage.getItem('falco-theme');}catch(e){}if(!t)t='dark';d.setAttribute('data-theme',t);})();</script>
     <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
 
 	<title>
@@ -50,6 +50,7 @@ body {
   font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display','SF Pro Text','Segoe UI',Roboto,Helvetica,Arial,sans-serif;
   font-size:15px; line-height:1.55; -webkit-font-smoothing:antialiased;
   letter-spacing:-.006em;
+  -webkit-print-color-adjust:exact; print-color-adjust:exact;
 }
 a { color:var(--brand); text-decoration:none; }
 a:hover { text-decoration:underline; }
@@ -633,7 +634,7 @@ if (document.getElementById('kmerlineplot') !== null) {
   sel.onchange=function(){ try{localStorage.setItem('falco-palette',sel.value);}catch(e){} applyPalette(sel.value); };
   var title=document.querySelector('#header_title');
   if(title){ title.parentNode.insertBefore(btn,title.nextSibling); btn.parentNode.insertBefore(sel,btn.nextSibling); }
-  set(root.getAttribute('data-theme')||'light');
+  set(root.getAttribute('data-theme')||'dark');
   window.addEventListener('load',function(){ applyPlotStyle(); applyPalette(sel.value); });
 })();
 
