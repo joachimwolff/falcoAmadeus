@@ -170,6 +170,7 @@ img.indented { margin-left:3em; } p { margin-top:0; }
 @media print {
   div.summary, div.footer { position:static; width:auto; height:auto; }
   div.main { margin-left:0; } div.module { break-inside:avoid; box-shadow:none; }
+  .modebar { display:none !important; }
 }
 :root[data-theme="dark"] {
   --bg:#000000; --surface:#1c1c1e; --surface-2:#2c2c2e; --border:#38383a;
