@@ -698,6 +698,78 @@ analyze_and_write(FalcoConfig &falco_config, const std::string &filename,
                 report_filename);
 }
 
+// [FalcoAmadeus] read an entire file into a string (for embedding mate reports).
+static std::string
+read_text_file(const std::string &path) {
+  std::ifstream in(path, std::ifstream::binary);
+  std::ostringstream ss;
+  ss << in.rdbuf();
+  return ss.str();
+}
+
+// [FalcoAmadeus] escape a string for use inside a double-quoted HTML attribute
+// (iframe srcdoc): only & and " need escaping; < > and ' are literal there.
+static std::string
+html_attr_escape(const std::string &s) {
+  std::string o;
+  o.reserve(s.size() + 64);
+  for (const char c : s) {
+    if (c == '&')
+      o += "&amp;";
+    else if (c == '"')
+      o += "&quot;";
+    else
+      o += c;
+  }
+  return o;
+}
+
+// [FalcoAmadeus] Combine the two per-mate reports into ONE self-contained HTML
+// with Forward/Reverse tabs. Each mate is embedded via an isolated iframe
+// (srcdoc) so their identical element IDs and scripts never collide. The two
+// machine-readable fastqc_data.txt files are kept (in the mate subdirs) for
+// MultiQC; only the single combined report is written at the top level.
+static void
+write_combined_paired_report(const std::string &out_file,
+                             const std::string &fwd_html,
+                             const std::string &rev_html,
+                             const std::string &sample_label) {
+  std::ofstream os(out_file, std::ofstream::binary);
+  os <<
+    "<html><head><meta charset=\"utf-8\">"
+    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+    "<script>(function(){var d=document.documentElement,t;try{t=localStorage.getItem('falco-theme');}catch(e){}if(!t)t='dark';d.setAttribute('data-theme',t);})();</script>"
+    "<title>" << sample_label << " - paired report</title><style>"
+    ":root{--bg:#f5f5f7;--surface:#fff;--border:#e3e3e8;--text:#1d1d1f;--brand:#0071e3;--header-bg:rgba(255,255,255,.72);}"
+    ":root[data-theme=\"dark\"]{--bg:#000;--surface:#1c1c1e;--border:#38383a;--text:#f5f5f7;--brand:#0a84ff;--header-bg:rgba(28,28,30,.72);}"
+    "*{box-sizing:border-box;}html,body{margin:0;height:100%;}"
+    "body{background:var(--bg);display:flex;flex-direction:column;"
+    "font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display','Segoe UI',Roboto,Helvetica,Arial,sans-serif;}"
+    ".pbar{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:1em;flex-wrap:wrap;"
+    "padding:.7em 1.5em;background:var(--header-bg);border-bottom:1px solid var(--border);"
+    "-webkit-backdrop-filter:saturate(180%) blur(20px);backdrop-filter:saturate(180%) blur(20px);}"
+    ".ptitle{font-size:1.3rem;font-weight:700;color:var(--text);letter-spacing:-.022em;}"
+    ".pfile{margin-left:auto;font-size:.82rem;color:var(--text);opacity:.65;font-family:ui-monospace,Menlo,monospace;}"
+    ".ptabs{display:inline-flex;gap:.2em;background:var(--surface);border:1px solid var(--border);border-radius:999px;padding:.2em;}"
+    ".ptabs button{border:0;background:transparent;color:var(--text);font:inherit;font-weight:600;font-size:.9rem;"
+    "padding:.35em 1.2em;border-radius:999px;cursor:pointer;}"
+    ".ptabs button.active{background:var(--brand);color:#fff;}"
+    "iframe{flex:1 1 auto;width:100%;border:0;display:block;}iframe.hide{display:none;}"
+    "</style></head><body>"
+    "<div class=\"pbar\"><div class=\"ptitle\">FalcoAmadeus</div>"
+    "<div class=\"ptabs\"><button id=\"tf\" class=\"active\">Forward (R1)</button>"
+    "<button id=\"tr\">Reverse (R2)</button></div>"
+    "<div class=\"pfile\">" << sample_label << " &middot; paired-end</div></div>"
+    "<iframe id=\"ifwd\" srcdoc=\"" << html_attr_escape(fwd_html) << "\"></iframe>"
+    "<iframe id=\"irev\" class=\"hide\" srcdoc=\"" << html_attr_escape(rev_html) << "\"></iframe>"
+    "<script>(function(){var f=document.getElementById('ifwd'),r=document.getElementById('irev'),"
+    "tf=document.getElementById('tf'),tr=document.getElementById('tr');"
+    "function show(fwd){f.classList.toggle('hide',!fwd);r.classList.toggle('hide',fwd);"
+    "tf.classList.toggle('active',fwd);tr.classList.toggle('active',!fwd);}"
+    "tf.onclick=function(){show(true);};tr.onclick=function(){show(false);};})();</script>"
+    "</body></html>";
+}
+
 int
 main(int argc, char *argv[]) {
 
@@ -1209,6 +1281,31 @@ main(int argc, char *argv[]) {
                           std::string{}, skip_text, skip_html,
                           skip_short_summary, do_call, true, " (reverse)",
                           r1_base);
+
+        // [FalcoAmadeus] Merge the two mate reports into ONE combined HTML with
+        // Forward/Reverse tabs; drop the per-mate HTML files but keep their
+        // fastqc_data.txt + summary.txt (in the subdirs) for MultiQC.
+        if (!skip_html) {
+          const std::string fwd_html_path =
+            fwd_dir + "/falcoAmadeus_report.html";
+          const std::string rev_html_path =
+            rev_dir + "/falcoAmadeus_report.html";
+          std::string sample = fwd_stem;
+          const std::string tag = "_forward";
+          if (sample.size() > tag.size() &&
+              sample.compare(sample.size() - tag.size(), tag.size(), tag) == 0)
+            sample.erase(sample.size() - tag.size());
+          write_combined_paired_report(
+            cur_outdir + "/falcoAmadeus_report.html",
+            read_text_file(fwd_html_path), read_text_file(rev_html_path),
+            sample);
+          std::error_code rc;
+          std::filesystem::remove(fwd_html_path, rc);
+          std::filesystem::remove(rev_html_path, rc);
+          if (!falco_config.quiet)
+            log_process("Wrote combined paired report to " + cur_outdir +
+                        "/falcoAmadeus_report.html");
+        }
 
         const std::string paired_out = cur_outdir + "/paired_duplication.txt";
         if (!falco_config.quiet)
