@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -423,10 +424,24 @@ struct GzFastqPairReader {
     }
   }
 
-  // Reads one FASTQ record, returning the (untruncated) sequence in seq.
-  // Returns false cleanly at end of file; throws on a truncated record.
+  // Canonical read name: header without the leading '@', truncated at the first
+  // whitespace, with a trailing /1 or /2 mate token removed -- so the two mates
+  // of a pair share the same name.
+  static std::string
+  canonical_name(const std::string &h) {
+    std::size_t b = (!h.empty() && h[0] == '@') ? 1 : 0;
+    std::size_t e = h.find_first_of(" \t", b);
+    std::string name = h.substr(b, (e == std::string::npos ? h.size() : e) - b);
+    if (name.size() >= 2 && name[name.size() - 2] == '/' &&
+        (name.back() == '1' || name.back() == '2'))
+      name.erase(name.size() - 2);
+    return name;
+  }
+
+  // Reads one FASTQ record, returning the canonical read name and the
+  // (untruncated) sequence. Returns false cleanly at EOF; throws if truncated.
   bool
-  next_sequence(std::string &seq) {
+  next_record(std::string &name, std::string &seq) {
     std::string header, plus, qual;
     if (!read_line(header)) {
       if (gzeof(fp))
@@ -438,11 +453,25 @@ struct GzFastqPairReader {
       return false;
     if (!read_line(seq) || !read_line(plus) || !read_line(qual))
       throw std::runtime_error("truncated FASTQ record in file: " + filename);
+    name = canonical_name(header);
     return true;
+  }
+
+  // Sequence-only convenience (name discarded).
+  bool
+  next_sequence(std::string &seq) {
+    std::string name;
+    return next_record(name, seq);
   }
 };
 
-void
+// [FalcoAmadeus] paired-end read-pairing summary.
+struct PairStats {
+  std::size_t pairs = 0;
+  std::size_t matching = 0;  // pairs whose R1/R2 canonical names agree
+};
+
+PairStats
 run_paired_duplication(const std::string &r1_file, const std::string &r2_file,
                        const std::string &out_file, const bool quiet) {
   GzFastqPairReader r1(r1_file);
@@ -452,17 +481,21 @@ run_paired_duplication(const std::string &r1_file, const std::string &r2_file,
   PairedDupCounter r1_ctr;    // naive single-end estimate on R1 only
   PairedDupCounter r2_ctr;    // naive single-end estimate on R2 only
 
-  std::string s1, s2, k1, k2, pair_key;
+  PairStats pstats;
+  std::string s1, s2, n1s, n2s, k1, k2, pair_key;
   std::size_t num_pairs = 0;
   while (true) {
-    const bool got1 = r1.next_sequence(s1);
-    const bool got2 = r2.next_sequence(s2);
+    const bool got1 = r1.next_record(n1s, s1);
+    const bool got2 = r2.next_record(n2s, s2);
     if (got1 != got2)
       throw std::runtime_error(
         "paired-end inputs have different numbers of reads: " + r1_file +
         " and " + r2_file);
     if (!got1)
       break;
+
+    if (n1s == n2s)
+      ++pstats.matching;  // R1/R2 identifiers agree -> a real, matched pair
 
     k1.assign(s1, 0, get_truncate_point(s1.size()));
     k2.assign(s2, 0, get_truncate_point(s2.size()));
@@ -490,6 +523,8 @@ run_paired_duplication(const std::string &r1_file, const std::string &r2_file,
   os << "Read1 file\t" << r1_file << "\n";
   os << "Read2 file\t" << r2_file << "\n";
   os << "Total read pairs\t" << num_pairs << "\n";
+  os << "Matching read pairs (R1/R2 identifiers agree)\t" << pstats.matching
+     << "\n";
 
   // Explicit PCR-duplicate rate (= 100 - deduplicated%); LOWER is better. The
   // paired value is the correct one; the naive single-end values OVERESTIMATE
@@ -525,7 +560,10 @@ run_paired_duplication(const std::string &r1_file, const std::string &r2_file,
 
   if (!quiet)
     std::cerr << "[paired-end duplication] wrote " << out_file << " ("
-              << num_pairs << " pairs)\n";
+              << num_pairs << " pairs, " << pstats.matching << " matching)\n";
+
+  pstats.pairs = num_pairs;
+  return pstats;
 }
 
 }  // namespace
@@ -1343,6 +1381,15 @@ main(int argc, char *argv[]) {
                           skip_short_summary, do_call, true, " (reverse)",
                           r1_base);
 
+        // [FalcoAmadeus] Pairing + duplication pass FIRST, so the combined view
+        // can report the true read-PAIR count and how many R1/R2 reads match.
+        const std::string paired_out = cur_outdir + "/paired_duplication.txt";
+        if (!falco_config.quiet)
+          log_process("Running paired-end pairing/duplication pass with " +
+                      paired_with_file);
+        const PairStats ps = run_paired_duplication(
+          filename, paired_with_file, paired_out, falco_config.quiet);
+
         // [FalcoAmadeus] Merge the mate reports into ONE combined HTML with
         // three tabs: Combined (R1+R2 pooled, the default), Forward, Reverse.
         // Drop the per-mate HTML files but keep their fastqc_data.txt +
@@ -1375,11 +1422,28 @@ main(int argc, char *argv[]) {
             append_file_bytes(po, filename);
             append_file_bytes(po, paired_with_file);
           }
+          // Banner clarifying pairs-vs-pooled-reads and R1/R2 matching.
+          char pctbuf[16];
+          const double mpct = ps.pairs ? (100.0 * ps.matching / ps.pairs) : 0.0;
+          std::snprintf(pctbuf, sizeof pctbuf, "%.1f", mpct);
+          const std::string npairs = std::to_string(ps.pairs);
+          const std::string nreads = std::to_string(2 * ps.pairs);
+          falco_config.combined_note =
+            "<div class=\"module\"><p class=\"module-desc\" style=\"margin:0\">"
+            "<b>Paired-end combined view.</b> Read 1 and Read 2 are the two ends "
+            "of the same fragments, so this is <b>" + npairs + " read pairs</b> "
+            "(not " + nreads + " independent reads). <b>" +
+            std::to_string(ps.matching) + " (" + pctbuf +
+            "%)</b> of pairs have matching R1/R2 identifiers. The metrics below "
+            "pool both mates, so \"Total Sequences\" counts all " + nreads +
+            " sequenced ends.</p></div>";
+
           analyze_and_write(falco_config, pooled_in, forced_file_format,
                             comb_dir, std::string{}, std::string{},
                             std::string{}, std::string{}, /*skip_text=*/true,
                             skip_html, /*skip_short_summary=*/true, do_call,
                             true, " (combined)");
+          falco_config.combined_note.clear();  // don't leak to other reports
           const std::string comb_html =
             read_text_file(comb_dir + "/falcoAmadeus_report.html");
 
@@ -1396,13 +1460,6 @@ main(int argc, char *argv[]) {
             log_process("Wrote combined paired report to " + cur_outdir +
                         "/falcoAmadeus_report.html");
         }
-
-        const std::string paired_out = cur_outdir + "/paired_duplication.txt";
-        if (!falco_config.quiet)
-          log_process("Running paired-end duplication pass with " +
-                      paired_with_file);
-        run_paired_duplication(filename, paired_with_file, paired_out,
-                               falco_config.quiet);
       }
 
       /************************** TIME SUMMARY *****************************/

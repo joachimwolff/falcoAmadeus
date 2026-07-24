@@ -89,4 +89,9 @@ HtmlMaker::put_file_details(const FalcoConfig &falco_config) {
   }
   std::regex paired_re(left_tag + "pairednote"s + right_tag);
   html_boilerplate = std::regex_replace(html_boilerplate, paired_re, paired_note);
+
+  // [FalcoAmadeus] top-of-report banner for the pooled paired "combined" view.
+  std::regex combined_re(left_tag + "combinednote"s + right_tag);
+  html_boilerplate =
+    std::regex_replace(html_boilerplate, combined_re, falco_config.combined_note);
 }

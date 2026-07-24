@@ -169,6 +169,9 @@ struct FalcoConfig {
   // [FalcoAmadeus] in --paired-with mode, the basename of this mate's partner
   // file (empty for single-end runs); surfaced in the duplication module.
   std::string paired_mate;
+  // [FalcoAmadeus] banner (HTML) shown at the top of the pooled "combined"
+  // paired view -- read-pair count and R1/R2 matching. Empty otherwise.
+  std::string combined_note;
 
   /*********** FUNCTIONS TO READ FILES *************/
   void define_file_format();

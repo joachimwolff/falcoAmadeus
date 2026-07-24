@@ -262,6 +262,7 @@ select.palette-select:hover { border-color:var(--brand); }
 </ul>
 </div>
 <div class="main">
+{{combinednote}}
 <div class="module">
   <h2 class="{{passbasicstatistics}}" id="basicstatistics">
     {{basicstatisticsname}}: {{passbasicstatistics}}
