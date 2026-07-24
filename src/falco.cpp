@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -191,7 +192,7 @@ write_results(const FalcoConfig &falco_config, FastqStats &stats,
     // Decide html filename based on input
     const std::string html_file =
       (report_filename.empty()
-         ? (outdir + "/" + file_prefix + "fastqc_report.html")
+         ? (outdir + "/" + file_prefix + "falcoAmadeus_report.html")
          : (report_filename));
 
     if (!falco_config.quiet)
@@ -423,10 +424,24 @@ struct GzFastqPairReader {
     }
   }
 
-  // Reads one FASTQ record, returning the (untruncated) sequence in seq.
-  // Returns false cleanly at end of file; throws on a truncated record.
+  // Canonical read name: header without the leading '@', truncated at the first
+  // whitespace, with a trailing /1 or /2 mate token removed -- so the two mates
+  // of a pair share the same name.
+  static std::string
+  canonical_name(const std::string &h) {
+    std::size_t b = (!h.empty() && h[0] == '@') ? 1 : 0;
+    std::size_t e = h.find_first_of(" \t", b);
+    std::string name = h.substr(b, (e == std::string::npos ? h.size() : e) - b);
+    if (name.size() >= 2 && name[name.size() - 2] == '/' &&
+        (name.back() == '1' || name.back() == '2'))
+      name.erase(name.size() - 2);
+    return name;
+  }
+
+  // Reads one FASTQ record, returning the canonical read name and the
+  // (untruncated) sequence. Returns false cleanly at EOF; throws if truncated.
   bool
-  next_sequence(std::string &seq) {
+  next_record(std::string &name, std::string &seq) {
     std::string header, plus, qual;
     if (!read_line(header)) {
       if (gzeof(fp))
@@ -438,11 +453,25 @@ struct GzFastqPairReader {
       return false;
     if (!read_line(seq) || !read_line(plus) || !read_line(qual))
       throw std::runtime_error("truncated FASTQ record in file: " + filename);
+    name = canonical_name(header);
     return true;
+  }
+
+  // Sequence-only convenience (name discarded).
+  bool
+  next_sequence(std::string &seq) {
+    std::string name;
+    return next_record(name, seq);
   }
 };
 
-void
+// [FalcoAmadeus] paired-end read-pairing summary.
+struct PairStats {
+  std::size_t pairs = 0;
+  std::size_t matching = 0;  // pairs whose R1/R2 canonical names agree
+};
+
+PairStats
 run_paired_duplication(const std::string &r1_file, const std::string &r2_file,
                        const std::string &out_file, const bool quiet) {
   GzFastqPairReader r1(r1_file);
@@ -452,17 +481,21 @@ run_paired_duplication(const std::string &r1_file, const std::string &r2_file,
   PairedDupCounter r1_ctr;    // naive single-end estimate on R1 only
   PairedDupCounter r2_ctr;    // naive single-end estimate on R2 only
 
-  std::string s1, s2, k1, k2, pair_key;
+  PairStats pstats;
+  std::string s1, s2, n1s, n2s, k1, k2, pair_key;
   std::size_t num_pairs = 0;
   while (true) {
-    const bool got1 = r1.next_sequence(s1);
-    const bool got2 = r2.next_sequence(s2);
+    const bool got1 = r1.next_record(n1s, s1);
+    const bool got2 = r2.next_record(n2s, s2);
     if (got1 != got2)
       throw std::runtime_error(
         "paired-end inputs have different numbers of reads: " + r1_file +
         " and " + r2_file);
     if (!got1)
       break;
+
+    if (n1s == n2s)
+      ++pstats.matching;  // R1/R2 identifiers agree -> a real, matched pair
 
     k1.assign(s1, 0, get_truncate_point(s1.size()));
     k2.assign(s2, 0, get_truncate_point(s2.size()));
@@ -490,6 +523,8 @@ run_paired_duplication(const std::string &r1_file, const std::string &r2_file,
   os << "Read1 file\t" << r1_file << "\n";
   os << "Read2 file\t" << r2_file << "\n";
   os << "Total read pairs\t" << num_pairs << "\n";
+  os << "Matching read pairs (R1/R2 identifiers agree)\t" << pstats.matching
+     << "\n";
 
   // Explicit PCR-duplicate rate (= 100 - deduplicated%); LOWER is better. The
   // paired value is the correct one; the naive single-end values OVERESTIMATE
@@ -525,7 +560,10 @@ run_paired_duplication(const std::string &r1_file, const std::string &r2_file,
 
   if (!quiet)
     std::cerr << "[paired-end duplication] wrote " << out_file << " ("
-              << num_pairs << " pairs)\n";
+              << num_pairs << " pairs, " << pstats.matching << " matching)\n";
+
+  pstats.pairs = num_pairs;
+  return pstats;
 }
 
 }  // namespace
@@ -613,8 +651,10 @@ analyze_and_write(FalcoConfig &falco_config, const std::string &filename,
                   const std::string &report_filename, const bool skip_text,
                   const bool skip_html, const bool skip_short_summary,
                   const bool do_call, const bool forbid_sam_bam,
-                  const std::string &display_suffix) {
+                  const std::string &display_suffix,
+                  const std::string &paired_mate = std::string{}) {
   falco_config.filename = filename;
+  falco_config.paired_mate = paired_mate;
 
   // if format was not provided, we have to guess it by the filename
   falco_config.format = forced_file_format;
@@ -694,6 +734,139 @@ analyze_and_write(FalcoConfig &falco_config, const std::string &filename,
   write_results(falco_config, stats, skip_text, skip_html, skip_short_summary,
                 do_call, file_prefix, out_dir, summary_filename, data_filename,
                 report_filename);
+}
+
+// [FalcoAmadeus] read an entire file into a string (for embedding mate reports).
+static std::string
+read_text_file(const std::string &path) {
+  std::ifstream in(path, std::ifstream::binary);
+  std::ostringstream ss;
+  ss << in.rdbuf();
+  return ss.str();
+}
+
+// [FalcoAmadeus] append the raw bytes of `path` to an already-open stream.
+// Byte-concatenating two gzip files yields a valid multi-member gzip that the
+// reader decompresses in full, so this pools R1+R2 into one input.
+static void
+append_file_bytes(std::ofstream &out, const std::string &path) {
+  std::ifstream in(path, std::ifstream::binary);
+  char buf[1 << 16];
+  while (in) {
+    in.read(buf, sizeof buf);
+    out.write(buf, in.gcount());
+  }
+}
+
+// [FalcoAmadeus] escape a string for use inside a double-quoted HTML attribute
+// (iframe srcdoc): only & and " need escaping; < > and ' are literal there.
+static std::string
+html_attr_escape(const std::string &s) {
+  std::string o;
+  o.reserve(s.size() + 64);
+  for (const char c : s) {
+    if (c == '&')
+      o += "&amp;";
+    else if (c == '"')
+      o += "&quot;";
+    else
+      o += c;
+  }
+  return o;
+}
+
+// [FalcoAmadeus] Combine the mate reports into ONE self-contained HTML with
+// three tabs: Combined (R1+R2 pooled and analysed as a single dataset -- the
+// default), Forward and Reverse. Each view is an isolated iframe (srcdoc) so
+// their identical element IDs and scripts never collide. The per-mate
+// fastqc_data.txt files are kept (in the mate subdirs) for MultiQC; only this
+// single combined report is written at the top level.
+static void
+write_combined_paired_report(const std::string &out_file,
+                             const std::string &combined_html,
+                             const std::string &fwd_html,
+                             const std::string &rev_html,
+                             const std::string &sample_label) {
+  std::ofstream os(out_file, std::ofstream::binary);
+  os <<
+    "<html><head><meta charset=\"utf-8\">"
+    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+    "<script>(function(){var d=document.documentElement,t;try{t=localStorage.getItem('falco-theme');}catch(e){}if(!t)t='dark';d.setAttribute('data-theme',t);})();</script>"
+    "<title>" << sample_label << " - paired report</title><style>"
+    ":root{--bg:#f5f5f7;--surface:#fff;--border:#e3e3e8;--text:#1d1d1f;--brand:#0071e3;--header-bg:rgba(255,255,255,.72);}"
+    ":root[data-theme=\"dark\"]{--bg:#000;--surface:#1c1c1e;--border:#38383a;--text:#f5f5f7;--brand:#0a84ff;--header-bg:rgba(28,28,30,.72);}"
+    "*{box-sizing:border-box;}html,body{margin:0;height:100%;}"
+    "body{background:var(--bg);display:flex;flex-direction:column;"
+    "font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display','Segoe UI',Roboto,Helvetica,Arial,sans-serif;}"
+    ".pbar{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:1em;flex-wrap:wrap;"
+    "padding:.7em 1.5em;background:var(--header-bg);border-bottom:1px solid var(--border);"
+    "-webkit-backdrop-filter:saturate(180%) blur(20px);backdrop-filter:saturate(180%) blur(20px);}"
+    ".ptitle{font-size:1.3rem;font-weight:700;color:var(--text);letter-spacing:-.022em;}"
+    ".pfile{margin-left:auto;font-size:.82rem;color:var(--text);opacity:.65;font-family:ui-monospace,Menlo,monospace;}"
+    ".ptabs{display:inline-flex;gap:.2em;background:var(--surface);border:1px solid var(--border);border-radius:999px;padding:.2em;}"
+    ".ptabs button{border:0;background:transparent;color:var(--text);font:inherit;font-weight:600;font-size:.9rem;"
+    "padding:.35em 1.1em;border-radius:999px;cursor:pointer;}"
+    ".ptabs button.active{background:var(--brand);color:#fff;}"
+    ".pright{margin-left:auto;display:inline-flex;align-items:center;gap:.6em;}"
+    ".tgl{border:1px solid var(--border);background:var(--surface);color:var(--text);border-radius:999px;"
+    "width:2.1em;height:2.1em;font-size:1rem;line-height:1;cursor:pointer;display:inline-flex;"
+    "align-items:center;justify-content:center;padding:0;}"
+    ".tgl:hover{background:var(--brand);color:#fff;}"
+    ".psel{border:1px solid var(--border);background:var(--surface);color:var(--text);border-radius:999px;"
+    "height:2.1em;font:inherit;font-weight:600;font-size:.82rem;padding:0 .8em;cursor:pointer;}"
+    ".pfile{font-size:.82rem;color:var(--text);opacity:.65;font-family:ui-monospace,Menlo,monospace;}"
+    ".stage{position:relative;flex:1 1 auto;}"
+    ".stage iframe{position:absolute;inset:0;width:100%;height:100%;border:0;visibility:hidden;}"
+    ".stage iframe.show{visibility:visible;}"
+    "</style></head><body>"
+    "<div class=\"pbar\"><div class=\"ptitle\">FalcoAmadeus</div>"
+    "<div class=\"ptabs\">"
+    "<button data-v=\"c\" class=\"active\">Combined (R1+R2)</button>"
+    "<button data-v=\"f\">Forward (R1)</button>"
+    "<button data-v=\"r\">Reverse (R2)</button></div>"
+    "<div class=\"pright\">"
+    "<button id=\"otgl\" class=\"tgl\" title=\"Toggle light / dark\">&#9790;</button>"
+    "<select id=\"opal\" class=\"psel\" title=\"Plot colour scheme\">"
+    "<option value=\"ocean\">Ocean</option><option value=\"sunset\">Sunset</option>"
+    "<option value=\"ink\">Ink</option></select>"
+    "<div class=\"pfile\">" << sample_label << " &middot; paired-end</div></div></div>"
+    "<div class=\"stage\">"
+    "<iframe data-v=\"c\" class=\"show\" srcdoc=\"" << html_attr_escape(combined_html) << "\"></iframe>"
+    "<iframe data-v=\"f\" srcdoc=\"" << html_attr_escape(fwd_html) << "\"></iframe>"
+    "<iframe data-v=\"r\" srcdoc=\"" << html_attr_escape(rev_html) << "\"></iframe>"
+    "</div>"
+    "<script>(function(){var root=document.documentElement,"
+    "btns=document.querySelectorAll('.ptabs button'),frames=document.querySelectorAll('.stage iframe'),"
+    "tgl=document.getElementById('otgl'),psel=document.getElementById('opal');"
+    "var theme=root.getAttribute('data-theme')||'dark',pal='ocean';"
+    "try{var sp=localStorage.getItem('falco-palette');if(sp)pal=sp;}catch(e){}"
+    "psel.value=pal;tgl.innerHTML=(theme==='dark')?'&#9728;':'&#9790;';"
+    // strip each inner report's own header and sync it to the shared controls
+    "function prep(f){try{var d=f.contentDocument,w=f.contentWindow;"
+    "var h=d.querySelector('.header');if(h)h.style.display='none';"
+    "var sb=d.querySelector('.summary');if(sb){sb.style.top='1em';sb.style.height='calc(100vh - 2.5em)';}"
+    "var mn=d.querySelector('.main');if(mn)mn.style.paddingTop='1em';"
+    "if(w.falcoSetTheme)w.falcoSetTheme(theme);if(w.falcoSetPalette)w.falcoSetPalette(pal);}catch(e){}}"
+    "frames.forEach(function(f){if(f.contentDocument&&f.contentDocument.readyState==='complete')prep(f);"
+    "f.addEventListener('load',function(){prep(f);});});"
+    // shared controls broadcast to every mate view
+    "tgl.onclick=function(){theme=(theme==='dark')?'light':'dark';root.setAttribute('data-theme',theme);"
+    "try{localStorage.setItem('falco-theme',theme);}catch(e){}tgl.innerHTML=(theme==='dark')?'&#9728;':'&#9790;';"
+    "frames.forEach(function(f){try{if(f.contentWindow.falcoSetTheme)f.contentWindow.falcoSetTheme(theme);}catch(e){}});};"
+    "psel.onchange=function(){pal=psel.value;try{localStorage.setItem('falco-palette',pal);}catch(e){}"
+    "frames.forEach(function(f){try{if(f.contentWindow.falcoSetPalette)f.contentWindow.falcoSetPalette(pal);}catch(e){}});};"
+    "function sy(f){try{return f.contentWindow.pageYOffset||f.contentWindow.document.documentElement.scrollTop||0;}catch(e){return 0;}}"
+    "function show(v){var cur=null,i;for(i=0;i<frames.length;i++){if(frames[i].classList.contains('show'))cur=frames[i];}"
+    "var y=cur?sy(cur):0,next=null;"
+    "frames.forEach(function(f){if(f.getAttribute('data-v')===v)next=f;});"
+    // instant jump so the revealed tab keeps your scroll (defeat scroll-behavior:smooth)
+    "if(next){try{var d=next.contentWindow.document,se=d.scrollingElement||d.documentElement,"
+    "pb=se.style.scrollBehavior;se.style.scrollBehavior='auto';se.scrollTop=y;"
+    "next.contentWindow.scrollTo(0,y);se.style.scrollBehavior=pb;}catch(e){}}"
+    "frames.forEach(function(f){f.classList.toggle('show',f.getAttribute('data-v')===v);});"
+    "btns.forEach(function(b){b.classList.toggle('active',b.getAttribute('data-v')===v);});}"
+    "btns.forEach(function(b){b.onclick=function(){show(b.getAttribute('data-v'));};});})();</script>"
+    "</body></html>";
 }
 
 int
@@ -962,7 +1135,7 @@ main(int argc, char *argv[]) {
     opt_parse.add_opt(
       "report-filename", 'R',
       "[Falco only] Specify filename for FastQC report output (HTML). "
-      "If not specified, it will be called fastq_report.html in either "
+      "If not specified, it will be called falcoAmadeus_report.html in either "
       "the input file's directory or the one specified in the --output "
       "flag. Only available when running falco with a single input.",
       false, report_filename);
@@ -1193,21 +1366,100 @@ main(int argc, char *argv[]) {
 
         // Standard names within each subdir; custom -D/-R/-S are ignored in
         // paired mode (two outputs, so single-file names cannot apply).
+        const std::string r1_base =
+          std::filesystem::path(filename).filename().string();
+        const std::string r2_base =
+          std::filesystem::path(paired_with_file).filename().string();
         analyze_and_write(falco_config, filename, forced_file_format, fwd_dir,
                           std::string{}, std::string{}, std::string{},
                           std::string{}, skip_text, skip_html,
-                          skip_short_summary, do_call, true, " (forward)");
+                          skip_short_summary, do_call, true, " (forward)",
+                          r2_base);
         analyze_and_write(falco_config, paired_with_file, forced_file_format,
                           rev_dir, std::string{}, std::string{}, std::string{},
                           std::string{}, skip_text, skip_html,
-                          skip_short_summary, do_call, true, " (reverse)");
+                          skip_short_summary, do_call, true, " (reverse)",
+                          r1_base);
 
+        // [FalcoAmadeus] Pairing + duplication pass FIRST, so the combined view
+        // can report the true read-PAIR count and how many R1/R2 reads match.
         const std::string paired_out = cur_outdir + "/paired_duplication.txt";
         if (!falco_config.quiet)
-          log_process("Running paired-end duplication pass with " +
+          log_process("Running paired-end pairing/duplication pass with " +
                       paired_with_file);
-        run_paired_duplication(filename, paired_with_file, paired_out,
-                               falco_config.quiet);
+        const PairStats ps = run_paired_duplication(
+          filename, paired_with_file, paired_out, falco_config.quiet);
+
+        // [FalcoAmadeus] Merge the mate reports into ONE combined HTML with
+        // three tabs: Combined (R1+R2 pooled, the default), Forward, Reverse.
+        // Drop the per-mate HTML files but keep their fastqc_data.txt +
+        // summary.txt (in the subdirs) for MultiQC.
+        if (!skip_html) {
+          const std::string fwd_html_path =
+            fwd_dir + "/falcoAmadeus_report.html";
+          const std::string rev_html_path =
+            rev_dir + "/falcoAmadeus_report.html";
+          std::string sample = fwd_stem;
+          const std::string tag = "_forward";
+          if (sample.size() > tag.size() &&
+              sample.compare(sample.size() - tag.size(), tag.size(), tag) == 0)
+            sample.erase(sample.size() - tag.size());
+
+          // Combined view: analyse R1+R2 pooled as a single dataset. Byte-
+          // concatenate the two inputs into a temp file (multi-member gzip is
+          // read in full) and run the standard pipeline; only the HTML is
+          // needed here, so text/summary are skipped and the temp dir removed.
+          const std::string comb_dir = cur_outdir + "/" + sample + "_combined";
+          std::error_code cc;
+          std::filesystem::create_directories(comb_dir, cc);
+          const bool r1_gz =
+            filename.size() >= 3 &&
+            filename.compare(filename.size() - 3, 3, ".gz") == 0;
+          const std::string pooled_in =
+            comb_dir + "/" + sample + (r1_gz ? ".fastq.gz" : ".fastq");
+          {
+            std::ofstream po(pooled_in, std::ofstream::binary);
+            append_file_bytes(po, filename);
+            append_file_bytes(po, paired_with_file);
+          }
+          // Banner clarifying pairs-vs-pooled-reads and R1/R2 matching.
+          char pctbuf[16];
+          const double mpct = ps.pairs ? (100.0 * ps.matching / ps.pairs) : 0.0;
+          std::snprintf(pctbuf, sizeof pctbuf, "%.1f", mpct);
+          const std::string npairs = std::to_string(ps.pairs);
+          const std::string nreads = std::to_string(2 * ps.pairs);
+          falco_config.combined_note =
+            "<div class=\"module\"><p class=\"module-desc\" style=\"margin:0\">"
+            "<b>Paired-end combined view.</b> Read 1 and Read 2 are the two ends "
+            "of the same fragments, so this is <b>" + npairs + " read pairs</b> "
+            "(not " + nreads + " independent reads). <b>" +
+            std::to_string(ps.matching) + " (" + pctbuf +
+            "%)</b> of pairs have matching R1/R2 identifiers. The metrics below "
+            "pool both mates, so \"Total Sequences\" counts all " + nreads +
+            " sequenced ends.</p></div>";
+
+          analyze_and_write(falco_config, pooled_in, forced_file_format,
+                            comb_dir, std::string{}, std::string{},
+                            std::string{}, std::string{}, /*skip_text=*/true,
+                            skip_html, /*skip_short_summary=*/true, do_call,
+                            true, " (combined)");
+          falco_config.combined_note.clear();  // don't leak to other reports
+          const std::string comb_html =
+            read_text_file(comb_dir + "/falcoAmadeus_report.html");
+
+          write_combined_paired_report(
+            cur_outdir + "/falcoAmadeus_report.html", comb_html,
+            read_text_file(fwd_html_path), read_text_file(rev_html_path),
+            sample);
+
+          std::error_code rc;
+          std::filesystem::remove(fwd_html_path, rc);
+          std::filesystem::remove(rev_html_path, rc);
+          std::filesystem::remove_all(comb_dir, rc);  // temp pooled input + html
+          if (!falco_config.quiet)
+            log_process("Wrote combined paired report to " + cur_outdir +
+                        "/falcoAmadeus_report.html");
+        }
       }
 
       /************************** TIME SUMMARY *****************************/

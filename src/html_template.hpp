@@ -25,6 +25,7 @@
 constexpr auto falco_config_html_template = R"(<html>
 <head>
     <meta charset="utf-8">
+    <script>(function(){var d=document.documentElement,t;try{t=localStorage.getItem('falco-theme');}catch(e){}if(!t)t='dark';d.setAttribute('data-theme',t);})();</script>
     <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
 
 	<title>
@@ -34,33 +35,35 @@ constexpr auto falco_config_html_template = R"(<html>
 <link href="https://stackpath.bootstrapcdn.com/font-awesome/4.7.0/css/font-awesome.min.css" rel="stylesheet" integrity="sha384-wvfXpqpZZVQGK6TAh5PVlGOfQNHSoD2xbE+QkPxCAFlNEevoEH3Sl0sibVcOQVnN" crossorigin="anonymous">
 <style type="text/css">
 :root {
-  --bg:#f4f6f9; --surface:#ffffff; --surface-2:#f7f9fc; --border:#e4e9f0;
-  --text:#1f2733; --muted:#697586; --brand:#0b6bcb; --brand-2:#37a0f4;
-  --pass:#1a9e5f; --warn:#d69b00; --fail:#d64545;
-  --shadow:0 1px 3px rgba(16,24,40,.06),0 1px 2px rgba(16,24,40,.04);
-  --radius:12px; --sidebar-w:19em;
+  --bg:#f5f5f7; --surface:#ffffff; --surface-2:#f5f5f7; --border:#e3e3e8;
+  --text:#1d1d1f; --muted:#6e6e73; --brand:#0071e3; --brand-2:#42a5ff;
+  --pass:#34c759; --warn:#ff9f0a; --fail:#ff3b30;
+  --header-bg:rgba(255,255,255,.72);
+  --shadow:0 8px 30px rgba(0,0,0,.06),0 1px 2px rgba(0,0,0,.05);
+  --shadow-lg:0 18px 50px rgba(0,0,0,.10);
+  --radius:18px; --sidebar-w:19em;
 }
 * { box-sizing:border-box; }
 html { scroll-behavior:smooth; }
 body {
-  color:var(--text); background:var(--bg); margin:0; padding:0;
-  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
+  color:var(--text); margin:0; padding:0; background:var(--bg);
+  font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display','SF Pro Text','Segoe UI',Roboto,Helvetica,Arial,sans-serif;
   font-size:15px; line-height:1.55; -webkit-font-smoothing:antialiased;
+  letter-spacing:-.006em;
+  -webkit-print-color-adjust:exact; print-color-adjust:exact;
 }
 a { color:var(--brand); text-decoration:none; }
+a:hover { text-decoration:underline; }
 div.header {
-  position:sticky; top:0; z-index:20; display:flex; align-items:baseline;
+  position:sticky; top:0; z-index:20; display:flex; align-items:center;
   justify-content:space-between; gap:1em; flex-wrap:wrap; width:100%; margin:0;
-  background:var(--surface); border-bottom:1px solid var(--border);
-  box-shadow:var(--shadow); padding:.85em 1.4em; font-size:100%;
+  background:var(--header-bg); border-bottom:1px solid var(--border);
+  -webkit-backdrop-filter:saturate(180%) blur(20px); backdrop-filter:saturate(180%) blur(20px);
+  padding:.9em 1.6em; font-size:100%;
 }
 #header_title {
-  float:none; display:inline-flex; align-items:center; gap:.5em;
-  font-size:1.5rem; font-weight:700; letter-spacing:-.01em; color:var(--brand);
-}
-#header_title::before {
-  content:""; width:.72em; height:.72em; border-radius:4px;
-  background:linear-gradient(135deg,var(--brand),var(--brand-2));
+  float:none; display:inline-flex; align-items:center;
+  font-size:1.6rem; font-weight:700; letter-spacing:-.022em; color:var(--text);
 }
 #header_filename {
   float:none; text-align:right; font-size:.82rem; color:var(--muted);
@@ -92,8 +95,10 @@ div.summary ul li a.fail::before { background:var(--fail); }
 div.main { margin-left:var(--sidebar-w); padding:1.5em 2em 4.5em; max-width:1180px; }
 div.module {
   background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
-  box-shadow:var(--shadow); padding:1.2em 1.5em 1.5em; margin-bottom:1.4em;
+  box-shadow:var(--shadow); padding:1.35em 1.7em 1.6em; margin-bottom:1.5em;
+  transition:box-shadow .2s ease, transform .2s ease;
 }
+div.module:hover { box-shadow:var(--shadow-lg); transform:translateY(-2px); }
 div.module h2 {
   display:flex; align-items:center; gap:.55em; flex-wrap:wrap; clear:none;
   font-size:1.12rem; font-weight:650; color:var(--text);
@@ -145,9 +150,16 @@ tr:last-child td { border-bottom:0; }
 tr:hover td { background:var(--surface-2); }
 div.footer {
   position:fixed; bottom:0; left:0; width:100%; z-index:20; margin:0;
-  background:var(--surface); border-top:1px solid var(--border);
-  color:var(--muted); font-size:.8rem; padding:.55em 1.4em;
+  background:var(--header-bg); border-top:1px solid var(--border);
+  -webkit-backdrop-filter:saturate(180%) blur(20px); backdrop-filter:saturate(180%) blur(20px);
+  color:var(--muted); font-size:.8rem; padding:.55em 1.6em;
 }
+div.summary ul li a.pass::before { box-shadow:0 0 0 3px rgba(52,199,89,.16); }
+div.summary ul li a.warn::before { box-shadow:0 0 0 3px rgba(255,159,10,.16); }
+div.summary ul li a.fail::before { box-shadow:0 0 0 3px rgba(255,59,48,.16); }
+div.module h2.pass::before { box-shadow:0 0 0 4px rgba(52,199,89,.15); }
+div.module h2.warn::before { box-shadow:0 0 0 4px rgba(255,159,10,.15); }
+div.module h2.fail::before { box-shadow:0 0 0 4px rgba(255,59,48,.15); }
 img.indented { margin-left:3em; } p { margin-top:0; }
 @media (max-width:820px) {
   div.summary { position:static; width:auto; height:auto; margin:.8em;
@@ -158,12 +170,35 @@ img.indented { margin-left:3em; } p { margin-top:0; }
 @media print {
   div.summary, div.footer { position:static; width:auto; height:auto; }
   div.main { margin-left:0; } div.module { break-inside:avoid; box-shadow:none; }
+  .modebar { display:none !important; }
 }
-@media (prefers-color-scheme:dark) {
-  :root { --bg:#0f141a; --surface:#171d25; --surface-2:#1e2732; --border:#2a333f;
-    --text:#e6ebf2; --muted:#9aa6b2; --brand:#4aa3f0; --brand-2:#7cc0ff;
-    --shadow:0 1px 3px rgba(0,0,0,.45); }
+:root[data-theme="dark"] {
+  --bg:#000000; --surface:#1c1c1e; --surface-2:#2c2c2e; --border:#38383a;
+  --text:#f5f5f7; --muted:#98989d; --brand:#0a84ff; --brand-2:#64d2ff;
+  --pass:#30d158; --warn:#ff9f0a; --fail:#ff453a;
+  --header-bg:rgba(28,28,30,.72);
+  --shadow:0 8px 30px rgba(0,0,0,.5),0 1px 2px rgba(0,0,0,.6);
+  --shadow-lg:0 18px 50px rgba(0,0,0,.6);
 }
+button.theme-toggle {
+  border:1px solid var(--border); background:var(--surface-2); color:var(--text);
+  border-radius:999px; width:2.1em; height:2.1em; font-size:1rem; line-height:1;
+  cursor:pointer; display:inline-flex; align-items:center; justify-content:center;
+  padding:0; margin-left:.15em; flex:0 0 auto; transition:background .15s, transform .15s;
+}
+button.theme-toggle:hover { background:var(--brand); color:#fff; transform:scale(1.08); }
+select.palette-select {
+  border:1px solid var(--border); background:var(--surface-2); color:var(--text);
+  border-radius:999px; height:2.1em; font-size:.82rem; font-weight:600; line-height:1;
+  cursor:pointer; padding:0 1.9em 0 .9em; margin-left:.35em; flex:0 0 auto;
+  font-family:inherit; -webkit-appearance:none; appearance:none;
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6'><path d='M1 1l4 4 4-4' fill='none' stroke='%236e6e73' stroke-width='1.6'/></svg>");
+  background-repeat:no-repeat; background-position:right .8em center;
+}
+select.palette-select:hover { border-color:var(--brand); }
+/* Center the Plotly modebar icons inside their (hover) background squares. */
+.js-plotly-plot .modebar-btn { display:inline-flex !important; align-items:center; justify-content:center; }
+.js-plotly-plot .modebar-btn svg { vertical-align:middle; display:block; }
 </style>
 <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
 </head>
@@ -230,6 +265,7 @@ img.indented { margin-left:3em; } p { margin-top:0; }
 </ul>
 </div>
 <div class="main">
+{{combinednote}}
 <div class="module">
   <h2 class="{{passbasicstatistics}}" id="basicstatistics">
     {{basicstatisticsname}}: {{passbasicstatistics}}
@@ -306,6 +342,7 @@ img.indented { margin-left:3em; } p { margin-top:0; }
 	<h2 class="{{passsequenceduplicationlevels}}" id="sequenceduplicationlevels">
     {{sequenceduplicationlevelsname}} : {{passsequenceduplicationlevels}}
   </h2>
+  {{pairednote}}
  	<div id="seqduplevelslineplot"></div>
 </div>
 {{sequenceduplicationlevelsce}}
@@ -359,9 +396,41 @@ crossorigin="anonymous"></script>
 // slimmer boxes, an on-hover toolbar and no logo, without touching each call.
 (function(){
   if (!window.Plotly) return;
+  // Selectable colorblind-safe palettes, with a variant per background so no
+  // colour ever disappears into it (the near-black in light mode becomes a light
+  // neutral in dark mode, dark hues are brightened). Each palette still never
+  // mixes red WITH green: 'ocean' has no red, 'sunset'/'ink' have no green.
+  // Each palette: categorical light/dark arrays, plus a colourblind-safe
+  // diverging pair (warm,cool) used for heatmaps so every plot follows the
+  // chosen scheme (lines, box and heatmap alike).
+  window.FALCO_PALETTES={
+    ocean:{light:['#0071e3','#00c7be','#5856d6','#ff9500','#1d1d1f','#8e8e93'],
+           dark: ['#4aa3ff','#40e0d6','#a29bff','#ffb340','#f2f2f7','#c7c7cc'],
+           divLight:['#ff9500','#0071e3'],divDark:['#ffb340','#4aa3ff']},
+    sunset:{light:['#ff9500','#ff2d55','#af52de','#a2845e','#1d1d1f','#0071e3'],
+            dark: ['#ffb340','#ff6482','#d68bff','#d6b48c','#f2f2f7','#64d2ff'],
+            divLight:['#ff9500','#af52de'],divDark:['#ffb340','#d68bff']},
+    ink:{light:['#1d1d1f','#0071e3','#ff9500','#af52de','#8a6d1f','#6e6e73'],
+         dark: ['#f2f2f7','#4aa3ff','#ffb340','#d68bff','#d4b06a','#aeaeb2'],
+         divLight:['#ff9500','#0071e3'],divDark:['#ffb340','#4aa3ff']}
+  };
+  function palColors(name){
+    var p=window.FALCO_PALETTES[name]||window.FALCO_PALETTES.ocean;
+    return (document.documentElement.getAttribute('data-theme')==='dark')?p.dark:p.light;
+  }
+  var PAL='ocean'; try{var _p=localStorage.getItem('falco-palette'); if(_p&&window.FALCO_PALETTES[_p])PAL=_p;}catch(e){}
   var FONT={family:'-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif',size:12,color:'#3a4553'};
-  var AX={gridcolor:'#eceff3',zerolinecolor:'#dfe4ea',linecolor:'#cfd6de',ticks:'outside',tickcolor:'#cfd6de',tickfont:{size:11,color:'#697586'},automargin:true};
-  var THEME={paper_bgcolor:'rgba(0,0,0,0)',plot_bgcolor:'rgba(0,0,0,0)',colorway:['#0072b2','#e69f00','#009e73','#d55e00','#56b4e9','#cc79a7','#111111'],boxgap:0.28,boxgroupgap:0.2,legend:{borderwidth:0}};
+  // Grid is visible by default (a clear reference grid on every plot).
+  var AX={gridcolor:'#d6dbe3',zerolinecolor:'#c4cbd4',linecolor:'#b7bec9',ticks:'outside',tickcolor:'#b7bec9',tickfont:{size:11,color:'#697586'},gridwidth:1,automargin:true};
+  // Legend as a horizontal row BELOW the figure so it never collides with the
+  // modebar (camera/zoom toolbar), which Plotly pins to the top-right corner.
+  var LEGEND={orientation:'h',xanchor:'center',x:0.5,yanchor:'top',y:-0.22,borderwidth:0,font:{size:11}};
+  // Force a solid, readable hover label instead of Plotly's default (which tints
+  // it with the trace colour and can render same-colour text on same-colour bg).
+  var HOVER={bgcolor:'#ffffff',bordercolor:'#d6dbe3',font:{family:FONT.family,size:12,color:'#1d1d1f'}};
+  // 'x unified' collapses all series at a position into ONE box that honours the
+  // hoverlabel bg/font, instead of per-point boxes whose colours fight the theme.
+  var THEME={paper_bgcolor:'rgba(0,0,0,0)',plot_bgcolor:'rgba(0,0,0,0)',colorway:palColors(PAL).slice(),boxgap:0.28,boxgroupgap:0.2,legend:LEGEND,hoverlabel:HOVER,hovermode:'x unified'};
   var CFG={displaylogo:false,responsive:true,displayModeBar:'hover',modeBarButtonsToRemove:['select2d','lasso2d','autoScale2d','toggleSpikelines','hoverClosestCartesian','hoverCompareCartesian']};
   var orig=Plotly.newPlot;
   Plotly.newPlot=function(id,data,layout,config){
@@ -370,7 +439,8 @@ crossorigin="anonymous"></script>
     L.font=Object.assign({},FONT,layout.font);
     L.xaxis=Object.assign({},AX,layout.xaxis);
     L.yaxis=Object.assign({},AX,layout.yaxis);
-    L.margin=Object.assign({t:12,r:18,b:54,l:60},layout.margin);
+    L.legend=Object.assign({},LEGEND,layout.legend);
+    L.margin=Object.assign({t:34,r:18,b:70,l:60},layout.margin);
     return orig.call(Plotly,id,data,L,Object.assign({},CFG,config));
   };
 })();
@@ -379,9 +449,15 @@ if (document.getElementById('seqbasequalityboxplot') !== null) {
   Plotly.newPlot('seqbasequalityboxplot', [
    {{perbasesequencequalitydata}}
   ], {
-    margin: { t: 0 }, showlegend: false,
+    showlegend: false,
+    boxgap: 0.45,
     xaxis : {title : 'Base position'},
-    yaxis : {title : 'Phread quality'},
+    yaxis : {title : 'Phred quality', range : [0, 42]},
+    shapes : [
+      {type:'rect',xref:'paper',yref:'y',x0:0,x1:1,y0:28,y1:42,fillcolor:'rgba(52,199,89,0.20)',line:{width:0},layer:'below'},
+      {type:'rect',xref:'paper',yref:'y',x0:0,x1:1,y0:20,y1:28,fillcolor:'rgba(255,159,10,0.22)',line:{width:0},layer:'below'},
+      {type:'rect',xref:'paper',yref:'y',x0:0,x1:1,y0:0,y1:20,fillcolor:'rgba(255,59,48,0.20)',line:{width:0},layer:'below'}
+    ]
   });
 }
 if (document.getElementById('tilequalityheatmap') !== null) {
@@ -520,6 +596,94 @@ if (document.getElementById('kmerlineplot') !== null) {
     });
     sum.parentNode.insertBefore(btn,sum.nextSibling);
   }
+})();
+
+// [FalcoAmadeus] dark-mode toggle (persisted) that also re-themes the plots
+(function(){
+  var root=document.documentElement;
+  // Theme the plot chrome: a clear reference grid on every plot by default,
+  // recoloured for dark mode. (No separate contrast mode -- the grid is default.)
+  function applyPlotStyle(){
+    if(!window.Plotly) return;
+    var dark=root.getAttribute('data-theme')==='dark';
+    var fg=dark?'#e6ebf2':'#2a3441', grid=dark?'#3a4451':'#d6dbe3',
+        line=dark?'#4a5462':'#b7bec9', tick=dark?'#9aa6b2':'#697586';
+    // readable hover label: solid surface bg + contrasting text for this theme
+    var hbg=dark?'#2c2c2e':'#ffffff', hbd=dark?'#48484a':'#d6dbe3',
+        htx=dark?'#f5f5f7':'#1d1d1f';
+    document.querySelectorAll('.js-plotly-plot').forEach(function(d){
+      Plotly.relayout(d,{'font.color':fg,'xaxis.gridcolor':grid,'yaxis.gridcolor':grid,
+        'xaxis.gridwidth':1,'yaxis.gridwidth':1,
+        'xaxis.linecolor':line,'yaxis.linecolor':line,
+        'xaxis.tickcolor':line,'yaxis.tickcolor':line,
+        'xaxis.tickfont.color':tick,'yaxis.tickfont.color':tick,'xaxis.zerolinecolor':grid,
+        'yaxis.zerolinecolor':grid,'xaxis.title.font.color':fg,'yaxis.title.font.color':fg,
+        'legend.font.color':fg,
+        'hoverlabel.bgcolor':hbg,'hoverlabel.bordercolor':hbd,'hoverlabel.font.color':htx});
+    });
+  }
+  // Recolour every categorical plot from the chosen palette, cycling colours
+  // across each plot's solid line/bar traces (dashed reference lines, the box
+  // plot and heatmaps keep their own colours).
+  function hexToRgba(h,a){var m=(h||'').replace('#','');
+    if(m.length===3)m=m[0]+m[0]+m[1]+m[1]+m[2]+m[2];
+    var r=parseInt(m.substr(0,2),16),g=parseInt(m.substr(2,2),16),b=parseInt(m.substr(4,2),16);
+    return 'rgba('+r+','+g+','+b+','+a+')';}
+  function applyPalette(name){
+    if(!window.Plotly||!window.FALCO_PALETTES) return;
+    // theme-aware: pick the light/dark variant for the active background
+    var dark=root.getAttribute('data-theme')==='dark';
+    var p=window.FALCO_PALETTES[name]||window.FALCO_PALETTES.ocean;
+    var pal=dark?p.dark:p.light, dv=dark?p.divDark:p.divLight,
+        neutral=dark?'#3a3f47':'#eef0f3';
+    document.querySelectorAll('.js-plotly-plot').forEach(function(gd){
+      if(!gd.data) return;
+      var k=0;
+      gd.data.forEach(function(tr,i){
+        var t=tr.type||'scatter';
+        if(t==='heatmap'||t==='histogram2d'||t==='histogram2dcontour'||t==='contour'){
+          // diverging scale from the palette (warm -> neutral -> cool)
+          try{Plotly.restyle(gd,{colorscale:[[[0,dv[0]],[0.5,neutral],[1,dv[1]]]]},[i]);}catch(e){}
+        } else if(t==='box'){
+          var bc=pal[0];
+          try{Plotly.restyle(gd,{fillcolor:[hexToRgba(bc,0.55)],'line.color':[bc],'marker.color':[bc]},[i]);}catch(e){}
+        } else {
+          var dashed=tr.line&&tr.line.dash&&tr.line.dash!=='solid';
+          if(dashed) return;
+          var c=pal[k%pal.length]; k++;
+          try{Plotly.restyle(gd,{'line.color':[c],'marker.color':[c]},[i]);}catch(e){}
+        }
+      });
+    });
+  }
+  var btn=document.createElement('button'); btn.className='theme-toggle';
+  btn.title='Toggle light / dark';
+  function set(t){ root.setAttribute('data-theme',t);
+    try{localStorage.setItem('falco-theme',t);}catch(e){}
+    btn.textContent=(t==='dark')?'☀':'☾'; applyPlotStyle();
+    // re-map the palette to the new background so no colour is lost in it
+    if(typeof sel!=='undefined'&&sel) applyPalette(sel.value); }
+  btn.onclick=function(){ set(root.getAttribute('data-theme')==='dark'?'light':'dark'); };
+  // palette picker
+  var sel=document.createElement('select'); sel.className='palette-select';
+  sel.title='Plot colour scheme';
+  var NAMES={ocean:'Ocean',sunset:'Sunset',ink:'Ink'};
+  ['ocean','sunset','ink'].forEach(function(k){
+    var o=document.createElement('option'); o.value=k; o.textContent=NAMES[k]; sel.appendChild(o); });
+  var curPal='ocean'; try{var sp=localStorage.getItem('falco-palette'); if(sp&&NAMES[sp])curPal=sp;}catch(e){}
+  sel.value=curPal;
+  sel.onchange=function(){ try{localStorage.setItem('falco-palette',sel.value);}catch(e){} applyPalette(sel.value); };
+  var title=document.querySelector('#header_title');
+  if(title){ title.parentNode.insertBefore(btn,title.nextSibling); btn.parentNode.insertBefore(sel,btn.nextSibling); }
+  set(root.getAttribute('data-theme')||'dark');
+  window.addEventListener('load',function(){ applyPlotStyle(); applyPalette(sel.value); });
+  // Expose theme/palette setters so an embedding page (the paired combined
+  // report) can drive this report from one shared header.
+  window.falcoSetTheme=function(t){ set(t); };
+  window.falcoSetPalette=function(p){ if(!NAMES[p])return; sel.value=p;
+    try{localStorage.setItem('falco-palette',p);}catch(e){} applyPalette(p); };
+  window.falcoTheme=function(){ return root.getAttribute('data-theme')||'dark'; };
+  window.falcoPalette=function(){ return sel.value; };
 })();
 
 </script>

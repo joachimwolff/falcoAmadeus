@@ -763,41 +763,32 @@ ModulePerBaseSequenceQuality::write_module(std::ostream &os) {
 // Plotly data
 std::string
 ModulePerBaseSequenceQuality::make_html_data() {
-  std::ostringstream data;
+  // Render as clean percentile bands (10-90% and the 25-75% IQR) with a median
+  // line rather than one box glyph per position: far less cluttered than a wall
+  // of boxes, and an honest depiction of the quantile summary we store.
+  std::ostringstream x, med, ud, ld, uq, lq;
   for (std::size_t i = 0; i < num_groups; ++i) {
-    data << "{y : [";
-
-    data << group_ldecile[i] << ", " << group_lquartile[i] << ", "
-         << group_median[i] << ", " << group_uquartile[i] << ", "
-         << group_udecile[i] << "], ";
-    data << "type : 'box', name : ' ";
-    if (base_groups[i].start == base_groups[i].end)
-      data << base_groups[i].start + 1;
-    else
-      data << base_groups[i].start + 1 << "-" << base_groups[i].end + 1;
-    data << "bp', ";
-    // colour by pass/warn/fail, with a soft fill and a crisp outline
-    const char *fillc, *linec;
-    if (group_median[i] < base_median_error ||
-        group_lquartile[i] < base_lower_error) {
-      fillc = "rgba(214,69,69,0.35)";
-      linec = "rgb(192,57,43)";
+    if (i) {
+      x << ","; med << ","; ud << ","; ld << ","; uq << ","; lq << ",";
     }
-    else if (group_median[i] < base_median_warn ||
-             group_lquartile[i] < base_lower_warn) {
-      fillc = "rgba(214,155,0,0.35)";
-      linec = "rgb(176,125,10)";
-    }
-    else {
-      fillc = "rgba(26,158,95,0.32)";
-      linec = "rgb(21,148,87)";
-    }
-    data << "fillcolor : '" << fillc << "', line : {color : '" << linec
-         << "', width : 1.4}, marker : {color : '" << linec << "'}}";
-    if (i < num_bases - 1) {
-      data << ", ";
-    }
+    // representative (1-based) base position: midpoint of the group
+    const double pos = (base_groups[i].start + base_groups[i].end) / 2.0 + 1.0;
+    x << pos;
+    med << group_median[i];
+    ud << group_udecile[i];
+    ld << group_ldecile[i];
+    uq << group_uquartile[i];
+    lq << group_lquartile[i];
   }
+  // One precomputed box trace (box = 25-75% IQR, whiskers = 10-90%, line =
+  // median) instead of a separate box glyph per position -- the recognizable
+  // FastQC standard, rendered cleanly.
+  std::ostringstream data;
+  data << "{type:'box',x:[" << x.str() << "],lowerfence:[" << ld.str()
+       << "],q1:[" << lq.str() << "],median:[" << med.str() << "],q3:[" << uq.str()
+       << "],upperfence:[" << ud.str()
+       << "],fillcolor:'rgba(221,170,51,0.6)',line:{color:'#8a6d1f',width:1},"
+          "marker:{color:'#8a6d1f'},whiskerwidth:0.35,showlegend:false,hoverinfo:'x'}";
   return data.str();
 }
 
@@ -1352,16 +1343,17 @@ ModulePerBaseSequenceContent::make_html_data() {
     }
     data << "], mode : 'lines', name : '" + size_t_to_seq(base, 1) + "', ";
 
-    // color
+    // color: colorblind-safe defaults (Ocean palette order) that never place a
+    // red next to a green; the report's palette picker can recolour these live.
     data << "line :{ color : '";
     if (base == 0)
-      data << "green";
+      data << "#0071e3";       // A - blue
     else if (base == 1)
-      data << "blue";
+      data << "#00c7be";       // C - teal
     else if (base == 2)
-      data << "red";
+      data << "#5856d6";       // T - indigo
     else
-      data << "black";
+      data << "#ff9500";       // G - orange
     data << "'}";
     // end color
 
@@ -1691,55 +1683,52 @@ ModuleSequenceLengthDistribution::write_module(std::ostream &os) {
 
 std::string
 ModuleSequenceLengthDistribution::make_html_data() {
+  // [FalcoAmadeus] Emit a contiguous window padded a couple of positions past
+  // the observed min/max length. With uniform-length reads the old code emitted
+  // a single categorical bar that filled the whole plot ("blob"); padding the
+  // axis makes it a normal, centred bar and turns any distribution into a proper
+  // histogram with its zero-count gaps shown.
+  std::size_t lo = 0, hi = 0;
+  bool any = false;
+  for (std::size_t i = 0; i < max_read_length; ++i) {
+    if (sequence_lengths[i] > 0) {
+      if (!any)
+        lo = i;
+      hi = i;
+      any = true;
+    }
+  }
+  const std::size_t pad = 2;
+  const std::size_t wlo = (any && lo > pad) ? lo - pad : 0;
+  const std::size_t whi = any ? hi + pad : 0;  // may extend past the count array
+
+  std::ostringstream xs, ys, ts;
+  bool first = false;
+  if (empty_reads > 0) {
+    xs << "\"0 bp\"";
+    ys << empty_reads;
+    ts << 0;
+    first = true;
+  }
+  if (any) {
+    for (std::size_t i = wlo; i <= whi; ++i) {
+      if (first) {
+        xs << ",";
+        ys << ",";
+        ts << ",";
+      }
+      const std::size_t count = (i < max_read_length) ? sequence_lengths[i] : 0;
+      xs << "\"" << (i + 1) << " bp\"";
+      ys << count;
+      ts << (i + 1);
+      first = true;
+    }
+  }
+
   std::ostringstream data;
-  // X values : avg quality phred scores
-  data << "{x : [";
-  bool first_seen = false;
-
-  if (empty_reads > 0) {
-    first_seen = true;
-    data << "\"0 bp\"";
-  }
-  for (std::size_t i = 0; i < max_read_length; ++i) {
-    if (sequence_lengths[i] > 0) {
-      if (first_seen)
-        data << ",";
-      data << "\"" << i + 1 << " bp\"";
-      first_seen = true;
-    }
-  }
-
-  // Y values: frequency with which they were seen
-  data << "], y : [";
-  first_seen = false;
-
-  if (empty_reads > 0) {
-    first_seen = true;
-    data << empty_reads;
-  }
-  for (std::size_t i = 0; i < max_read_length; ++i) {
-    if (sequence_lengths[i] > 0) {
-      if (first_seen)
-        data << ",";
-      data << sequence_lengths[i];
-      first_seen = true;
-    }
-  }
-
-  // Put the sequence value in the text
-  data << "], text : [";
-  first_seen = false;
-  for (std::size_t i = 0; i < max_read_length; ++i) {
-    if (sequence_lengths[i] > 0) {
-      if (first_seen)
-        data << ",";
-      data << i + 1;
-      first_seen = true;
-    }
-  }
-
-  data << "], type: 'bar', marker : {color : 'rgba(55,128,191,1.0)',"
-       << "line : {width : 2}}, "
+  data << "{x : [" << xs.str() << "], y : [" << ys.str() << "], text : ["
+       << ts.str() << "], type: 'bar', width: 0.7, "
+       << "marker : {color : 'rgba(55,128,191,1.0)', line : {width : 2}}, "
        << "name : 'Sequence length distribution'}";
 
   return data.str();
