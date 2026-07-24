@@ -25,7 +25,13 @@ runautoreconf() {
     autoreconf -i;
 }
 
-if test -d .git && test "$(basename "${PWD}")" = "falco"
+# Run autoreconf whenever configure.ac is present (i.e. a source tree that needs
+# the configure script generated). The previous check required the working
+# directory to be named literally "falco", which broke CI and any fork:
+# actions/checkout names the directory after the repo (e.g. "falcoAmadeus"), so
+# the name test failed, autoreconf never ran, and the "Generate the configure
+# script" CI step exited 1.
+if test -f configure.ac
 then
     runautoreconf
     exit 0
