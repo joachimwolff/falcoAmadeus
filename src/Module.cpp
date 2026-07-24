@@ -343,12 +343,15 @@ Module::write(std::ostream &os) {
   if (!summarized)
     throw std::runtime_error("Attempted to write module before summarizing : " +
                              module_name);
-  os << ">>" << module_name << "\t" << grade << "\n";
-  // [FalcoAmadeus] assay-aware annotations: comment lines (leading '#' is part
-  // of the FastQC format) explaining any grade the active --assay adjusted.
-  // Empty in generic mode, so default output is byte-identical.
+  // [FalcoAmadeus] assay-aware annotations: comment lines explaining any grade
+  // the active --assay adjusted. Emitted BEFORE the ">>module" line (in the gap
+  // between modules) so parsers that treat a '#' line inside a module as a
+  // column header -- notably MultiQC -- ignore them instead of choking on a
+  // comment that has no tab-separated columns. Empty in generic mode, so the
+  // default output stays byte-identical.
   for (const auto &annotation : assay_annotations)
     os << annotation << "\n";
+  os << ">>" << module_name << "\t" << grade << "\n";
   write_module(os);
   os << ">>END_MODULE\n";
 }
