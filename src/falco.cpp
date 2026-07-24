@@ -1017,6 +1017,24 @@ main(int argc, char *argv[]) {
                       false, falco_config.threads);
 
     opt_parse.add_opt(
+      "-name", '\0',
+      "[FalcoAmadeus] Sample name to use as the report 'Filename' (and MultiQC "
+      "sample name) instead of the input file's basename. Useful when the input "
+      "is passed with an unhelpful name -- e.g. Galaxy paired collections whose "
+      "elements are all literally 'forward'/'reverse' -- so each sample stays "
+      "distinct. In paired mode it also names the per-mate output subdirs.",
+      false, falco_config.sample_name);
+
+    opt_parse.add_opt(
+      "-paired-data", '\0',
+      "[FalcoAmadeus] With --paired-with, which fastqc_data.txt files to write "
+      "for MultiQC: 'mates' (default) = separate forward + reverse; 'combined' = "
+      "a single pooled R1+R2 file only (one MultiQC sample per pair, no separate "
+      "mates); 'both' = all three. The combined HTML report is written either "
+      "way.",
+      false, falco_config.paired_data);
+
+    opt_parse.add_opt(
       "-contaminants", 'c',
       "Specifies a non-default file which contains the list of "
       "contaminants to screen overrepresented sequences against. "
@@ -1351,6 +1369,13 @@ main(int argc, char *argv[]) {
         // at the top level of the output directory.
         std::string fwd_stem, rev_stem;
         derive_mate_stems(filename, paired_with_file, fwd_stem, rev_stem);
+        // [FalcoAmadeus] an explicit --name overrides the derived mate stems so
+        // the per-mate output subdirs are <name>_forward / <name>_reverse
+        // (distinct per sample even when the inputs are named forward/reverse).
+        if (!falco_config.sample_name.empty()) {
+          fwd_stem = falco_config.sample_name + "_forward";
+          rev_stem = falco_config.sample_name + "_reverse";
+        }
         const std::string fwd_dir = cur_outdir + "/" + fwd_stem;
         const std::string rev_dir = cur_outdir + "/" + rev_stem;
 
@@ -1370,15 +1395,20 @@ main(int argc, char *argv[]) {
           std::filesystem::path(filename).filename().string();
         const std::string r2_base =
           std::filesystem::path(paired_with_file).filename().string();
+        // [FalcoAmadeus] Which per-sample data files to write for MultiQC.
+        const bool want_mate_data = (falco_config.paired_data != "combined");
+        const bool want_comb_data = (falco_config.paired_data != "mates");
+        const bool mate_skip_text = skip_text || !want_mate_data;
+
         analyze_and_write(falco_config, filename, forced_file_format, fwd_dir,
                           std::string{}, std::string{}, std::string{},
-                          std::string{}, skip_text, skip_html,
-                          skip_short_summary, do_call, true, " (forward)",
+                          std::string{}, mate_skip_text, skip_html,
+                          mate_skip_text, do_call, true, " (forward)",
                           r2_base);
         analyze_and_write(falco_config, paired_with_file, forced_file_format,
                           rev_dir, std::string{}, std::string{}, std::string{},
-                          std::string{}, skip_text, skip_html,
-                          skip_short_summary, do_call, true, " (reverse)",
+                          std::string{}, mate_skip_text, skip_html,
+                          mate_skip_text, do_call, true, " (reverse)",
                           r1_base);
 
         // [FalcoAmadeus] Pairing + duplication pass FIRST, so the combined view
@@ -1393,8 +1423,10 @@ main(int argc, char *argv[]) {
         // [FalcoAmadeus] Merge the mate reports into ONE combined HTML with
         // three tabs: Combined (R1+R2 pooled, the default), Forward, Reverse.
         // Drop the per-mate HTML files but keep their fastqc_data.txt +
-        // summary.txt (in the subdirs) for MultiQC.
-        if (!skip_html) {
+        // summary.txt (in the subdirs) for MultiQC. Also runs when the combined
+        // fastqc_data.txt is requested (--paired-data combined/both) even if the
+        // HTML report is skipped.
+        if (!skip_html || want_comb_data) {
           const std::string fwd_html_path =
             fwd_dir + "/falcoAmadeus_report.html";
           const std::string rev_html_path =
@@ -1440,25 +1472,41 @@ main(int argc, char *argv[]) {
 
           analyze_and_write(falco_config, pooled_in, forced_file_format,
                             comb_dir, std::string{}, std::string{},
-                            std::string{}, std::string{}, /*skip_text=*/true,
-                            skip_html, /*skip_short_summary=*/true, do_call,
-                            true, " (combined)");
+                            std::string{}, std::string{},
+                            /*skip_text=*/!want_comb_data, skip_html,
+                            /*skip_short_summary=*/!want_comb_data, do_call, true,
+                            " (combined)");
           falco_config.combined_note.clear();  // don't leak to other reports
-          const std::string comb_html =
-            read_text_file(comb_dir + "/falcoAmadeus_report.html");
-
-          write_combined_paired_report(
-            cur_outdir + "/falcoAmadeus_report.html", comb_html,
-            read_text_file(fwd_html_path), read_text_file(rev_html_path),
-            sample);
 
           std::error_code rc;
-          std::filesystem::remove(fwd_html_path, rc);
-          std::filesystem::remove(rev_html_path, rc);
+          // The combined HTML report (three tabs) -- unless HTML is skipped.
+          if (!skip_html) {
+            const std::string comb_html =
+              read_text_file(comb_dir + "/falcoAmadeus_report.html");
+            write_combined_paired_report(
+              cur_outdir + "/falcoAmadeus_report.html", comb_html,
+              read_text_file(fwd_html_path), read_text_file(rev_html_path),
+              sample);
+            std::filesystem::remove(fwd_html_path, rc);
+            std::filesystem::remove(rev_html_path, rc);
+            if (!falco_config.quiet)
+              log_process("Wrote combined paired report to " + cur_outdir +
+                          "/falcoAmadeus_report.html");
+          }
+          // Pooled combined fastqc_data.txt (+summary) for MultiQC: lift it to
+          // the top level so it is the single sample for this pair.
+          if (want_comb_data) {
+            std::filesystem::rename(comb_dir + "/fastqc_data.txt",
+                                    cur_outdir + "/fastqc_data.txt", rc);
+            std::filesystem::rename(comb_dir + "/summary.txt",
+                                    cur_outdir + "/summary.txt", rc);
+          }
           std::filesystem::remove_all(comb_dir, rc);  // temp pooled input + html
-          if (!falco_config.quiet)
-            log_process("Wrote combined paired report to " + cur_outdir +
-                        "/falcoAmadeus_report.html");
+          // If the mates carry no data (combined-only), drop their empty dirs.
+          if (!want_mate_data) {
+            std::filesystem::remove_all(fwd_dir, rc);
+            std::filesystem::remove_all(rev_dir, rc);
+          }
         }
       }
 
