@@ -422,7 +422,10 @@ crossorigin="anonymous"></script>
   // Legend as a horizontal row BELOW the figure so it never collides with the
   // modebar (camera/zoom toolbar), which Plotly pins to the top-right corner.
   var LEGEND={orientation:'h',xanchor:'center',x:0.5,yanchor:'top',y:-0.22,borderwidth:0,font:{size:11}};
-  var THEME={paper_bgcolor:'rgba(0,0,0,0)',plot_bgcolor:'rgba(0,0,0,0)',colorway:palColors(PAL).slice(),boxgap:0.28,boxgroupgap:0.2,legend:LEGEND};
+  // Force a solid, readable hover label instead of Plotly's default (which tints
+  // it with the trace colour and can render same-colour text on same-colour bg).
+  var HOVER={bgcolor:'#ffffff',bordercolor:'#d6dbe3',font:{family:FONT.family,size:12,color:'#1d1d1f'}};
+  var THEME={paper_bgcolor:'rgba(0,0,0,0)',plot_bgcolor:'rgba(0,0,0,0)',colorway:palColors(PAL).slice(),boxgap:0.28,boxgroupgap:0.2,legend:LEGEND,hoverlabel:HOVER};
   var CFG={displaylogo:false,responsive:true,displayModeBar:'hover',modeBarButtonsToRemove:['select2d','lasso2d','autoScale2d','toggleSpikelines','hoverClosestCartesian','hoverCompareCartesian']};
   var orig=Plotly.newPlot;
   Plotly.newPlot=function(id,data,layout,config){
@@ -600,6 +603,9 @@ if (document.getElementById('kmerlineplot') !== null) {
     var dark=root.getAttribute('data-theme')==='dark';
     var fg=dark?'#e6ebf2':'#2a3441', grid=dark?'#3a4451':'#d6dbe3',
         line=dark?'#4a5462':'#b7bec9', tick=dark?'#9aa6b2':'#697586';
+    // readable hover label: solid surface bg + contrasting text for this theme
+    var hbg=dark?'#2c2c2e':'#ffffff', hbd=dark?'#48484a':'#d6dbe3',
+        htx=dark?'#f5f5f7':'#1d1d1f';
     document.querySelectorAll('.js-plotly-plot').forEach(function(d){
       Plotly.relayout(d,{'font.color':fg,'xaxis.gridcolor':grid,'yaxis.gridcolor':grid,
         'xaxis.gridwidth':1,'yaxis.gridwidth':1,
@@ -607,7 +613,8 @@ if (document.getElementById('kmerlineplot') !== null) {
         'xaxis.tickcolor':line,'yaxis.tickcolor':line,
         'xaxis.tickfont.color':tick,'yaxis.tickfont.color':tick,'xaxis.zerolinecolor':grid,
         'yaxis.zerolinecolor':grid,'xaxis.title.font.color':fg,'yaxis.title.font.color':fg,
-        'legend.font.color':fg});
+        'legend.font.color':fg,
+        'hoverlabel.bgcolor':hbg,'hoverlabel.bordercolor':hbd,'hoverlabel.font.color':htx});
     });
   }
   // Recolour every categorical plot from the chosen palette, cycling colours
