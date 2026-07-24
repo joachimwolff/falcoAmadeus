@@ -415,8 +415,10 @@ FalcoConfig::setup() {
   // Now check for the file format (FASTQ/SAM/BAM, compressed or not)
   define_file_format();
 
-  // Get filename without absolute path
-  filename_stripped = std::filesystem::path(filename).filename().string();
+  // Get filename without absolute path (or the explicit --name if provided).
+  filename_stripped = sample_name.empty()
+    ? std::filesystem::path(filename).filename().string()
+    : sample_name;
 
   // resolve the assay-aware grading profile (validated already in main; fall
   // back to the no-op generic profile if something slipped through).
