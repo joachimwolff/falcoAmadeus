@@ -782,8 +782,12 @@ write_combined_paired_report(const std::string &out_file,
     "<iframe data-v=\"r\" class=\"hide\" srcdoc=\"" << html_attr_escape(rev_html) << "\"></iframe>"
     "<script>(function(){var btns=document.querySelectorAll('.ptabs button'),"
     "frames=document.querySelectorAll('iframe');"
-    "function show(v){frames.forEach(function(f){f.classList.toggle('hide',f.getAttribute('data-v')!==v);});"
-    "btns.forEach(function(b){b.classList.toggle('active',b.getAttribute('data-v')===v);});}"
+    "function sy(f){try{return f.contentWindow.pageYOffset||f.contentWindow.document.documentElement.scrollTop||0;}catch(e){return 0;}}"
+    "function show(v){var cur=null,i;for(i=0;i<frames.length;i++){if(!frames[i].classList.contains('hide'))cur=frames[i];}"
+    "var y=cur?sy(cur):0,next=null;"
+    "frames.forEach(function(f){var m=f.getAttribute('data-v')===v;f.classList.toggle('hide',!m);if(m)next=f;});"
+    "btns.forEach(function(b){b.classList.toggle('active',b.getAttribute('data-v')===v);});"
+    "if(next){var go=function(){try{next.contentWindow.scrollTo(0,y);}catch(e){}};go();requestAnimationFrame(go);}}"
     "btns.forEach(function(b){b.onclick=function(){show(b.getAttribute('data-v'));};});})();</script>"
     "</body></html>";
 }
