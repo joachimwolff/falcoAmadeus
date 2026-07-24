@@ -425,7 +425,9 @@ crossorigin="anonymous"></script>
   // Force a solid, readable hover label instead of Plotly's default (which tints
   // it with the trace colour and can render same-colour text on same-colour bg).
   var HOVER={bgcolor:'#ffffff',bordercolor:'#d6dbe3',font:{family:FONT.family,size:12,color:'#1d1d1f'}};
-  var THEME={paper_bgcolor:'rgba(0,0,0,0)',plot_bgcolor:'rgba(0,0,0,0)',colorway:palColors(PAL).slice(),boxgap:0.28,boxgroupgap:0.2,legend:LEGEND,hoverlabel:HOVER};
+  // 'x unified' collapses all series at a position into ONE box that honours the
+  // hoverlabel bg/font, instead of per-point boxes whose colours fight the theme.
+  var THEME={paper_bgcolor:'rgba(0,0,0,0)',plot_bgcolor:'rgba(0,0,0,0)',colorway:palColors(PAL).slice(),boxgap:0.28,boxgroupgap:0.2,legend:LEGEND,hoverlabel:HOVER,hovermode:'x unified'};
   var CFG={displaylogo:false,responsive:true,displayModeBar:'hover',modeBarButtonsToRemove:['select2d','lasso2d','autoScale2d','toggleSpikelines','hoverClosestCartesian','hoverCompareCartesian']};
   var orig=Plotly.newPlot;
   Plotly.newPlot=function(id,data,layout,config){
