@@ -790,9 +790,13 @@ write_combined_paired_report(const std::string &out_file,
     "function show(v){var cur=null,i;for(i=0;i<frames.length;i++){if(frames[i].classList.contains('show'))cur=frames[i];}"
     "var y=cur?sy(cur):0,next=null;"
     "frames.forEach(function(f){if(f.getAttribute('data-v')===v)next=f;});"
-    // set the target's scroll while it is still hidden (but laid out), so it
-    // appears already at the right position -- no scroll-to-top flash.
-    "if(next){try{next.contentWindow.scrollTo(0,y);}catch(e){}}"
+    // Set the target's scroll while it is still hidden so it appears already at
+    // the right position. The inner reports use scroll-behavior:smooth, so force
+    // an INSTANT jump (assign scrollTop, behaviour override) -- otherwise it
+    // animates from the top and looks like a scroll-to-top-and-back flash.
+    "if(next){try{var d=next.contentWindow.document,se=d.scrollingElement||d.documentElement,"
+    "pb=se.style.scrollBehavior;se.style.scrollBehavior='auto';se.scrollTop=y;"
+    "next.contentWindow.scrollTo(0,y);se.style.scrollBehavior=pb;}catch(e){}}"
     "frames.forEach(function(f){f.classList.toggle('show',f.getAttribute('data-v')===v);});"
     "btns.forEach(function(b){b.classList.toggle('active',b.getAttribute('data-v')===v);});}"
     "btns.forEach(function(b){b.onclick=function(){show(b.getAttribute('data-v'));};});})();</script>"
