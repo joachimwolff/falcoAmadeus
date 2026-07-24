@@ -338,6 +338,7 @@ select.palette-select:hover { border-color:var(--brand); }
 	<h2 class="{{passsequenceduplicationlevels}}" id="sequenceduplicationlevels">
     {{sequenceduplicationlevelsname}} : {{passsequenceduplicationlevels}}
   </h2>
+  {{pairednote}}
  	<div id="seqduplevelslineplot"></div>
 </div>
 {{sequenceduplicationlevelsce}}

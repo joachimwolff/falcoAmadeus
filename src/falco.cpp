@@ -613,8 +613,10 @@ analyze_and_write(FalcoConfig &falco_config, const std::string &filename,
                   const std::string &report_filename, const bool skip_text,
                   const bool skip_html, const bool skip_short_summary,
                   const bool do_call, const bool forbid_sam_bam,
-                  const std::string &display_suffix) {
+                  const std::string &display_suffix,
+                  const std::string &paired_mate = std::string{}) {
   falco_config.filename = filename;
+  falco_config.paired_mate = paired_mate;
 
   // if format was not provided, we have to guess it by the filename
   falco_config.format = forced_file_format;
@@ -1193,14 +1195,20 @@ main(int argc, char *argv[]) {
 
         // Standard names within each subdir; custom -D/-R/-S are ignored in
         // paired mode (two outputs, so single-file names cannot apply).
+        const std::string r1_base =
+          std::filesystem::path(filename).filename().string();
+        const std::string r2_base =
+          std::filesystem::path(paired_with_file).filename().string();
         analyze_and_write(falco_config, filename, forced_file_format, fwd_dir,
                           std::string{}, std::string{}, std::string{},
                           std::string{}, skip_text, skip_html,
-                          skip_short_summary, do_call, true, " (forward)");
+                          skip_short_summary, do_call, true, " (forward)",
+                          r2_base);
         analyze_and_write(falco_config, paired_with_file, forced_file_format,
                           rev_dir, std::string{}, std::string{}, std::string{},
                           std::string{}, skip_text, skip_html,
-                          skip_short_summary, do_call, true, " (reverse)");
+                          skip_short_summary, do_call, true, " (reverse)",
+                          r1_base);
 
         const std::string paired_out = cur_outdir + "/paired_duplication.txt";
         if (!falco_config.quiet)

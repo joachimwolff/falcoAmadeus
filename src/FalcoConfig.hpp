@@ -166,6 +166,9 @@ struct FalcoConfig {
   bool is_sam, is_bam, is_fastq, is_fastq_gz;
   std::string filename;
   std::string filename_stripped;
+  // [FalcoAmadeus] in --paired-with mode, the basename of this mate's partner
+  // file (empty for single-end runs); surfaced in the duplication module.
+  std::string paired_mate;
 
   /*********** FUNCTIONS TO READ FILES *************/
   void define_file_format();

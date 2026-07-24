@@ -72,4 +72,21 @@ HtmlMaker::put_file_details(const FalcoConfig &falco_config) {
 
   std::regex version_re(left_tag + "version"s + right_tag);
   html_boilerplate = std::regex_replace(html_boilerplate, version_re, VERSION);
+
+  // [FalcoAmadeus] In paired-end mode, note inside the duplication module that
+  // this rate is per-mate and name the partner file; the corrected paired rate
+  // (a pair is a duplicate only if BOTH mates match) lives in
+  // paired_duplication.txt. Empty for single-end runs.
+  std::string paired_note;
+  if (!falco_config.paired_mate.empty()) {
+    paired_note =
+      "<p class=\"module-desc\"><b>Paired-end run.</b> The mate of this file is "
+      "<b>" + falco_config.paired_mate +
+      "</b>. The level shown here is computed per mate (single-end). The "
+      "corrected paired PCR-duplicate rate, where a read pair counts as a "
+      "duplicate only when both mates are duplicates, is written to "
+      "<code>paired_duplication.txt</code> in the parent directory.</p>";
+  }
+  std::regex paired_re(left_tag + "pairednote"s + right_tag);
+  html_boilerplate = std::regex_replace(html_boilerplate, paired_re, paired_note);
 }
