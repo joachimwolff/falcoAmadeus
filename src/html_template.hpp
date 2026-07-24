@@ -397,13 +397,19 @@ crossorigin="anonymous"></script>
   // colour ever disappears into it (the near-black in light mode becomes a light
   // neutral in dark mode, dark hues are brightened). Each palette still never
   // mixes red WITH green: 'ocean' has no red, 'sunset'/'ink' have no green.
+  // Each palette: categorical light/dark arrays, plus a colourblind-safe
+  // diverging pair (warm,cool) used for heatmaps so every plot follows the
+  // chosen scheme (lines, box and heatmap alike).
   window.FALCO_PALETTES={
     ocean:{light:['#0071e3','#00c7be','#5856d6','#ff9500','#1d1d1f','#8e8e93'],
-           dark: ['#4aa3ff','#40e0d6','#a29bff','#ffb340','#f2f2f7','#c7c7cc']},
+           dark: ['#4aa3ff','#40e0d6','#a29bff','#ffb340','#f2f2f7','#c7c7cc'],
+           divLight:['#ff9500','#0071e3'],divDark:['#ffb340','#4aa3ff']},
     sunset:{light:['#ff9500','#ff2d55','#af52de','#a2845e','#1d1d1f','#0071e3'],
-            dark: ['#ffb340','#ff6482','#d68bff','#d6b48c','#f2f2f7','#64d2ff']},
+            dark: ['#ffb340','#ff6482','#d68bff','#d6b48c','#f2f2f7','#64d2ff'],
+            divLight:['#ff9500','#af52de'],divDark:['#ffb340','#d68bff']},
     ink:{light:['#1d1d1f','#0071e3','#ff9500','#af52de','#8a6d1f','#6e6e73'],
-         dark: ['#f2f2f7','#4aa3ff','#ffb340','#d68bff','#d4b06a','#aeaeb2']}
+         dark: ['#f2f2f7','#4aa3ff','#ffb340','#d68bff','#d4b06a','#aeaeb2'],
+         divLight:['#ff9500','#0071e3'],divDark:['#ffb340','#4aa3ff']}
   };
   function palColors(name){
     var p=window.FALCO_PALETTES[name]||window.FALCO_PALETTES.ocean;
@@ -607,27 +613,35 @@ if (document.getElementById('kmerlineplot') !== null) {
   // Recolour every categorical plot from the chosen palette, cycling colours
   // across each plot's solid line/bar traces (dashed reference lines, the box
   // plot and heatmaps keep their own colours).
+  function hexToRgba(h,a){var m=(h||'').replace('#','');
+    if(m.length===3)m=m[0]+m[0]+m[1]+m[1]+m[2]+m[2];
+    var r=parseInt(m.substr(0,2),16),g=parseInt(m.substr(2,2),16),b=parseInt(m.substr(4,2),16);
+    return 'rgba('+r+','+g+','+b+','+a+')';}
   function applyPalette(name){
     if(!window.Plotly||!window.FALCO_PALETTES) return;
     // theme-aware: pick the light/dark variant for the active background
+    var dark=root.getAttribute('data-theme')==='dark';
     var p=window.FALCO_PALETTES[name]||window.FALCO_PALETTES.ocean;
-    var pal=(root.getAttribute('data-theme')==='dark')?p.dark:p.light;
+    var pal=dark?p.dark:p.light, dv=dark?p.divDark:p.divLight,
+        neutral=dark?'#3a3f47':'#eef0f3';
     document.querySelectorAll('.js-plotly-plot').forEach(function(gd){
       if(!gd.data) return;
-      var lc=[],mc=[],k=0,touch=false;
-      var SKIP={box:1,heatmap:1,histogram2d:1,histogram2dcontour:1,contour:1,pie:1,violin:1};
-      gd.data.forEach(function(tr){
+      var k=0;
+      gd.data.forEach(function(tr,i){
         var t=tr.type||'scatter';
-        var colorable=!SKIP[t];
-        var dashed=tr.line&&tr.line.dash&&tr.line.dash!=='solid';
-        if(colorable&&!dashed){
-          var c=pal[k%pal.length]; k++; touch=true; lc.push(c); mc.push(c);
+        if(t==='heatmap'||t==='histogram2d'||t==='histogram2dcontour'||t==='contour'){
+          // diverging scale from the palette (warm -> neutral -> cool)
+          try{Plotly.restyle(gd,{colorscale:[[[0,dv[0]],[0.5,neutral],[1,dv[1]]]]},[i]);}catch(e){}
+        } else if(t==='box'){
+          var bc=pal[0];
+          try{Plotly.restyle(gd,{fillcolor:[hexToRgba(bc,0.55)],'line.color':[bc],'marker.color':[bc]},[i]);}catch(e){}
         } else {
-          lc.push((tr.line&&tr.line.color)||null);
-          mc.push((tr.marker&&tr.marker.color)||null);
+          var dashed=tr.line&&tr.line.dash&&tr.line.dash!=='solid';
+          if(dashed) return;
+          var c=pal[k%pal.length]; k++;
+          try{Plotly.restyle(gd,{'line.color':[c],'marker.color':[c]},[i]);}catch(e){}
         }
       });
-      if(touch){ try{Plotly.restyle(gd,{'line.color':lc,'marker.color':mc});}catch(e){} }
     });
   }
   var btn=document.createElement('button'); btn.className='theme-toggle';
