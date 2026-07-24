@@ -392,14 +392,22 @@ crossorigin="anonymous"></script>
 // slimmer boxes, an on-hover toolbar and no logo, without touching each call.
 (function(){
   if (!window.Plotly) return;
-  // Selectable colorblind-safe palettes. Each one never mixes red WITH green:
-  // 'ocean' has no red, 'sunset'/'ink' have no green -- so within any single
-  // plot (which draws from one palette) red and green never co-occur.
+  // Selectable colorblind-safe palettes, with a variant per background so no
+  // colour ever disappears into it (the near-black in light mode becomes a light
+  // neutral in dark mode, dark hues are brightened). Each palette still never
+  // mixes red WITH green: 'ocean' has no red, 'sunset'/'ink' have no green.
   window.FALCO_PALETTES={
-    ocean:['#0071e3','#00c7be','#5856d6','#ff9500','#111111','#8e8e93'],
-    sunset:['#ff9500','#ff2d55','#af52de','#a2845e','#111111','#0071e3'],
-    ink:['#111111','#0071e3','#ff9500','#af52de','#8a6d1f','#6e6e73']
+    ocean:{light:['#0071e3','#00c7be','#5856d6','#ff9500','#1d1d1f','#8e8e93'],
+           dark: ['#4aa3ff','#40e0d6','#a29bff','#ffb340','#f2f2f7','#c7c7cc']},
+    sunset:{light:['#ff9500','#ff2d55','#af52de','#a2845e','#1d1d1f','#0071e3'],
+            dark: ['#ffb340','#ff6482','#d68bff','#d6b48c','#f2f2f7','#64d2ff']},
+    ink:{light:['#1d1d1f','#0071e3','#ff9500','#af52de','#8a6d1f','#6e6e73'],
+         dark: ['#f2f2f7','#4aa3ff','#ffb340','#d68bff','#d4b06a','#aeaeb2']}
   };
+  function palColors(name){
+    var p=window.FALCO_PALETTES[name]||window.FALCO_PALETTES.ocean;
+    return (document.documentElement.getAttribute('data-theme')==='dark')?p.dark:p.light;
+  }
   var PAL='ocean'; try{var _p=localStorage.getItem('falco-palette'); if(_p&&window.FALCO_PALETTES[_p])PAL=_p;}catch(e){}
   var FONT={family:'-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif',size:12,color:'#3a4553'};
   // Grid is visible by default (a clear reference grid on every plot).
@@ -407,7 +415,7 @@ crossorigin="anonymous"></script>
   // Legend as a horizontal row BELOW the figure so it never collides with the
   // modebar (camera/zoom toolbar), which Plotly pins to the top-right corner.
   var LEGEND={orientation:'h',xanchor:'center',x:0.5,yanchor:'top',y:-0.22,borderwidth:0,font:{size:11}};
-  var THEME={paper_bgcolor:'rgba(0,0,0,0)',plot_bgcolor:'rgba(0,0,0,0)',colorway:window.FALCO_PALETTES[PAL].slice(),boxgap:0.28,boxgroupgap:0.2,legend:LEGEND};
+  var THEME={paper_bgcolor:'rgba(0,0,0,0)',plot_bgcolor:'rgba(0,0,0,0)',colorway:palColors(PAL).slice(),boxgap:0.28,boxgroupgap:0.2,legend:LEGEND};
   var CFG={displaylogo:false,responsive:true,displayModeBar:'hover',modeBarButtonsToRemove:['select2d','lasso2d','autoScale2d','toggleSpikelines','hoverClosestCartesian','hoverCompareCartesian']};
   var orig=Plotly.newPlot;
   Plotly.newPlot=function(id,data,layout,config){
@@ -599,8 +607,10 @@ if (document.getElementById('kmerlineplot') !== null) {
   // across each plot's solid line/bar traces (dashed reference lines, the box
   // plot and heatmaps keep their own colours).
   function applyPalette(name){
-    if(!window.Plotly) return;
-    var pal=(window.FALCO_PALETTES&&window.FALCO_PALETTES[name])||window.FALCO_PALETTES.ocean;
+    if(!window.Plotly||!window.FALCO_PALETTES) return;
+    // theme-aware: pick the light/dark variant for the active background
+    var p=window.FALCO_PALETTES[name]||window.FALCO_PALETTES.ocean;
+    var pal=(root.getAttribute('data-theme')==='dark')?p.dark:p.light;
     document.querySelectorAll('.js-plotly-plot').forEach(function(gd){
       if(!gd.data) return;
       var lc=[],mc=[],k=0,touch=false;
@@ -623,7 +633,9 @@ if (document.getElementById('kmerlineplot') !== null) {
   btn.title='Toggle light / dark';
   function set(t){ root.setAttribute('data-theme',t);
     try{localStorage.setItem('falco-theme',t);}catch(e){}
-    btn.textContent=(t==='dark')?'☀':'☾'; applyPlotStyle(); }
+    btn.textContent=(t==='dark')?'☀':'☾'; applyPlotStyle();
+    // re-map the palette to the new background so no colour is lost in it
+    if(typeof sel!=='undefined'&&sel) applyPalette(sel.value); }
   btn.onclick=function(){ set(root.getAttribute('data-theme')==='dark'?'light':'dark'); };
   // palette picker
   var sel=document.createElement('select'); sel.className='palette-select';
