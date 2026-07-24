@@ -1683,55 +1683,52 @@ ModuleSequenceLengthDistribution::write_module(std::ostream &os) {
 
 std::string
 ModuleSequenceLengthDistribution::make_html_data() {
+  // [FalcoAmadeus] Emit a contiguous window padded a couple of positions past
+  // the observed min/max length. With uniform-length reads the old code emitted
+  // a single categorical bar that filled the whole plot ("blob"); padding the
+  // axis makes it a normal, centred bar and turns any distribution into a proper
+  // histogram with its zero-count gaps shown.
+  std::size_t lo = 0, hi = 0;
+  bool any = false;
+  for (std::size_t i = 0; i < max_read_length; ++i) {
+    if (sequence_lengths[i] > 0) {
+      if (!any)
+        lo = i;
+      hi = i;
+      any = true;
+    }
+  }
+  const std::size_t pad = 2;
+  const std::size_t wlo = (any && lo > pad) ? lo - pad : 0;
+  const std::size_t whi = any ? hi + pad : 0;  // may extend past the count array
+
+  std::ostringstream xs, ys, ts;
+  bool first = false;
+  if (empty_reads > 0) {
+    xs << "\"0 bp\"";
+    ys << empty_reads;
+    ts << 0;
+    first = true;
+  }
+  if (any) {
+    for (std::size_t i = wlo; i <= whi; ++i) {
+      if (first) {
+        xs << ",";
+        ys << ",";
+        ts << ",";
+      }
+      const std::size_t count = (i < max_read_length) ? sequence_lengths[i] : 0;
+      xs << "\"" << (i + 1) << " bp\"";
+      ys << count;
+      ts << (i + 1);
+      first = true;
+    }
+  }
+
   std::ostringstream data;
-  // X values : avg quality phred scores
-  data << "{x : [";
-  bool first_seen = false;
-
-  if (empty_reads > 0) {
-    first_seen = true;
-    data << "\"0 bp\"";
-  }
-  for (std::size_t i = 0; i < max_read_length; ++i) {
-    if (sequence_lengths[i] > 0) {
-      if (first_seen)
-        data << ",";
-      data << "\"" << i + 1 << " bp\"";
-      first_seen = true;
-    }
-  }
-
-  // Y values: frequency with which they were seen
-  data << "], y : [";
-  first_seen = false;
-
-  if (empty_reads > 0) {
-    first_seen = true;
-    data << empty_reads;
-  }
-  for (std::size_t i = 0; i < max_read_length; ++i) {
-    if (sequence_lengths[i] > 0) {
-      if (first_seen)
-        data << ",";
-      data << sequence_lengths[i];
-      first_seen = true;
-    }
-  }
-
-  // Put the sequence value in the text
-  data << "], text : [";
-  first_seen = false;
-  for (std::size_t i = 0; i < max_read_length; ++i) {
-    if (sequence_lengths[i] > 0) {
-      if (first_seen)
-        data << ",";
-      data << i + 1;
-      first_seen = true;
-    }
-  }
-
-  data << "], type: 'bar', marker : {color : 'rgba(55,128,191,1.0)',"
-       << "line : {width : 2}}, "
+  data << "{x : [" << xs.str() << "], y : [" << ys.str() << "], text : ["
+       << ts.str() << "], type: 'bar', width: 0.7, "
+       << "marker : {color : 'rgba(55,128,191,1.0)', line : {width : 2}}, "
        << "name : 'Sequence length distribution'}";
 
   return data.str();

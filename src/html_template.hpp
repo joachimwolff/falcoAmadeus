@@ -196,6 +196,9 @@ select.palette-select {
   background-repeat:no-repeat; background-position:right .8em center;
 }
 select.palette-select:hover { border-color:var(--brand); }
+/* Center the Plotly modebar icons inside their (hover) background squares. */
+.js-plotly-plot .modebar-btn { display:inline-flex !important; align-items:center; justify-content:center; }
+.js-plotly-plot .modebar-btn svg { vertical-align:middle; display:block; }
 </style>
 <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
 </head>
