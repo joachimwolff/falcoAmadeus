@@ -707,6 +707,19 @@ read_text_file(const std::string &path) {
   return ss.str();
 }
 
+// [FalcoAmadeus] append the raw bytes of `path` to an already-open stream.
+// Byte-concatenating two gzip files yields a valid multi-member gzip that the
+// reader decompresses in full, so this pools R1+R2 into one input.
+static void
+append_file_bytes(std::ofstream &out, const std::string &path) {
+  std::ifstream in(path, std::ifstream::binary);
+  char buf[1 << 16];
+  while (in) {
+    in.read(buf, sizeof buf);
+    out.write(buf, in.gcount());
+  }
+}
+
 // [FalcoAmadeus] escape a string for use inside a double-quoted HTML attribute
 // (iframe srcdoc): only & and " need escaping; < > and ' are literal there.
 static std::string
@@ -724,13 +737,15 @@ html_attr_escape(const std::string &s) {
   return o;
 }
 
-// [FalcoAmadeus] Combine the two per-mate reports into ONE self-contained HTML
-// with Forward/Reverse tabs. Each mate is embedded via an isolated iframe
-// (srcdoc) so their identical element IDs and scripts never collide. The two
-// machine-readable fastqc_data.txt files are kept (in the mate subdirs) for
-// MultiQC; only the single combined report is written at the top level.
+// [FalcoAmadeus] Combine the mate reports into ONE self-contained HTML with
+// three tabs: Combined (R1+R2 pooled and analysed as a single dataset -- the
+// default), Forward and Reverse. Each view is an isolated iframe (srcdoc) so
+// their identical element IDs and scripts never collide. The per-mate
+// fastqc_data.txt files are kept (in the mate subdirs) for MultiQC; only this
+// single combined report is written at the top level.
 static void
 write_combined_paired_report(const std::string &out_file,
+                             const std::string &combined_html,
                              const std::string &fwd_html,
                              const std::string &rev_html,
                              const std::string &sample_label) {
@@ -752,21 +767,24 @@ write_combined_paired_report(const std::string &out_file,
     ".pfile{margin-left:auto;font-size:.82rem;color:var(--text);opacity:.65;font-family:ui-monospace,Menlo,monospace;}"
     ".ptabs{display:inline-flex;gap:.2em;background:var(--surface);border:1px solid var(--border);border-radius:999px;padding:.2em;}"
     ".ptabs button{border:0;background:transparent;color:var(--text);font:inherit;font-weight:600;font-size:.9rem;"
-    "padding:.35em 1.2em;border-radius:999px;cursor:pointer;}"
+    "padding:.35em 1.1em;border-radius:999px;cursor:pointer;}"
     ".ptabs button.active{background:var(--brand);color:#fff;}"
     "iframe{flex:1 1 auto;width:100%;border:0;display:block;}iframe.hide{display:none;}"
     "</style></head><body>"
     "<div class=\"pbar\"><div class=\"ptitle\">FalcoAmadeus</div>"
-    "<div class=\"ptabs\"><button id=\"tf\" class=\"active\">Forward (R1)</button>"
-    "<button id=\"tr\">Reverse (R2)</button></div>"
+    "<div class=\"ptabs\">"
+    "<button data-v=\"c\" class=\"active\">Combined (R1+R2)</button>"
+    "<button data-v=\"f\">Forward (R1)</button>"
+    "<button data-v=\"r\">Reverse (R2)</button></div>"
     "<div class=\"pfile\">" << sample_label << " &middot; paired-end</div></div>"
-    "<iframe id=\"ifwd\" srcdoc=\"" << html_attr_escape(fwd_html) << "\"></iframe>"
-    "<iframe id=\"irev\" class=\"hide\" srcdoc=\"" << html_attr_escape(rev_html) << "\"></iframe>"
-    "<script>(function(){var f=document.getElementById('ifwd'),r=document.getElementById('irev'),"
-    "tf=document.getElementById('tf'),tr=document.getElementById('tr');"
-    "function show(fwd){f.classList.toggle('hide',!fwd);r.classList.toggle('hide',fwd);"
-    "tf.classList.toggle('active',fwd);tr.classList.toggle('active',!fwd);}"
-    "tf.onclick=function(){show(true);};tr.onclick=function(){show(false);};})();</script>"
+    "<iframe data-v=\"c\" srcdoc=\"" << html_attr_escape(combined_html) << "\"></iframe>"
+    "<iframe data-v=\"f\" class=\"hide\" srcdoc=\"" << html_attr_escape(fwd_html) << "\"></iframe>"
+    "<iframe data-v=\"r\" class=\"hide\" srcdoc=\"" << html_attr_escape(rev_html) << "\"></iframe>"
+    "<script>(function(){var btns=document.querySelectorAll('.ptabs button'),"
+    "frames=document.querySelectorAll('iframe');"
+    "function show(v){frames.forEach(function(f){f.classList.toggle('hide',f.getAttribute('data-v')!==v);});"
+    "btns.forEach(function(b){b.classList.toggle('active',b.getAttribute('data-v')===v);});}"
+    "btns.forEach(function(b){b.onclick=function(){show(b.getAttribute('data-v'));};});})();</script>"
     "</body></html>";
 }
 
@@ -1282,9 +1300,10 @@ main(int argc, char *argv[]) {
                           skip_short_summary, do_call, true, " (reverse)",
                           r1_base);
 
-        // [FalcoAmadeus] Merge the two mate reports into ONE combined HTML with
-        // Forward/Reverse tabs; drop the per-mate HTML files but keep their
-        // fastqc_data.txt + summary.txt (in the subdirs) for MultiQC.
+        // [FalcoAmadeus] Merge the mate reports into ONE combined HTML with
+        // three tabs: Combined (R1+R2 pooled, the default), Forward, Reverse.
+        // Drop the per-mate HTML files but keep their fastqc_data.txt +
+        // summary.txt (in the subdirs) for MultiQC.
         if (!skip_html) {
           const std::string fwd_html_path =
             fwd_dir + "/falcoAmadeus_report.html";
@@ -1295,13 +1314,41 @@ main(int argc, char *argv[]) {
           if (sample.size() > tag.size() &&
               sample.compare(sample.size() - tag.size(), tag.size(), tag) == 0)
             sample.erase(sample.size() - tag.size());
+
+          // Combined view: analyse R1+R2 pooled as a single dataset. Byte-
+          // concatenate the two inputs into a temp file (multi-member gzip is
+          // read in full) and run the standard pipeline; only the HTML is
+          // needed here, so text/summary are skipped and the temp dir removed.
+          const std::string comb_dir = cur_outdir + "/" + sample + "_combined";
+          std::error_code cc;
+          std::filesystem::create_directories(comb_dir, cc);
+          const bool r1_gz =
+            filename.size() >= 3 &&
+            filename.compare(filename.size() - 3, 3, ".gz") == 0;
+          const std::string pooled_in =
+            comb_dir + "/" + sample + (r1_gz ? ".fastq.gz" : ".fastq");
+          {
+            std::ofstream po(pooled_in, std::ofstream::binary);
+            append_file_bytes(po, filename);
+            append_file_bytes(po, paired_with_file);
+          }
+          analyze_and_write(falco_config, pooled_in, forced_file_format,
+                            comb_dir, std::string{}, std::string{},
+                            std::string{}, std::string{}, /*skip_text=*/true,
+                            skip_html, /*skip_short_summary=*/true, do_call,
+                            true, " (combined)");
+          const std::string comb_html =
+            read_text_file(comb_dir + "/falcoAmadeus_report.html");
+
           write_combined_paired_report(
-            cur_outdir + "/falcoAmadeus_report.html",
+            cur_outdir + "/falcoAmadeus_report.html", comb_html,
             read_text_file(fwd_html_path), read_text_file(rev_html_path),
             sample);
+
           std::error_code rc;
           std::filesystem::remove(fwd_html_path, rc);
           std::filesystem::remove(rev_html_path, rc);
+          std::filesystem::remove_all(comb_dir, rc);  // temp pooled input + html
           if (!falco_config.quiet)
             log_process("Wrote combined paired report to " + cur_outdir +
                         "/falcoAmadeus_report.html");
