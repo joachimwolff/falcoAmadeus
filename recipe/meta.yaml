@@ -6,7 +6,7 @@ package:
   version: {{ version }}
 
 source:
-  url: https://github.com/joachimwolff/falco/archive/refs/tags/v{{ version }}.tar.gz
+  url: https://github.com/joachimwolff/falcoAmadeus/archive/refs/tags/v{{ version }}.tar.gz
   # Fill in once the release tag v{{ version }} is pushed:
   #   curl -sL <url> | sha256sum
   sha256: 0000000000000000000000000000000000000000000000000000000000000000
@@ -34,7 +34,7 @@ test:
     - falcoAmadeus --help
 
 about:
-  home: https://github.com/joachimwolff/falco
+  home: https://github.com/joachimwolff/falcoAmadeus
   license: GPL-3.0-or-later
   license_family: GPL3
   license_file: LICENSE
@@ -45,7 +45,7 @@ about:
     checks) while producing analysis output byte-identical to upstream falco
     apart from the tool identifier line. It reads FASTQ, SAM and BAM files and
     reports FastQC-style quality-control metrics and reports.
-  dev_url: https://github.com/joachimwolff/falco
+  dev_url: https://github.com/joachimwolff/falcoAmadeus
 
 extra:
   recipe-maintainers:

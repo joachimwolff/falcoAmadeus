@@ -100,6 +100,30 @@ Measured best-of-N wall-clock on commodity hardware (page cache warm):
 Peak memory is unchanged: falco already streams input, so resident memory is
 constant regardless of file size.
 
+### Parallel (multi-threaded) gzip parsing
+
+With `-t N` (N ≥ 2), gzip decompression runs on a background thread overlapped
+with parsing, and per-read statistics are computed in parallel. This helps
+**gzipped input only** — uncompressed FASTQ/SAM has no decompression to overlap
+— and the output stays **byte-identical to single-threaded** at every thread
+count.
+
+Best-of-3 wall-clock on a 675&nbsp;MB gzipped FASTQ (8M reads), 32-core machine:
+
+| Threads (`-t`) | Time | Speedup vs `-t 1` |
+| ---: | ---: | ---: |
+| 1  | 10.4&nbsp;s | 1.0x |
+| 2  |  5.2&nbsp;s | 2.0x |
+| 4  |  4.1&nbsp;s | 2.5x |
+| 8  |  4.3&nbsp;s | 2.4x |
+| 16 |  4.5&nbsp;s | 2.3x |
+
+Speedup peaks around **2.5x at `-t 4`** and then plateaus: a single gzip stream
+can only be *inflated* serially, so once decompression is fully overlapped with
+parsing there is little left to parallelize, and extra threads only add
+scheduling overhead. Combined with the single-threaded parser win above, this
+is roughly **3x faster than upstream falco** on gzipped input.
+
 The binary is installed and invoked as `falcoAmadeus`. Apart from the program
 name and the added options above, all usage is identical to upstream falco.
 
