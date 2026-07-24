@@ -650,6 +650,13 @@ if (document.getElementById('kmerlineplot') !== null) {
   if(title){ title.parentNode.insertBefore(btn,title.nextSibling); btn.parentNode.insertBefore(sel,btn.nextSibling); }
   set(root.getAttribute('data-theme')||'dark');
   window.addEventListener('load',function(){ applyPlotStyle(); applyPalette(sel.value); });
+  // Expose theme/palette setters so an embedding page (the paired combined
+  // report) can drive this report from one shared header.
+  window.falcoSetTheme=function(t){ set(t); };
+  window.falcoSetPalette=function(p){ if(!NAMES[p])return; sel.value=p;
+    try{localStorage.setItem('falco-palette',p);}catch(e){} applyPalette(p); };
+  window.falcoTheme=function(){ return root.getAttribute('data-theme')||'dark'; };
+  window.falcoPalette=function(){ return sel.value; };
 })();
 
 </script>
