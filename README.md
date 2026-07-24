@@ -5,17 +5,60 @@
 popular [FastQC](https://www.bioinformatics.babraham.ac.uk/projects/fastqc)
 software) that checks large sequencing reads for common problems.
 
-It produces **byte-identical output** to upstream falco: every
-`fastqc_data.txt` and `summary.txt` still matches the reference checksums in
-the upstream test suite (`test/md5sum.txt`). Only the read-parsing hot path
-was optimized, so results and reports are unchanged.
+By default it produces **byte-identical output** to upstream falco: a plain
+single-end run's `fastqc_data.txt` and `summary.txt` still match the reference
+checksums in the upstream test suite (`test/md5sum.txt`). The speed work never
+changes results. Everything new below is **opt-in** behind a flag or a new
+mode, so existing single-end pipelines are unaffected.
 
 ## Why this fork exists
 
 These optimizations were offered to upstream falco as a patch, but the
 maintainers declined to merge it. FalcoAmadeus exists to make the faster
-implementation available to users who want it while keeping output identical
-to the original.
+implementation available to users who want it, and to add the sequencing-aware
+and reporting features below, while keeping the default output identical to the
+original.
+
+## What FalcoAmadeus does differently
+
+- **Correct paired-end analysis** (`--paired-with R2`). FastQC and falco only
+  process one file at a time, so paired-end PCR-duplicate rates are
+  overestimated. FalcoAmadeus analyses the pair together and writes **one
+  combined HTML report** with **Combined / Forward / Reverse** tabs, where
+  *Combined* pools R1+R2 as a single dataset (GC, adapters, content, quality
+  measured over all reads at once, not two independent files). It reports the
+  **corrected paired PCR-duplicate rate** — a pair counts as a duplicate only
+  when *both* mates are duplicates — and how many R1/R2 reads **actually match**
+  into pairs (by read identifier). Per-mate `fastqc_data.txt` files are kept for
+  MultiQC, alongside a `paired_duplication.txt` summary.
+
+- **Assay-aware QC** (`--assay <type>`). Tunes each module's pass/warn/fail
+  expectations to the library type (`rnaseq`, `amplicon`, `wgbs` bisulfite/EM,
+  `chipseq`, `atac`, `smallrna`, `wgs`, …), so genuinely expected base-content
+  patterns (e.g. the C→T depletion of bisulfite libraries) are annotated and
+  not flagged as failures.
+
+- **A beautified, interactive HTML report.** The report (now named
+  `falcoAmadeus_report.html`) has a modern, responsive design: collapsible
+  modules with plain-language explanations and FastQC documentation links, a
+  **light/dark theme toggle**, **selectable colourblind-safe colour palettes**
+  that also recolour the box plot and per-tile heatmap, readable unified
+  hover tooltips, and cleaner plots (a proper box-and-whisker per-base-quality
+  plot over pass/warn/fail zones, a padded length-distribution histogram, …).
+
+- **MultiQC-friendly.** The `fastqc_data.txt` output is ingested by MultiQC as a
+  FastQC report. `--name NAME` sets an explicit sample name (so inputs passed
+  with unhelpful names — e.g. Galaxy paired-collection elements all called
+  *forward*/*reverse* — stay distinct instead of collapsing), and
+  `--paired-data mates|combined|both` chooses whether MultiQC gets the two mates
+  separately or a single pooled sample per pair.
+
+- **Multi-threaded gzip parsing** (`-t N`). Gzip decompression runs on a
+  background thread overlapped with parsing; output is byte-identical to the
+  single-threaded default.
+
+A Galaxy tool wrapper exposing these features is maintained separately as
+`tools-iuc/tools/falcoAmadeus`.
 
 ## Speed improvements
 
