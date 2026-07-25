@@ -28,8 +28,10 @@ requirements:
   host:
     - zlib
     - htslib
+    - llvm-openmp  # [osx]
   run:
     - htslib
+    - llvm-openmp  # [osx]
 
 test:
   commands:
