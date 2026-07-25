@@ -26,3 +26,6 @@ missing
 src/.deps
 src/.dirstamp
 stamp-h1
+
+# the bioconda recipe build script is a source file, not a build artifact
+!recipe/build.sh
