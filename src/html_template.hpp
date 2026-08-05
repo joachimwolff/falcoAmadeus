@@ -196,6 +196,16 @@ select.palette-select {
   background-repeat:no-repeat; background-position:right .8em center;
 }
 select.palette-select:hover { border-color:var(--brand); }
+button.sidebar-toggle {
+  border:1px solid var(--border); background:var(--surface-2); color:var(--text);
+  border-radius:999px; width:2.1em; height:2.1em; font-size:1.05rem; line-height:1;
+  cursor:pointer; display:inline-flex; align-items:center; justify-content:center;
+  padding:0; margin-right:.5em; flex:0 0 auto; transition:background .15s, transform .15s;
+}
+button.sidebar-toggle:hover { background:var(--brand); color:#fff; transform:scale(1.08); }
+/* Collapsed sidebar: hide the summary and give the modules the full width. */
+body.nav-collapsed div.summary { display:none; }
+body.nav-collapsed div.main { margin-left:auto; margin-right:auto; }
 /* Center the Plotly modebar icons inside their (hover) background squares. */
 .js-plotly-plot .modebar-btn { display:inline-flex !important; align-items:center; justify-content:center; }
 .js-plotly-plot .modebar-btn svg { vertical-align:middle; display:block; }
@@ -596,6 +606,44 @@ if (document.getElementById('kmerlineplot') !== null) {
     });
     sum.parentNode.insertBefore(btn,sum.nextSibling);
   }
+  // [FalcoAmadeus] Scroll to a module WITHOUT a document-level fragment
+  // navigation. In the paired combined report each view is a srcdoc iframe,
+  // where a plain href="#id" resolves against the PARENT url and reloads the
+  // whole paired page inside the frame (producing a duplicate top bar).
+  // Intercepting the click and scrolling keeps navigation inside this
+  // document, and lets us offset for the sticky header so the target title
+  // is not hidden underneath it.
+  document.querySelectorAll('a[href^="#"]').forEach(function(a){
+    var href=a.getAttribute('href'); if(!href||href==='#') return;
+    a.addEventListener('click',function(e){
+      var t=document.getElementById(href.slice(1)); if(!t) return;
+      e.preventDefault();
+      var hdr=document.querySelector('div.header');
+      var off=(hdr&&getComputedStyle(hdr).display!=='none')?hdr.offsetHeight+12:12;
+      var y=t.getBoundingClientRect().top+(window.pageYOffset||document.documentElement.scrollTop)-off;
+      window.scrollTo({top:y,behavior:'smooth'});
+    });
+  });
+})();
+
+// [FalcoAmadeus] Collapsible summary sidebar: a header toggle hides the
+// sidebar and lets the modules use the full width (useful on small screens).
+// The state is persisted, and exposed via falcoSetNav so the paired combined
+// report can drive every mate view from one shared control.
+(function(){
+  var body=document.body;
+  function apply(c){ body.classList.toggle('nav-collapsed',c);
+    try{localStorage.setItem('falco-nav',c?'1':'0');}catch(e){} }
+  var init=false; try{init=localStorage.getItem('falco-nav')==='1';}catch(e){}
+  var t=document.createElement('button'); t.className='sidebar-toggle';
+  t.title='Show / hide the summary sidebar'; t.setAttribute('aria-label','Toggle sidebar');
+  t.innerHTML='&#9776;';
+  t.onclick=function(){ apply(!body.classList.contains('nav-collapsed')); };
+  var hdr=document.querySelector('div.header');
+  if(hdr) hdr.insertBefore(t,hdr.firstChild);
+  apply(init);
+  window.falcoSetNav=function(c){ apply(!!c); };
+  window.falcoNav=function(){ return body.classList.contains('nav-collapsed'); };
 })();
 
 // [FalcoAmadeus] dark-mode toggle (persisted) that also re-themes the plots
