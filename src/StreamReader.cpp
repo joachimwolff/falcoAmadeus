@@ -189,6 +189,22 @@ StreamReader::StreamReader(FalcoConfig &config, const std::size_t _buffer_size,
   do_tile_quality = false;
   cur_tile_quality = nullptr;
   cur_tile_count = nullptr;
+
+  // [FalcoAmadeus] Build the adapter presence bitmap. Most k-mer positions in a
+  // read match no adapter, so a single bit test lets us skip the whole
+  // per-adapter comparison loop on them. Byte-identical: a set bit still runs
+  // the original loop unchanged, and a clear bit guarantees no adapter k-mer
+  // equals this window (every adapter's low bits are set in the map).
+  if (do_adapter_optimized && adapter_size > 0 && num_adapters > 0) {
+    const unsigned bits = (2 * adapter_size <= 18) ? 2 * adapter_size : 18;
+    adapter_bm_mask = (static_cast<std::size_t>(1) << bits) - 1;
+    adapter_present.assign(
+      ((static_cast<std::size_t>(1) << bits) + 63) / 64, 0);
+    for (std::size_t i = 0; i < num_adapters; ++i) {
+      const std::size_t b = adapters[i] & adapter_bm_mask;
+      adapter_present[b >> 6] |= (static_cast<std::uint64_t>(1) << (b & 63));
+    }
+  }
 }
 
 // Makes sure that any subclass deletes the buffer
@@ -346,11 +362,18 @@ StreamReader::process_sequence_base_from_buffer(FastqStats &stats) {
     // GS: slow, need to use fsm
     if (do_adapter_optimized && (num_bases_after_n == adapter_size)) {
       cur_kmer &= adapter_mask;
-      for (std::size_t i = 0; i != num_adapters; ++i) {
-        if (cur_kmer == adapters[i] && !adapters_found[i]) {
-          ++stats.pos_adapter_count[(read_pos << Constants::bit_shift_adapter) |
-                                    i];
-          adapters_found[i] = true;
+      // one-bit fast reject: skip the per-adapter scan unless some adapter's
+      // k-mer could match this window (byte-identical, superset filter).
+      const std::size_t bmb = cur_kmer & adapter_bm_mask;
+      if (adapter_present[bmb >> 6] & (static_cast<std::uint64_t>(1)
+                                       << (bmb & 63))) {
+        for (std::size_t i = 0; i != num_adapters; ++i) {
+          if (cur_kmer == adapters[i] && !adapters_found[i]) {
+            ++stats
+                .pos_adapter_count[(read_pos << Constants::bit_shift_adapter) |
+                                   i];
+            adapters_found[i] = true;
+          }
         }
       }
     }

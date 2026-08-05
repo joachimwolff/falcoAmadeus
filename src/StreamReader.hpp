@@ -123,6 +123,11 @@ class StreamReader{
   const std::array<size_t, Constants::max_adapters> adapters;
   std::bitset<Constants::max_adapters> adapters_found{};
 
+  // [FalcoAmadeus] Presence bitmap over the low bits of the packed adapter
+  // k-mer, for a one-bit fast reject before the per-base per-adapter scan.
+  std::vector<std::uint64_t> adapter_present;
+  size_t adapter_bm_mask = 0;
+
   const std::string filename;
 
     // keep track of reads for which to do kmer and tile count
