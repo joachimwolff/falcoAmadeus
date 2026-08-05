@@ -54,26 +54,37 @@ public:
   const_iterator cend() const { return entries_.data() + entries_.size(); }
   std::size_t size() const { return entries_.size(); }
 
-  iterator find(const std::string &key) {
-    std::size_t h = hash_key(key.data(), key.size()) & mask_;
+  // Look up a key given as a raw byte range (the read's sequence buffer). This
+  // avoids constructing a std::string for every one of the ~2M lookups per
+  // file: we hash and compare the bytes in place, and only materialise a
+  // std::string on the (<=100k) inserts.
+  iterator find(const char *p, std::size_t n) {
+    std::size_t h = hash_key(p, n) & mask_;
     for (;;) {
       const std::int64_t idx = slots_[h];
       if (idx < 0)
         return end();
-      if (entries_[static_cast<std::size_t>(idx)].first == key)
+      const std::string &k = entries_[static_cast<std::size_t>(idx)].first;
+      if (k.size() == n && std::memcmp(k.data(), p, n) == 0)
         return entries_.data() + idx;
       h = (h + 1) & mask_;
     }
   }
+  iterator find(const std::string &key) {
+    return find(key.data(), key.size());
+  }
 
   // Insert a key known not to be present (callers only emplace after a failed
   // find, exactly as the previous unordered_map code did).
-  void emplace(const std::string &key, std::size_t value) {
-    std::size_t h = hash_key(key.data(), key.size()) & mask_;
+  void emplace(const char *p, std::size_t n, std::size_t value) {
+    std::size_t h = hash_key(p, n) & mask_;
     while (slots_[h] >= 0)
       h = (h + 1) & mask_;
     slots_[h] = static_cast<std::int64_t>(entries_.size());
-    entries_.emplace_back(key, value);
+    entries_.emplace_back(std::string(p, n), value);
+  }
+  void emplace(const std::string &key, std::size_t value) {
+    emplace(key.data(), key.size(), value);
   }
 
 private:

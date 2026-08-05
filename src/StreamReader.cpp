@@ -637,17 +637,17 @@ StreamReader::read_quality_line(FastqStats &stats) {
 void
 StreamReader::postprocess_fastq_record(FastqStats &stats) {
   if (do_sequence_hash) {
-    buffer[get_truncate_point(read_pos)] = '\0';
-    // assign() reuses the string's existing capacity instead of allocating a
-    // fresh std::string every read
-    sequence_to_hash.assign(buffer);
+    // Key the duplication map directly off the sequence buffer bytes: hash and
+    // compare in place so no std::string is constructed for any of the ~2M
+    // per-read lookups (only the <=100k inserts materialise a string).
+    const std::size_t key_len = get_truncate_point(read_pos);
     // Single hash lookup: reuse the iterator for both the insert and the
     // increment branches
-    const auto it = stats.sequence_count.find(sequence_to_hash);
+    const auto it = stats.sequence_count.find(buffer, key_len);
     // New sequence found
     if (it == stats.sequence_count.end()) {
       if (continue_storing_sequences) {
-        stats.sequence_count.emplace(sequence_to_hash, 1);
+        stats.sequence_count.emplace(buffer, key_len, 1);
         stats.count_at_limit = stats.num_reads;
         ++stats.num_unique_seen;
 
