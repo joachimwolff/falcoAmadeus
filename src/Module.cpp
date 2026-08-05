@@ -1971,9 +1971,17 @@ ModuleOverrepresentedSequences::summarize_module(FastqStats &stats) {
       overrep_sequences.push_back(*it);
     }
   }
-  // sort strings by frequency
+  // Sort by frequency, breaking ties by the sequence itself. This is a
+  // deterministic total order, so the listing is reproducible regardless of
+  // the duplication map's iteration order (the open-addressing map in
+  // dup_hash_map.hpp does not iterate in the same order as std::unordered_map,
+  // and unordered_map's order is itself non-portable across libstdc++ versions).
   std::sort(std::begin(overrep_sequences), std::end(overrep_sequences),
-            [](const auto &a, const auto &b) { return a.second > b.second; });
+            [](const auto &a, const auto &b) {
+              if (a.second != b.second)
+                return a.second > b.second;
+              return a.first < b.first;
+            });
 }
 
 void

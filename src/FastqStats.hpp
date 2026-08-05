@@ -20,6 +20,8 @@
 #include <vector>
 #include <iostream>
 #include <unordered_map>
+
+#include "dup_hash_map.hpp"
 #include <array>
 #include "FalcoConfig.hpp"
 // log of a power of two, to use in bit shifting for fast index acces
@@ -224,8 +226,10 @@ struct FastqStats {
   std::array<size_t, Constants::max_adapters * SHORT_READ_THRESHOLD> pos_adapter_count;
 
   /*********** DUPLICATION ******************/
-  // First 100k unique sequences and how often they were seen
-  std::unordered_map <std::string, size_t> sequence_count;
+  // First 100k unique sequences and how often they were seen. Open-addressing
+  // map (dup_hash_map.hpp) instead of std::unordered_map: its node-chasing
+  // lookup was ~36% of a run's CPU. Same counting semantics -> identical QC.
+  DupHashMap sequence_count;
 
   /**************** FUNCTIONS ****************************/
   // Default constructor that zeros everything
