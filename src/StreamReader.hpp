@@ -358,6 +358,10 @@ class PlainBlockReader {
     return n;
   }
   bool eof() const { return p_ >= end_; }
+
+  // Direct access to the memory-mapped bytes, for the zero-copy chunked parser.
+  const char *data() const { return p_; }
+  size_t size() const { return static_cast<size_t>(end_ - p_); }
 };
 
 /*******************************************************/
@@ -413,6 +417,13 @@ void read_gz_parallel(FalcoConfig &config, FastqStats &master, size_t nthreads);
 // background inflater. Only valid for read_step == 1.
 void read_uncompressed_parallel(FalcoConfig &config, FastqStats &master,
                                 size_t nthreads);
+
+// Fully parallel (chunked, zero-copy) uncompressed-FASTQ driver: each thread
+// parses its own memory-mapped byte range in place, with duplication handled by
+// a short serial prefix plus parallel occurrence counting. Byte-identical to the
+// single-threaded pass; read_step == 1 only.
+void read_uncompressed_chunked(FalcoConfig &config, FastqStats &master,
+                               size_t nthreads);
 
 /*******************************************************/
 /*************** READ SAM RECORD ***********************/
