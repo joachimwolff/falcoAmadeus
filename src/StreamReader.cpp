@@ -1688,7 +1688,33 @@ read_uncompressed_chunked(FalcoConfig &config, FastqStats &master,
   }
   master.num_reads = total_reads;
 
-  // ---- merge worker accumulators into master (same as read_parallel_impl) ----
+  // ---- merge worker accumulators into master ----
+  // kmer_count dominates (~8.2M entries) and the serial sum over all nthreads
+  // copies grows with the thread count, so merge it by index-partitioned slices
+  // in parallel: each thread owns a contiguous range and reads every worker's
+  // slice sequentially. The remaining (small) arrays are summed serially below.
+  {
+    const std::size_t nk = master.kmer_count.size();
+    std::size_t *const mk = master.kmer_count.data();
+#ifdef _OPENMP
+#pragma omp parallel num_threads(nthreads)
+#endif
+    {
+#ifdef _OPENMP
+      const int tid = omp_get_thread_num();
+      const int nth = omp_get_num_threads();
+      const std::size_t lo = nk * tid / nth;
+      const std::size_t hi = nk * (tid + 1) / nth;
+#else
+      const std::size_t lo = 0, hi = nk;
+#endif
+      for (std::size_t t = 0; t < nthreads; ++t) {
+        const std::size_t *const wk = wstats[t]->kmer_count.data();
+        for (std::size_t i = lo; i < hi; ++i)
+          mk[i] += wk[i];
+      }
+    }
+  }
   auto add_arr = [](auto &dst, const auto &src) {
     for (std::size_t i = 0; i < dst.size(); ++i)
       dst[i] += src[i];
@@ -1709,8 +1735,6 @@ read_uncompressed_chunked(FalcoConfig &config, FastqStats &master,
     add_arr(master.read_length_freq, ws.read_length_freq);
     add_arr(master.pos_kmer_count, ws.pos_kmer_count);
     add_arr(master.pos_adapter_count, ws.pos_adapter_count);
-    for (std::size_t i = 0; i < master.kmer_count.size(); ++i)
-      master.kmer_count[i] += ws.kmer_count[i];
     master.total_bases += ws.total_bases;
     master.total_gc += ws.total_gc;
     master.empty_reads += ws.empty_reads;
