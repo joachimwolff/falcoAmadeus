@@ -1501,6 +1501,18 @@ read_uncompressed_chunked(FalcoConfig &config, FastqStats &master,
     const std::size_t end = sync[t + 1];
     ParallelWorker &w = *workers[t];
     std::vector<ParRec> &recs = chunk_recs[t];
+    // Reserve from an estimate of this chunk's record size (first record's byte
+    // span) to avoid ~millions of reallocating push_backs.
+    if (start < end) {
+      const char *r0 =
+        static_cast<const char *>(memchr(base + start, '\n', end - start));
+      if (r0 != nullptr) {
+        const std::size_t line = static_cast<std::size_t>(r0 - (base + start)) + 1;
+        const std::size_t rec_est = line * 4;  // 4 lines per FASTQ record
+        if (rec_est > 0)
+          recs.reserve((end - start) / rec_est + 16);
+      }
+    }
     std::size_t p = start;
     while (p < end) {
       const std::size_t h_off = p;
