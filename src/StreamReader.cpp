@@ -1571,49 +1571,12 @@ read_uncompressed_chunked(FalcoConfig &config, FastqStats &master,
     }
   }
 
-  // ---- Phase B: per-base statistics (parallel, zero-copy) ----
-  std::vector<FastqStats> wstats(nthreads);
-  std::vector<std::vector<GCRecord>> gcrec(nthreads);
-#ifdef _OPENMP
-#pragma omp parallel for num_threads(nthreads) schedule(static)
-#endif
-  for (std::size_t t = 0; t < nthreads; ++t) {
-    ParallelWorker &w = *workers[t];
-    FastqStats &ws = wstats[t];
-    std::vector<ParRec> &recs = chunk_recs[t];
-    std::vector<GCRecord> &gc = gcrec[t];
-    gc.assign(recs.size(), GCRecord{0, 0, 0});
-    for (std::size_t j = 0; j < recs.size(); ++j) {
-      const ParRec &r = recs[j];
-      w.cur_char = const_cast<char *>(base + r.seq_off);
-      w.do_read = true;
-      w.do_kmer_read = r.do_kmer_read;
-      w.cur_gc_record = &gc[j];
-      w.read_sequence_line(ws);
-
-      w.cur_char = const_cast<char *>(base + r.qual_off);
-      w.do_tile_read = r.do_tile_read;
-      w.tile_cur = r.tile_cur;
-      w.force_eof = r.qual_no_nl;
-      w.read_quality_line(ws);
-    }
-  }
-
-  // ---- GC replay in global read order (exact FP reproduction) ----
-  for (std::size_t t = 0; t < nthreads; ++t) {
-    for (const GCRecord &gr : gcrec[t]) {
-      if (gr.kind == 1) {
-        for (const auto &v : master.gc_models[gr.a].models[gr.b])
-          master.gc_count[v.percent] += v.increment;
-      }
-      else if (gr.kind == 2) {
-        ++master.gc_count[100 * gr.b / gr.a];
-      }
-    }
-  }
-
-  // ---- duplication: serial prefix fixes the tracked set, then parallel count ----
-  std::size_t fill_boundary = total_reads;  // global index after which counting is parallel
+  // ---- duplication phase 1: serial prefix fixes the "first 100k unique" set ----
+  // Run before the per-base phase so the map is fully populated (and thereafter
+  // read-only) while the workers count occurrences in parallel below. Ordering
+  // matters only until the 100k-unique cap fills; after that occurrence counting
+  // is commutative. reads [0, fill_boundary) are counted here, serially.
+  std::size_t fill_boundary = 0;
   if (do_hash) {
     bool continue_storing = true;
     std::size_t seen = 0;
@@ -1633,7 +1596,6 @@ read_uncompressed_chunked(FalcoConfig &config, FastqStats &master,
                 Constants::unique_reads_stop_counting) {
               continue_storing = false;
               ++seen;
-              fill_boundary = seen;  // reads [0, fill_boundary) counted serially
               break;
             }
           }
@@ -1645,39 +1607,83 @@ read_uncompressed_chunked(FalcoConfig &config, FastqStats &master,
         ++seen;
       }
     }
-    if (continue_storing)
-      fill_boundary = total_reads;  // fewer than 100k uniques: all done serially
+    fill_boundary = continue_storing ? total_reads : seen;
+  }
+  // The map never reallocates after the cap (it is reserved to 100k), so this
+  // base pointer stays valid for the read-only find()s in the parallel phase.
+  const std::size_t nent = do_hash ? master.sequence_count.size() : 0;
+  const auto mbegin = master.sequence_count.begin();
+  const bool count_dup = do_hash && (fill_boundary < total_reads);
 
-    // parallel occurrence counting for reads at global index >= fill_boundary.
-    // The map is read-only here (no inserts), so find() is thread-safe; each
-    // thread accumulates per-entry deltas that are summed into the map.
-    if (fill_boundary < total_reads) {
-      const std::size_t nent = master.sequence_count.size();
-      std::vector<std::vector<std::size_t>> deltas(nthreads);
+  // ---- Phase B: per-base statistics + fused parallel duplication counting ----
+  // Zero-copy: each worker parses its chunk in place. For reads at global index
+  // >= fill_boundary it also counts occurrences against the now read-only map
+  // (find() is safe with no concurrent inserts), folded into the same pass so
+  // the sequence bytes are not walked a second time.
+  // Per-thread accumulators are allocated INSIDE the parallel region: each
+  // FastqStats zero-fills a ~65 MB kmer_count vector, so constructing all
+  // nthreads of them serially would add tens of ms; here that zeroing runs in
+  // parallel, one per thread.
+  std::vector<std::unique_ptr<FastqStats>> wstats(nthreads);
+  std::vector<std::vector<GCRecord>> gcrec(nthreads);
+  std::vector<std::vector<std::size_t>> deltas(nthreads);
 #ifdef _OPENMP
 #pragma omp parallel for num_threads(nthreads) schedule(static)
 #endif
-      for (std::size_t t = 0; t < nthreads; ++t) {
-        std::vector<std::size_t> &d = deltas[t];
-        d.assign(nent, 0);
-        const std::size_t g0 = gstart[t];
-        const std::vector<ParRec> &recs = chunk_recs[t];
-        const auto mbegin = master.sequence_count.begin();
-        for (std::size_t j = 0; j < recs.size(); ++j) {
-          if (g0 + j < fill_boundary)
-            continue;
-          const ParRec &r = recs[j];
-          const auto it =
-            master.sequence_count.find(base + r.seq_off,
-                                       get_truncate_point(r.seqlen));
-          if (it != master.sequence_count.end())
-            ++d[static_cast<std::size_t>(it - mbegin)];
-        }
+  for (std::size_t t = 0; t < nthreads; ++t) {
+    wstats[t].reset(new FastqStats());
+    ParallelWorker &w = *workers[t];
+    FastqStats &ws = *wstats[t];
+    std::vector<ParRec> &recs = chunk_recs[t];
+    std::vector<GCRecord> &gc = gcrec[t];
+    gc.assign(recs.size(), GCRecord{0, 0, 0});
+    std::vector<std::size_t> &d = deltas[t];
+    if (count_dup)
+      d.assign(nent, 0);
+    const std::size_t g0 = gstart[t];
+    for (std::size_t j = 0; j < recs.size(); ++j) {
+      const ParRec &r = recs[j];
+      w.cur_char = const_cast<char *>(base + r.seq_off);
+      w.do_read = true;
+      w.do_kmer_read = r.do_kmer_read;
+      w.cur_gc_record = &gc[j];
+      w.read_sequence_line(ws);
+
+      w.cur_char = const_cast<char *>(base + r.qual_off);
+      w.do_tile_read = r.do_tile_read;
+      w.tile_cur = r.tile_cur;
+      w.force_eof = r.qual_no_nl;
+      w.read_quality_line(ws);
+
+      if (count_dup && (g0 + j) >= fill_boundary) {
+        const auto it = master.sequence_count.find(
+          base + r.seq_off, get_truncate_point(r.seqlen));
+        if (it != master.sequence_count.end())
+          ++d[static_cast<std::size_t>(it - mbegin)];
       }
-      const auto mbegin = master.sequence_count.begin();
-      for (std::size_t t = 0; t < nthreads; ++t)
-        for (std::size_t i = 0; i < nent; ++i)
-          (mbegin + i)->second += deltas[t][i];
+    }
+  }
+
+  // ---- GC replay in global read order (exact FP reproduction) ----
+  for (std::size_t t = 0; t < nthreads; ++t) {
+    for (const GCRecord &gr : gcrec[t]) {
+      if (gr.kind == 1) {
+        for (const auto &v : master.gc_models[gr.a].models[gr.b])
+          master.gc_count[v.percent] += v.increment;
+      }
+      else if (gr.kind == 2) {
+        ++master.gc_count[100 * gr.b / gr.a];
+      }
+    }
+  }
+
+  // ---- merge per-thread duplication deltas into the map ----
+  if (count_dup) {
+    for (std::size_t t = 0; t < nthreads; ++t) {
+      if (deltas[t].empty())
+        continue;
+      for (std::size_t i = 0; i < nent; ++i)
+        (mbegin + i)->second += deltas[t][i];
     }
   }
   master.num_reads = total_reads;
@@ -1695,7 +1701,7 @@ read_uncompressed_chunked(FalcoConfig &config, FastqStats &master,
       dst[i] += src[i];
   };
   for (std::size_t t = 0; t < nthreads; ++t) {
-    FastqStats &ws = wstats[t];
+    FastqStats &ws = *wstats[t];
     add_arr(master.base_count, ws.base_count);
     add_arr(master.n_base_count, ws.n_base_count);
     add_arr(master.position_quality_count, ws.position_quality_count);
@@ -1741,14 +1747,14 @@ read_uncompressed_chunked(FalcoConfig &config, FastqStats &master,
         std::vector<std::size_t>(kv.second, 0);
     }
     for (std::size_t t = 0; t < nthreads; ++t) {
-      for (const auto &kv : wstats[t].tile_position_quality) {
+      for (const auto &kv : wstats[t]->tile_position_quality) {
         auto &dst = master.tile_position_quality[kv.first];
         const auto &s = kv.second;
         const std::size_t lim = std::min(s.size(), dst.size());
         for (std::size_t i = 0; i < lim; ++i)
           dst[i] += s[i];
       }
-      for (const auto &kv : wstats[t].tile_position_count) {
+      for (const auto &kv : wstats[t]->tile_position_count) {
         auto &dst = master.tile_position_count[kv.first];
         const auto &s = kv.second;
         const std::size_t lim = std::min(s.size(), dst.size());
