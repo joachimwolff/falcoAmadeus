@@ -1708,12 +1708,20 @@ read_uncompressed_chunked(FalcoConfig &config, FastqStats &master,
   master.num_reads = total_reads;
 
   // ---- merge worker accumulators into master ----
-  // kmer_count dominates (~8.2M entries) and the serial sum over all nthreads
-  // copies grows with the thread count, so merge it by index-partitioned slices
-  // in parallel: each thread owns a contiguous range and reads every worker's
-  // slice sequentially. The remaining (small) arrays are summed serially below.
+  // kmer_count is sized for the 500 bp maximum but is indexed by read position
+  // (rp << bit_shift_kmer | kmer); positions beyond the longest read are never
+  // written and stay zero in every worker, so only the first
+  // max_read_length * (kmer_mask+1) entries can be non-zero. Bounding the merge
+  // to that skips summing the (typically ~85%) all-zero tail. It is merged by
+  // index-partitioned slices in parallel (each thread owns a contiguous range,
+  // reading every worker's slice sequentially).
+  std::size_t merge_max_rl = 0;
+  for (std::size_t t = 0; t < nthreads; ++t)
+    merge_max_rl = std::max(merge_max_rl, wstats[t]->max_read_length);
   {
-    const std::size_t nk = master.kmer_count.size();
+    const std::size_t nk = std::min(
+      master.kmer_count.size(),
+      (merge_max_rl + 1) << Constants::bit_shift_kmer);
     std::size_t *const mk = master.kmer_count.data();
 #ifdef _OPENMP
 #pragma omp parallel num_threads(nthreads)
