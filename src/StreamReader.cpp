@@ -497,42 +497,104 @@ StreamReader::read_sequence_line(FastqStats &stats) {
   /*********************************************************/
   /********** THIS LOOP MUST BE ALWAYS OPTIMIZED ***********/
   /*********************************************************/
-  for (; *cur_char != field_separator; ++cur_char, ++read_pos) {
-    // if we reached the buffer size, stop using it and start using leftover
-    if (read_pos == buffer_size) {
-      still_in_buffer = false;
-      leftover_ind = 0;
+  // [FalcoAmadeus] In-buffer fast path: as long as the read position stays
+  // within the static buffer (the overwhelmingly common case) the per-base
+  // buffer-overflow / leftover-allocation branches are invariant, so they are
+  // hoisted out of the loop and every running scalar (position, gc count,
+  // k-mer, n-gap counter, truncation cursor) is kept in a local so the compiler
+  // is not forced to reload the aliasable member on every base. This inlines
+  // the exact body of process_sequence_base_from_buffer + the GC-truncation
+  // step, so the accumulated statistics are byte-identical to the original
+  // one-base-at-a-time loop. If the read overflows the buffer we fall through to
+  // the original slow tail below with the members synced.
+  const char *c = cur_char;
+  char *const buf = buffer;
+  const std::size_t bsz = buffer_size;
+  std::size_t rp = 0;
+  std::size_t gc = cur_gc_count;         // 0 on entry
+  std::size_t nba = num_bases_after_n;   // 1 on entry
+  std::size_t kmer = cur_kmer;           // carries over between reads
+  std::size_t next_trunc = next_truncation;  // 100 on entry
+  const char sep = field_separator;
+  for (; rp < bsz; ++c, ++rp) {
+    const char ch = *c;
+    if (ch == sep)
+      break;
+    buf[rp] = ch;
+    if (ch == 'N') {
+      ++stats.n_base_count[rp];
+      nba = 1;  // restart the current k-mer
     }
+    else {
+      const std::size_t two_bit = (ch >> 1) & 3;
+      gc += (two_bit & 1);
+      ++stats.base_count[(rp << Constants::bit_shift_base) | two_bit];
 
-    // Make sure we have memory space to process new base
-    if (!still_in_buffer) {
-      if (leftover_ind == stats.num_extra_bases) {
-        stats.allocate_new_base(tile_ignore);
+      if (do_sliding_window) {
+        kmer = (kmer << Constants::bit_shift_base) | two_bit;
+        if (do_kmer && do_kmer_read &&
+            (nba >= Constants::kmer_size)) {
+          ++stats.kmer_count[(rp << Constants::bit_shift_kmer) |
+                             (kmer & Constants::kmer_mask)];
+          ++stats.pos_kmer_count[rp];
+        }
+        if (do_adapter_optimized && (nba == adapter_size)) {
+          kmer &= adapter_mask;
+          const std::size_t bmb = kmer & adapter_bm_mask;
+          if (adapter_present[bmb >> 6] & (static_cast<std::uint64_t>(1)
+                                           << (bmb & 63))) {
+            for (std::size_t i = 0; i != num_adapters; ++i) {
+              if (kmer == adapters[i] && !adapters_found[i]) {
+                ++stats.pos_adapter_count[
+                    (rp << Constants::bit_shift_adapter) | i];
+                adapters_found[i] = true;
+              }
+            }
+          }
+        }
+        nba += (nba != adapter_size);
       }
     }
 
-    // puts base either on buffer or leftover
-    put_base_in_buffer();
-
-    // statistics updated base by base
-    // use buffer
-    if (still_in_buffer) {
-      process_sequence_base_from_buffer(stats);
+    // Truncate GC counts to multiples of 100
+    if (do_gc_sequence && rp == next_trunc) {
+      truncated_gc_count = gc;
+      truncated_length = rp;
+      next_trunc += 100;
     }
+  }
+  // publish the locals back to the members
+  read_pos = rp;
+  cur_gc_count = gc;
+  num_bases_after_n = nba;
+  cur_kmer = kmer;
+  next_truncation = next_trunc;
+  cur_char = const_cast<char *>(c);
 
-    // use dynamic allocation
-    else {
+  // Slow tail: only entered when the read is longer than the static buffer.
+  if (*cur_char != field_separator) {
+    still_in_buffer = false;
+    leftover_ind = 0;
+    for (; *cur_char != field_separator; ++cur_char, ++read_pos) {
+      // Make sure we have memory space to process new base
+      if (leftover_ind == stats.num_extra_bases) {
+        stats.allocate_new_base(tile_ignore);
+      }
+
+      // puts base either on buffer or leftover
+      put_base_in_buffer();
+
       process_sequence_base_from_leftover(stats);
 
       // Increase leftover pos if no longer in buffer
       ++leftover_ind;
-    }
 
-    // Truncate GC counts to multiples of 100
-    if (do_gc_sequence && read_pos == next_truncation) {
-      truncated_gc_count = cur_gc_count;
-      truncated_length = read_pos;
-      next_truncation += 100;
+      // Truncate GC counts to multiples of 100
+      if (do_gc_sequence && read_pos == next_truncation) {
+        truncated_gc_count = cur_gc_count;
+        truncated_length = read_pos;
+        next_truncation += 100;
+      }
     }
   }
 
@@ -608,40 +670,77 @@ StreamReader::read_quality_line(FastqStats &stats) {
 
   // For quality, we do not look for the separator, but rather for an explicit
   // newline or EOF in case the file does not end with newline or we are getting
-  // decompressed strings from a stream
-  for (; (*cur_char != field_separator) && (*cur_char != line_separator) &&
-         !line_at_eof;
-       ++cur_char) {
+  // decompressed strings from a stream.
+  //
+  // [FalcoAmadeus] Same in-buffer fast path as read_sequence_line: while the
+  // position stays inside the static buffer the overflow branch is invariant
+  // and the running scalars (position, quality sum, lowest char) live in locals
+  // so the members are not reloaded per base. The inlined body reproduces
+  // process_quality_base_from_buffer exactly, so the histograms stay
+  // byte-identical. Overflowing reads fall through to the original slow tail.
+  const char *c = cur_char;
+  const std::size_t bsz = buffer_size;
+  std::size_t rp = 0;
+  std::size_t cq = 0;
+  char lowest = stats.lowest_char;
+  const char sepf = field_separator;
+  const char sepl = line_separator;
+  if (!line_at_eof) {
+    for (; rp < bsz; ++c, ++rp) {
+      const char ch = *c;
+      if (ch == sepf || ch == sepl)
+        break;
 
-    if (read_pos == buffer_size) {
-      still_in_buffer = false;
-      leftover_ind = 0;
+      // update lowest quality
+      lowest = min8(lowest,
+                    ((ch == 9) ? (std::numeric_limits<char>::max()) : ch));
+
+      // Converts quality ascii to zero-based
+      const std::size_t qv = ch - Constants::quality_zero;
+      ++stats.position_quality_count[(rp << Constants::bit_shift_quality) | qv];
+
+      if (do_tile_quality) {
+        if (std::size(*cur_tile_quality) == rp) {
+          cur_tile_quality->push_back(0.0);
+          cur_tile_count->push_back(0);
+        }
+        (*cur_tile_quality)[rp] += qv;
+        ++(*cur_tile_count)[rp];
+      }
+
+      // Sums quality value so we can bin the average at the end
+      cq += qv;
     }
+  }
+  stats.lowest_char = lowest;
+  read_pos = rp;
+  cur_quality = cq;
+  cur_char = const_cast<char *>(c);
 
-    // update lowest quality
-    stats.lowest_char = min8(
-      stats.lowest_char,
-      ((*cur_char == 9) ? (std::numeric_limits<char>::max()) : (*cur_char)));
+  // Slow tail: only entered when the quality line is longer than the buffer.
+  if (!line_at_eof && (*cur_char != field_separator) &&
+      (*cur_char != line_separator)) {
+    still_in_buffer = false;
+    leftover_ind = 0;
+    for (; (*cur_char != field_separator) && (*cur_char != line_separator);
+         ++cur_char) {
+      // update lowest quality
+      stats.lowest_char = min8(
+        stats.lowest_char,
+        ((*cur_char == 9) ? (std::numeric_limits<char>::max()) : (*cur_char)));
 
-    // Converts quality ascii to zero-based
-    quality_value = *cur_char - Constants::quality_zero;
+      // Converts quality ascii to zero-based
+      quality_value = *cur_char - Constants::quality_zero;
 
-    // Fast bases from buffer
-    if (still_in_buffer) {
-      process_quality_base_from_buffer(stats);
-    }
-
-    // Slow bases from dynamic allocation
-    else {
       process_quality_base_from_leftover(stats);
       ++leftover_ind;
+
+      // Sums quality value so we can bin the average at the end
+      cur_quality += quality_value;
+
+      // Flag to start reading and writing outside of buffer
+      ++read_pos;
     }
-
-    // Sums quality value so we can bin the average at the end
-    cur_quality += quality_value;
-
-    // Flag to start reading and writing outside of buffer
-    ++read_pos;
   }
 
   // Average quality approximated to the nearest integer. Used to make a
