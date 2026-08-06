@@ -302,6 +302,65 @@ class GzBlockDecompressor {
 };
 
 /*******************************************************/
+/*********** PLAIN (UNCOMPRESSED) LINE SOURCE **********/
+/*******************************************************/
+// A line source over an uncompressed FASTQ file exposing the exact getline() /
+// eof() interface of GzBlockDecompressor, so the parallel dispatcher can drive
+// it unchanged. The whole file is memory-mapped (MADV_SEQUENTIAL), so getline
+// is a memchr('\n') + memcpy out of the page cache with no per-line syscall.
+class PlainBlockReader {
+ private:
+  int fd_ = -1;
+  void *map_ = MAP_FAILED;
+  size_t maplen_ = 0;
+  const char *p_ = nullptr;
+  const char *end_ = nullptr;
+
+ public:
+  explicit PlainBlockReader(const std::string &fn) {
+    fd_ = open(fn.c_str(), O_RDONLY);
+    if (fd_ < 0)
+      throw std::runtime_error("Cannot open FASTQ file : " + fn);
+    struct stat st;
+    if (fstat(fd_, &st) != 0)
+      throw std::runtime_error("Cannot stat FASTQ file : " + fn);
+    maplen_ = static_cast<size_t>(st.st_size);
+    if (maplen_ == 0)
+      return;  // empty file: p_ == end_ == nullptr -> immediate eof
+    map_ = mmap(nullptr, maplen_, PROT_READ, MAP_PRIVATE, fd_, 0);
+    if (map_ == MAP_FAILED)
+      throw std::runtime_error("Cannot mmap FASTQ file : " + fn);
+    madvise(map_, maplen_, MADV_SEQUENTIAL);
+    p_ = static_cast<const char *>(map_);
+    end_ = p_ + maplen_;
+  }
+  ~PlainBlockReader() {
+    if (map_ != MAP_FAILED && map_ != nullptr)
+      munmap(map_, maplen_);
+    if (fd_ >= 0)
+      close(fd_);
+  }
+  PlainBlockReader(const PlainBlockReader &) = delete;
+  PlainBlockReader &operator=(const PlainBlockReader &) = delete;
+
+  // Copy one line (up to and including '\n', NUL-terminated) into dst, exactly
+  // like GzBlockDecompressor::getline. Returns bytes written (0 at end).
+  size_t getline(char *dst, size_t maxlen) {
+    if (p_ >= end_)
+      return 0;
+    const size_t avail = static_cast<size_t>(end_ - p_);
+    const size_t lim = std::min(avail, maxlen - 1);
+    const char *nl = static_cast<const char *>(memchr(p_, '\n', lim));
+    const size_t n = nl ? static_cast<size_t>(nl - p_) + 1 : lim;
+    std::memcpy(dst, p_, n);
+    dst[n] = '\0';
+    p_ += n;
+    return n;
+  }
+  bool eof() const { return p_ >= end_; }
+};
+
+/*******************************************************/
 /*************** READ FASTQ GZ RCORD *******************/
 /*******************************************************/
 class GzFastqReader : public StreamReader {
@@ -347,6 +406,13 @@ class ParallelWorker : public StreamReader {
 // in `master` is byte-identical to the single-threaded path. Only valid for
 // read_step == 1; the caller falls back otherwise.
 void read_gz_parallel(FalcoConfig &config, FastqStats &master, size_t nthreads);
+
+// Multi-threaded uncompressed-FASTQ driver. Same dispatcher / worker / merge
+// machinery as read_gz_parallel (hence the same byte-identical result), but the
+// serial dispatcher pulls lines from a memory-mapped file instead of a
+// background inflater. Only valid for read_step == 1.
+void read_uncompressed_parallel(FalcoConfig &config, FastqStats &master,
+                                size_t nthreads);
 
 /*******************************************************/
 /*************** READ SAM RECORD ***********************/

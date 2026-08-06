@@ -1133,15 +1133,16 @@ struct ParRec {
 };
 }  // namespace
 
-void
-read_gz_parallel(FalcoConfig &config, FastqStats &master,
-                 std::size_t nthreads) {
+// Shared core for both parallel drivers. `decomp` is any line source exposing
+// getline(dst, maxlen) / eof() -- a GzBlockDecompressor for gzipped input or a
+// PlainBlockReader for uncompressed input. The dispatch / worker / merge logic
+// is format-agnostic, so the result is byte-identical to the serial path
+// regardless of which source is used.
+template <class Src>
+static void
+read_parallel_impl(FalcoConfig &config, FastqStats &master,
+                   std::size_t nthreads, Src &decomp) {
   const std::size_t BUF = FastqStats::SHORT_READ_THRESHOLD;
-
-  gzFile gz = gzopen(std::data(config.filename), "r");
-  if (gz == Z_NULL)
-    throw std::runtime_error("Cannot open gzip FASTQ file : " + config.filename);
-  gzbuffer(gz, (1 << 20));
 
   // dispatcher-only reader (parses the tile field from headers)
   ParallelWorker disp(config, BUF);
@@ -1171,7 +1172,6 @@ read_gz_parallel(FalcoConfig &config, FastqStats &master,
   std::vector<GCRecord> gcrec;
 
   {
-    GzBlockDecompressor decomp(gz, (1u << 22), 8);
     bool eof = false;
     while (!eof) {
       // ---- serial dispatch: stage up to CHUNK reads ----
@@ -1296,8 +1296,7 @@ read_gz_parallel(FalcoConfig &config, FastqStats &master,
         }
       }
     }
-  }  // decomp destroyed here: background thread joined
-  gzclose_r(gz);
+  }
 
   // ---- merge worker accumulators into master ----
   auto add_arr = [](auto &dst, const auto &src) {
@@ -1364,6 +1363,29 @@ read_gz_parallel(FalcoConfig &config, FastqStats &master,
   // as in read_stream_into_stats: drop tile reporting if there was no tile info
   if (tile_ignore)
     config.do_tile = false;
+}
+
+void
+read_gz_parallel(FalcoConfig &config, FastqStats &master,
+                 std::size_t nthreads) {
+  gzFile gz = gzopen(std::data(config.filename), "r");
+  if (gz == Z_NULL)
+    throw std::runtime_error("Cannot open gzip FASTQ file : " + config.filename);
+  gzbuffer(gz, (1 << 20));
+  {
+    // Scope the decompressor so its background thread is joined (destructor)
+    // before we close the gzFile it was reading from.
+    GzBlockDecompressor decomp(gz, (1u << 22), 8);
+    read_parallel_impl(config, master, nthreads, decomp);
+  }
+  gzclose_r(gz);
+}
+
+void
+read_uncompressed_parallel(FalcoConfig &config, FastqStats &master,
+                           std::size_t nthreads) {
+  PlainBlockReader src(config.filename);
+  read_parallel_impl(config, master, nthreads, src);
 }
 
 /*******************************************************/

@@ -716,8 +716,16 @@ analyze_and_write(FalcoConfig &falco_config, const std::string &filename,
   else if (falco_config.is_fastq) {
     if (!falco_config.quiet)
       log_process("reading file as uncompressed FASTQ format");
-    FastqReader in(falco_config, stats.SHORT_READ_THRESHOLD);
-    read_stream_into_stats(in, stats, falco_config);
+    // multi-threaded parser: memory-mapped dispatch + parallel per-read stats,
+    // byte-identical to single-threaded. Only for read_step == 1 (same reason
+    // as the gzipped path).
+    if (falco_config.threads >= 2 && falco_config.read_step == 1) {
+      read_uncompressed_parallel(falco_config, stats, falco_config.threads);
+    }
+    else {
+      FastqReader in(falco_config, stats.SHORT_READ_THRESHOLD);
+      read_stream_into_stats(in, stats, falco_config);
+    }
   }
   else {
     throw std::runtime_error("Cannot recognize file format for file " +
