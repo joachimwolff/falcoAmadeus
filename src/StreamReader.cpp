@@ -1551,25 +1551,14 @@ read_uncompressed_chunked(FalcoConfig &config, FastqStats &master,
     }
   }
 
-  // ---- global read indexing + subsampling flags ----
+  // ---- global read indexing ----
+  // Subsampling flags (do_tile_read / do_kmer_read) are a cheap modulo of the
+  // global read index, so they are computed inline in the per-base phase below
+  // rather than in a separate pass over all records.
   std::vector<std::size_t> gstart(nthreads + 1, 0);
   for (std::size_t t = 0; t < nthreads; ++t)
     gstart[t + 1] = gstart[t] + chunk_recs[t].size();
   const std::size_t total_reads = gstart[nthreads];
-
-#ifdef _OPENMP
-#pragma omp parallel for num_threads(nthreads) schedule(static)
-#endif
-  for (std::size_t t = 0; t < nthreads; ++t) {
-    const std::size_t g0 = gstart[t];
-    std::vector<ParRec> &recs = chunk_recs[t];
-    for (std::size_t j = 0; j < recs.size(); ++j) {
-      const std::size_t g = g0 + j;
-      recs[j].do_tile_read =
-        !tile_ignore && (g % StreamReader::num_reads_for_tile == 0);
-      recs[j].do_kmer_read = (g % StreamReader::num_reads_for_kmer == 0);
-    }
-  }
 
   // ---- duplication phase 1: serial prefix fixes the "first 100k unique" set ----
   // Run before the per-base phase so the map is fully populated (and thereafter
@@ -1643,14 +1632,16 @@ read_uncompressed_chunked(FalcoConfig &config, FastqStats &master,
     const std::size_t g0 = gstart[t];
     for (std::size_t j = 0; j < recs.size(); ++j) {
       const ParRec &r = recs[j];
+      const std::size_t g = g0 + j;
       w.cur_char = const_cast<char *>(base + r.seq_off);
       w.do_read = true;
-      w.do_kmer_read = r.do_kmer_read;
+      w.do_kmer_read = (g % StreamReader::num_reads_for_kmer == 0);
       w.cur_gc_record = &gc[j];
       w.read_sequence_line(ws);
 
       w.cur_char = const_cast<char *>(base + r.qual_off);
-      w.do_tile_read = r.do_tile_read;
+      w.do_tile_read =
+        !tile_ignore && (g % StreamReader::num_reads_for_tile == 0);
       w.tile_cur = r.tile_cur;
       w.force_eof = r.qual_no_nl;
       w.read_quality_line(ws);
@@ -1754,8 +1745,13 @@ read_uncompressed_chunked(FalcoConfig &config, FastqStats &master,
     std::unordered_map<std::size_t, std::size_t> tile_len;
     std::size_t max_len = 0;
     for (std::size_t t = 0; t < nthreads; ++t) {
-      for (const ParRec &r : chunk_recs[t]) {
-        if (r.do_tile_read) {
+      const std::size_t g0 = gstart[t];
+      const std::vector<ParRec> &recs = chunk_recs[t];
+      for (std::size_t j = 0; j < recs.size(); ++j) {
+        const ParRec &r = recs[j];
+        const bool do_tile_read =
+          (g0 + j) % StreamReader::num_reads_for_tile == 0;
+        if (do_tile_read) {
           if (tile_len.find(r.tile_cur) == tile_len.end())
             tile_len[r.tile_cur] = max_len;  // length at first sight
           if (r.tile_cur != 0)
