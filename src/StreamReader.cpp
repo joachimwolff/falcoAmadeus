@@ -1443,6 +1443,36 @@ find_record_start(const char *base, std::size_t size, std::size_t from) {
   return size;
 }
 
+// Parse the four line boundaries of the FASTQ record whose header starts at
+// offset p. Fills seq_off/seqlen and returns the offset of the next record (or
+// `size` at end of file). Used by the serial duplication prefix.
+static inline std::size_t
+parse_record(const char *base, std::size_t size, std::size_t p,
+             std::size_t &seq_off, std::size_t &seqlen) {
+  const char *h = static_cast<const char *>(memchr(base + p, '\n', size - p));
+  if (h == nullptr) {
+    seq_off = size;
+    seqlen = 0;
+    return size;
+  }
+  seq_off = static_cast<std::size_t>(h - base) + 1;
+  const char *s = static_cast<const char *>(
+    memchr(base + seq_off, '\n', size - seq_off));
+  const std::size_t seq_end = s ? static_cast<std::size_t>(s - base) : size;
+  seqlen = seq_end - seq_off;
+  if (seq_end >= size)
+    return size;
+  const std::size_t plus_off = seq_end + 1;
+  const char *pl = (plus_off < size) ? static_cast<const char *>(
+    memchr(base + plus_off, '\n', size - plus_off)) : nullptr;
+  if (pl == nullptr)
+    return size;
+  const std::size_t qual_off = static_cast<std::size_t>(pl - base) + 1;
+  const char *q = (qual_off < size) ? static_cast<const char *>(
+    memchr(base + qual_off, '\n', size - qual_off)) : nullptr;
+  return q ? static_cast<std::size_t>(q - base) + 1 : size;
+}
+
 // Fully parallel uncompressed-FASTQ driver. The file is memory-mapped and split
 // into one contiguous byte range per thread; each thread syncs to a record
 // boundary and parses its range in place (zero-copy), accumulating the per-base
@@ -1486,115 +1516,81 @@ read_uncompressed_chunked(FalcoConfig &config, FastqStats &master,
     if (sync[t] < sync[t - 1])
       sync[t] = sync[t - 1];
 
-  // ---- Phase A: parse record offsets in each chunk (parallel) ----
-  std::vector<std::vector<ParRec>> chunk_recs(nthreads);
+  // ---- per-thread parallel workers (parse config + per-base state) ----
   std::vector<std::unique_ptr<ParallelWorker>> workers;
   workers.reserve(nthreads);
   for (std::size_t t = 0; t < nthreads; ++t)
     workers.emplace_back(new ParallelWorker(config, BUF));
 
+  // ---- Phase 1: count records per chunk (parallel newline count) ----
+  // Chunks are record-aligned, so each record is exactly 4 newlines; only the
+  // file's final record can lack a trailing newline (in the last non-empty
+  // chunk), corrected here. No per-record offsets are stored -- Phase 2 parses
+  // the records in place, so the sequence bytes are scanned only once.
+  std::vector<std::size_t> counts(nthreads, 0);
 #ifdef _OPENMP
 #pragma omp parallel for num_threads(nthreads) schedule(static)
 #endif
   for (std::size_t t = 0; t < nthreads; ++t) {
-    const std::size_t start = sync[t];
-    const std::size_t end = sync[t + 1];
-    ParallelWorker &w = *workers[t];
-    std::vector<ParRec> &recs = chunk_recs[t];
-    // Reserve from an estimate of this chunk's record size (first record's byte
-    // span) to avoid ~millions of reallocating push_backs.
-    if (start < end) {
-      const char *r0 =
-        static_cast<const char *>(memchr(base + start, '\n', end - start));
-      if (r0 != nullptr) {
-        const std::size_t line = static_cast<std::size_t>(r0 - (base + start)) + 1;
-        const std::size_t rec_est = line * 4;  // 4 lines per FASTQ record
-        if (rec_est > 0)
-          recs.reserve((end - start) / rec_est + 16);
-      }
-    }
-    std::size_t p = start;
-    while (p < end) {
-      const std::size_t h_off = p;
-      const char *e0 =
-        static_cast<const char *>(memchr(base + p, '\n', size - p));
-      if (e0 == nullptr)
-        break;
-      const std::size_t seq_off = static_cast<std::size_t>(e0 - base) + 1;
-      const char *e1 = static_cast<const char *>(
-        memchr(base + seq_off, '\n', size - seq_off));
-      const std::size_t seq_end =
-        e1 ? static_cast<std::size_t>(e1 - base) : size;
-      const std::size_t seqlen = seq_end - seq_off;
-      const std::size_t plus_off = (seq_end < size) ? seq_end + 1 : size;
-      const char *e2 = (plus_off < size) ? static_cast<const char *>(
-        memchr(base + plus_off, '\n', size - plus_off)) : nullptr;
-      const std::size_t qual_off =
-        e2 ? static_cast<std::size_t>(e2 - base) + 1 : size;
-      const char *e3 = (qual_off < size) ? static_cast<const char *>(
-        memchr(base + qual_off, '\n', size - qual_off)) : nullptr;
-      const std::size_t qual_end =
-        e3 ? static_cast<std::size_t>(e3 - base) : size;
-      const bool qual_no_nl = (e3 == nullptr);
-
-      // parse the tile field from the header (mirrors read_tile_line)
-      std::size_t tile_cur = 0;
-      if (!tile_ignore) {
-        w.cur_char = const_cast<char *>(base + h_off);
-        w.get_tile_value();
-        tile_cur = w.tile_cur;
-      }
-      recs.push_back({seq_off, qual_off, seqlen, tile_cur,
-                      false, false, qual_no_nl});
-      // advance to the next record (the byte just after this quality line)
-      p = (qual_end < size) ? qual_end + 1 : size;
-    }
+    const std::size_t lo = sync[t], hi = sync[t + 1];
+    if (lo >= hi)
+      continue;
+    std::size_t nl =
+      static_cast<std::size_t>(std::count(base + lo, base + hi, '\n'));
+    if (hi == size && base[size - 1] != '\n')
+      ++nl;  // final record has no trailing newline
+    counts[t] = nl / 4;
   }
 
   // ---- global read indexing ----
   // Subsampling flags (do_tile_read / do_kmer_read) are a cheap modulo of the
-  // global read index, so they are computed inline in the per-base phase below
-  // rather than in a separate pass over all records.
+  // global read index, computed inline in Phase 2.
   std::vector<std::size_t> gstart(nthreads + 1, 0);
   for (std::size_t t = 0; t < nthreads; ++t)
-    gstart[t + 1] = gstart[t] + chunk_recs[t].size();
+    gstart[t + 1] = gstart[t] + counts[t];
   const std::size_t total_reads = gstart[nthreads];
 
+  // Per-record (seqlen, tile) captured during Phase 2 only when tiles are
+  // present, for the serial tile-length reconstruction (needs global order).
+  std::vector<std::vector<std::pair<std::uint32_t, std::uint32_t>>>
+    tilerecs(nthreads);
+
   // ---- duplication phase 1: serial prefix fixes the "first 100k unique" set ----
-  // Run before the per-base phase so the map is fully populated (and thereafter
-  // read-only) while the workers count occurrences in parallel below. Ordering
-  // matters only until the 100k-unique cap fills; after that occurrence counting
-  // is commutative. reads [0, fill_boundary) are counted here, serially.
+  // Walk records from the start in global order (parsing in place) until the
+  // 100k-unique cap fills; ordering matters only up to that point, after which
+  // occurrence counting is commutative and done in parallel in Phase 2. Touches
+  // only the prefix (typically a few hundred thousand reads), then stops. reads
+  // [0, fill_boundary) are counted here.
   std::size_t fill_boundary = 0;
   if (do_hash) {
     bool continue_storing = true;
     std::size_t seen = 0;
-    for (std::size_t t = 0; t < nthreads && continue_storing; ++t) {
-      const std::vector<ParRec> &recs = chunk_recs[t];
-      for (std::size_t j = 0; j < recs.size(); ++j) {
-        const ParRec &r = recs[j];
-        const char *key = base + r.seq_off;
-        const std::size_t klen = get_truncate_point(r.seqlen);
-        const auto it = master.sequence_count.find(key, klen);
-        if (it == master.sequence_count.end()) {
-          if (continue_storing) {
-            master.sequence_count.emplace(key, klen, 1);
-            master.count_at_limit = seen;
-            ++master.num_unique_seen;
-            if (master.num_unique_seen ==
-                Constants::unique_reads_stop_counting) {
-              continue_storing = false;
-              ++seen;
-              break;
-            }
+    std::size_t p = 0;
+    while (p < size && continue_storing && seen < total_reads) {
+      std::size_t seq_off, seqlen;
+      const std::size_t next = parse_record(base, size, p, seq_off, seqlen);
+      const char *key = base + seq_off;
+      const std::size_t klen = get_truncate_point(seqlen);
+      const auto it = master.sequence_count.find(key, klen);
+      if (it == master.sequence_count.end()) {
+        if (continue_storing) {
+          master.sequence_count.emplace(key, klen, 1);
+          master.count_at_limit = seen;
+          ++master.num_unique_seen;
+          if (master.num_unique_seen ==
+              Constants::unique_reads_stop_counting) {
+            continue_storing = false;
+            ++seen;
+            break;
           }
         }
-        else {
-          ++it->second;
-          master.count_at_limit += continue_storing;
-        }
-        ++seen;
       }
+      else {
+        ++it->second;
+        master.count_at_limit += continue_storing;
+      }
+      ++seen;
+      p = next;
     }
     fill_boundary = continue_storing ? total_reads : seen;
   }
@@ -1604,15 +1600,14 @@ read_uncompressed_chunked(FalcoConfig &config, FastqStats &master,
   const auto mbegin = master.sequence_count.begin();
   const bool count_dup = do_hash && (fill_boundary < total_reads);
 
-  // ---- Phase B: per-base statistics + fused parallel duplication counting ----
-  // Zero-copy: each worker parses its chunk in place. For reads at global index
-  // >= fill_boundary it also counts occurrences against the now read-only map
-  // (find() is safe with no concurrent inserts), folded into the same pass so
-  // the sequence bytes are not walked a second time.
-  // Per-thread accumulators are allocated INSIDE the parallel region: each
-  // FastqStats zero-fills a ~65 MB kmer_count vector, so constructing all
-  // nthreads of them serially would add tens of ms; here that zeroing runs in
-  // parallel, one per thread.
+  // ---- Phase 2: parse + per-base statistics + fused duplication counting ----
+  // Single in-place pass. read_sequence_line / read_quality_line find the
+  // seq/qual line ends themselves (leaving cur_char on the terminating '\n'),
+  // so only the short header and '+' lines need a memchr and the bulk sequence
+  // bytes are scanned exactly once. For reads at global index >= fill_boundary
+  // occurrences are also counted against the now read-only map. Per-thread
+  // FastqStats are allocated INSIDE the region so the ~65 MB kmer_count zeroing
+  // runs in parallel.
   std::vector<std::unique_ptr<FastqStats>> wstats(nthreads);
   std::vector<std::vector<GCRecord>> gcrec(nthreads);
   std::vector<std::vector<std::size_t>> deltas(nthreads);
@@ -1623,35 +1618,68 @@ read_uncompressed_chunked(FalcoConfig &config, FastqStats &master,
     wstats[t].reset(new FastqStats());
     ParallelWorker &w = *workers[t];
     FastqStats &ws = *wstats[t];
-    std::vector<ParRec> &recs = chunk_recs[t];
+    const std::size_t n = counts[t];
     std::vector<GCRecord> &gc = gcrec[t];
-    gc.assign(recs.size(), GCRecord{0, 0, 0});
+    gc.assign(n, GCRecord{0, 0, 0});
     std::vector<std::size_t> &d = deltas[t];
     if (count_dup)
       d.assign(nent, 0);
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> &tr = tilerecs[t];
+    if (!tile_ignore)
+      tr.reserve(n);
     const std::size_t g0 = gstart[t];
-    for (std::size_t j = 0; j < recs.size(); ++j) {
-      const ParRec &r = recs[j];
+    const bool last_chunk = (sync[t + 1] == size);
+    std::size_t p = sync[t];
+    for (std::size_t j = 0; j < n; ++j) {
       const std::size_t g = g0 + j;
-      w.cur_char = const_cast<char *>(base + r.seq_off);
+      // header -> sequence start (+ optional tile field)
+      const char *h =
+        static_cast<const char *>(memchr(base + p, '\n', size - p));
+      const std::size_t seq_off = static_cast<std::size_t>(h - base) + 1;
+      std::size_t tile_cur = 0;
+      if (!tile_ignore) {
+        w.cur_char = const_cast<char *>(base + p);
+        w.get_tile_value();
+        tile_cur = w.tile_cur;
+      }
+      // sequence (scans to '\n'; sets read_pos = seqlen, cur_char at the '\n')
+      w.cur_char = const_cast<char *>(base + seq_off);
       w.do_read = true;
       w.do_kmer_read = (g % StreamReader::num_reads_for_kmer == 0);
       w.cur_gc_record = &gc[j];
       w.read_sequence_line(ws);
-
-      w.cur_char = const_cast<char *>(base + r.qual_off);
+      const std::size_t seqlen = w.read_pos;
+      const char *seq_nl = w.cur_char;
+      // '+' line -> quality start
+      const std::size_t plus_off = static_cast<std::size_t>(seq_nl - base) + 1;
+      const char *pl = static_cast<const char *>(
+        memchr(base + plus_off, '\n', size - plus_off));
+      const std::size_t qual_off = static_cast<std::size_t>(pl - base) + 1;
+      // only the file's final record can lack a trailing newline
+      bool qual_no_nl = false;
+      if (last_chunk && j + 1 == n)
+        qual_no_nl =
+          (memchr(base + qual_off, '\n', size - qual_off) == nullptr);
+      // quality
+      w.cur_char = const_cast<char *>(base + qual_off);
       w.do_tile_read =
         !tile_ignore && (g % StreamReader::num_reads_for_tile == 0);
-      w.tile_cur = r.tile_cur;
-      w.force_eof = r.qual_no_nl;
+      w.tile_cur = tile_cur;
+      w.force_eof = qual_no_nl;
       w.read_quality_line(ws);
-
-      if (count_dup && (g0 + j) >= fill_boundary) {
+      // duplication occurrence count (post-cap; map is read-only here)
+      if (count_dup && g >= fill_boundary) {
         const auto it = master.sequence_count.find(
-          base + r.seq_off, get_truncate_point(r.seqlen));
+          base + seq_off, get_truncate_point(seqlen));
         if (it != master.sequence_count.end())
           ++d[static_cast<std::size_t>(it - mbegin)];
       }
+      if (!tile_ignore)
+        tr.push_back({static_cast<std::uint32_t>(seqlen),
+                      static_cast<std::uint32_t>(tile_cur)});
+      // advance to the next record
+      p = qual_no_nl ? size
+                     : static_cast<std::size_t>(w.cur_char - base) + 1;
     }
   }
 
@@ -1746,18 +1774,20 @@ read_uncompressed_chunked(FalcoConfig &config, FastqStats &master,
     std::size_t max_len = 0;
     for (std::size_t t = 0; t < nthreads; ++t) {
       const std::size_t g0 = gstart[t];
-      const std::vector<ParRec> &recs = chunk_recs[t];
+      const std::vector<std::pair<std::uint32_t, std::uint32_t>> &recs =
+        tilerecs[t];
       for (std::size_t j = 0; j < recs.size(); ++j) {
-        const ParRec &r = recs[j];
+        const std::size_t seqlen = recs[j].first;
+        const std::size_t tile_cur = recs[j].second;
         const bool do_tile_read =
           (g0 + j) % StreamReader::num_reads_for_tile == 0;
         if (do_tile_read) {
-          if (tile_len.find(r.tile_cur) == tile_len.end())
-            tile_len[r.tile_cur] = max_len;  // length at first sight
-          if (r.tile_cur != 0)
-            tile_len[r.tile_cur] = std::max(tile_len[r.tile_cur], r.seqlen);
+          if (tile_len.find(tile_cur) == tile_len.end())
+            tile_len[tile_cur] = max_len;  // length at first sight
+          if (tile_cur != 0)
+            tile_len[tile_cur] = std::max(tile_len[tile_cur], seqlen);
         }
-        max_len = std::max(max_len, r.seqlen);
+        max_len = std::max(max_len, seqlen);
       }
     }
     for (const auto &kv : tile_len) {
