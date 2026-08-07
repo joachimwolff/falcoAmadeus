@@ -203,9 +203,12 @@ button.sidebar-toggle {
   padding:0; margin-right:.5em; flex:0 0 auto; transition:background .15s, transform .15s;
 }
 button.sidebar-toggle:hover { background:var(--brand); color:#fff; transform:scale(1.08); }
-/* Collapsed sidebar: hide the summary and give the modules the full width. */
+/* Collapsed sidebar: hide the summary panel ONLY. div.main keeps its exact
+   left offset and width (from the rule above), so the modules and their Plotly
+   charts never shift or resize when the sidebar is toggled -- hiding it must
+   not make the graphics jump. The freed strip on the left is left empty by
+   design; reclaiming it would move the content and cause exactly that jump. */
 body.nav-collapsed div.summary { display:none; }
-body.nav-collapsed div.main { margin-left:auto; margin-right:auto; }
 /* Center the Plotly modebar icons inside their (hover) background squares. */
 .js-plotly-plot .modebar-btn { display:inline-flex !important; align-items:center; justify-content:center; }
 .js-plotly-plot .modebar-btn svg { vertical-align:middle; display:block; }
