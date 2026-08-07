@@ -29,6 +29,10 @@
 #include <omp.h>
 #endif
 
+#if defined(USE_HTS) && defined(USE_LIBDEFLATE)
+#include <libdeflate.h>
+#endif
+
 // this is faster than std::min
 template <class T>
 inline T
@@ -1849,9 +1853,152 @@ read_uncompressed_chunked(FalcoConfig &config, FastqStats &master,
   read_chunked_core(config, master, nthreads, src.data(), src.size());
 }
 
+#if defined(USE_HTS) && defined(USE_LIBDEFLATE)
+// Parallel BGZF decompression with libdeflate. A BGZF (bgzip) file is a series
+// of independent gzip members ("blocks"), each carrying a BC extra subfield
+// with the block's byte size and an ISIZE footer with its uncompressed size.
+// Memory-map the file, walk the block index from those headers/footers (no
+// decompression), then decompress the blocks in parallel straight into the
+// output buffer at their known offsets -- each thread writes (and first-touch
+// faults) its own output regions, so there is no serial copy and no separate
+// page-fault pass. Returns a malloc'd buffer + size, or nullptr if the input is
+// not BGZF (plain gzip) or any block fails to inflate, in which case the caller
+// falls back to the streaming bgzf reader.
+static char *
+decompress_bgzf_libdeflate(const std::string &path, std::size_t nthreads,
+                           std::size_t &out_size) {
+  const int fd = open(path.c_str(), O_RDONLY);
+  if (fd < 0)
+    throw std::runtime_error("Cannot open gzip FASTQ file : " + path);
+  struct stat stt;
+  if (fstat(fd, &stt) != 0) {
+    close(fd);
+    throw std::runtime_error("Cannot stat FASTQ file : " + path);
+  }
+  const std::size_t csize = static_cast<std::size_t>(stt.st_size);
+  if (csize < 18) {
+    close(fd);
+    return nullptr;
+  }
+  const unsigned char *comp = static_cast<const unsigned char *>(
+    mmap(nullptr, csize, PROT_READ, MAP_PRIVATE, fd, 0));
+  close(fd);
+  if (comp == MAP_FAILED)
+    throw std::runtime_error("Cannot mmap FASTQ file : " + path);
+  madvise(const_cast<unsigned char *>(comp), csize, MADV_WILLNEED);
+
+  auto le16 = [](const unsigned char *q) {
+    return static_cast<std::size_t>(q[0]) | (static_cast<std::size_t>(q[1]) << 8);
+  };
+  auto le32 = [](const unsigned char *q) {
+    return static_cast<std::size_t>(q[0]) | (static_cast<std::size_t>(q[1]) << 8) |
+           (static_cast<std::size_t>(q[2]) << 16) |
+           (static_cast<std::size_t>(q[3]) << 24);
+  };
+
+  std::vector<std::size_t> coff, clen, uoff, ulen;
+  std::size_t p = 0, utotal = 0;
+  bool bgzf_ok = true;
+  while (p + 18 <= csize) {
+    // gzip magic + CM=deflate + FLG.FEXTRA
+    if (!(comp[p] == 0x1f && comp[p + 1] == 0x8b && comp[p + 2] == 8 &&
+          (comp[p + 3] & 4))) {
+      bgzf_ok = (p != 0);  // a bad *first* block means this is not BGZF
+      break;
+    }
+    const std::size_t xlen = le16(comp + p + 10);
+    std::size_t xp = p + 12;
+    const std::size_t xe = xp + xlen;
+    std::size_t bsize = 0;
+    while (xp + 4 <= xe && xe <= csize) {
+      const std::size_t sl = le16(comp + xp + 2);
+      if (comp[xp] == 'B' && comp[xp + 1] == 'C' && sl == 2) {
+        bsize = le16(comp + xp + 4) + 1;
+        break;
+      }
+      xp += 4 + sl;
+    }
+    if (bsize == 0 || p + bsize > csize) {
+      bgzf_ok = (p != 0 && bsize != 0);
+      break;
+    }
+    const std::size_t isize = le32(comp + p + bsize - 4);
+    if (isize > 0) {
+      coff.push_back(p);
+      clen.push_back(bsize);
+      uoff.push_back(utotal);
+      ulen.push_back(isize);
+    }
+    utotal += isize;
+    p += bsize;
+  }
+  if (!bgzf_ok || coff.empty()) {
+    munmap(const_cast<unsigned char *>(comp), csize);
+    return nullptr;
+  }
+
+  char *out = static_cast<char *>(std::malloc(utotal));
+  if (out == nullptr) {
+    munmap(const_cast<unsigned char *>(comp), csize);
+    throw std::runtime_error("Out of memory decompressing : " + path);
+  }
+  const std::size_t nb = coff.size();
+  int ok = 1;
+#ifdef _OPENMP
+#pragma omp parallel num_threads(nthreads)
+#endif
+  {
+    libdeflate_decompressor *d = libdeflate_alloc_decompressor();
+    if (d == nullptr) {
+#ifdef _OPENMP
+#pragma omp atomic write
+#endif
+      ok = 0;
+    }
+    else {
+#ifdef _OPENMP
+#pragma omp for schedule(dynamic, 64)
+#endif
+      for (std::size_t i = 0; i < nb; ++i) {
+        std::size_t act = 0;
+        if (libdeflate_gzip_decompress(d, comp + coff[i], clen[i], out + uoff[i],
+                                       ulen[i], &act) != LIBDEFLATE_SUCCESS ||
+            act != ulen[i]) {
+#ifdef _OPENMP
+#pragma omp atomic write
+#endif
+          ok = 0;
+        }
+      }
+      libdeflate_free_decompressor(d);
+    }
+  }
+  munmap(const_cast<unsigned char *>(comp), csize);
+  if (!ok) {
+    std::free(out);
+    return nullptr;
+  }
+  out_size = utotal;
+  return out;
+}
+#endif  // USE_HTS && USE_LIBDEFLATE
+
 void
 read_gz_chunked(FalcoConfig &config, FastqStats &master,
                 std::size_t nthreads) {
+#if defined(USE_HTS) && defined(USE_LIBDEFLATE)
+  // Fast path: parallel BGZF block decompression with libdeflate, then parse.
+  {
+    std::size_t total = 0;
+    char *out = decompress_bgzf_libdeflate(config.filename, nthreads, total);
+    if (out != nullptr) {
+      read_chunked_core(config, master, nthreads, out, total);
+      std::free(out);
+      return;
+    }
+    // not BGZF (plain gzip) -> fall through to the streaming bgzf reader below
+  }
+#endif
 #ifdef USE_HTS
   // Decompress the whole file into RAM -- BGZF blocks are inflated in parallel
   // across nthreads via bgzf_mt, and htslib uses libdeflate (both external

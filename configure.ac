@@ -59,6 +59,17 @@ AS_IF([test "x$enable_hts" = "xyes"],
 )
 AM_CONDITIONAL([ENABLE_HTS], [test "x$enable_hts" = "xyes"])
 
+dnl With HTSLib enabled, optionally use libdeflate directly for parallel BGZF
+dnl block decompression (both are external libraries). Falls back gracefully.
+have_libdeflate=no
+AS_IF([test "x$enable_hts" = "xyes"],
+  [AC_CHECK_HEADER([libdeflate.h],
+    [AC_CHECK_LIB([deflate], [libdeflate_gzip_decompress],
+      [have_libdeflate=yes
+       LIBS="-ldeflate $LIBS"], [])], [])]
+)
+AM_CONDITIONAL([HAVE_LIBDEFLATE], [test "x$have_libdeflate" = "xyes"])
+
 AC_CONFIG_FILES([Makefile])
 dnl make the test data files available in the build tree
 AC_CONFIG_LINKS([
