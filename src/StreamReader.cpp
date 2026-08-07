@@ -1548,45 +1548,37 @@ read_chunked_core(FalcoConfig &config, FastqStats &master,
   // chunk), corrected here. No per-record offsets are stored -- Phase 2 parses
   // the records in place, so the sequence bytes are scanned only once.
   std::vector<std::size_t> counts(nthreads, 0);
-#ifdef _OPENMP
-#pragma omp parallel for num_threads(nthreads) schedule(static)
-#endif
-  for (std::size_t t = 0; t < nthreads; ++t) {
+  auto count_chunk = [&](const std::size_t t) {
     const std::size_t lo = sync[t], hi = sync[t + 1];
     if (lo >= hi)
-      continue;
+      return;
     std::size_t nl =
       static_cast<std::size_t>(std::count(base + lo, base + hi, '\n'));
     if (hi == size && base[size - 1] != '\n')
       ++nl;  // final record has no trailing newline
     counts[t] = nl / 4;
-  }
+  };
 
-  // ---- global read indexing ----
-  // Subsampling flags (do_tile_read / do_kmer_read) are a cheap modulo of the
-  // global read index, computed inline in Phase 2.
-  std::vector<std::size_t> gstart(nthreads + 1, 0);
-  for (std::size_t t = 0; t < nthreads; ++t)
-    gstart[t + 1] = gstart[t] + counts[t];
-  const std::size_t total_reads = gstart[nthreads];
-
-  // Per-record (seqlen, tile) captured during Phase 2 only when tiles are
-  // present, for the serial tile-length reconstruction (needs global order).
-  std::vector<std::vector<std::pair<std::uint32_t, std::uint32_t>>>
-    tilerecs(nthreads);
-
-  // ---- duplication phase 1: serial prefix fixes the "first 100k unique" set ----
+  // ---- duplication prefix: fixes the "first 100k unique" set ----
   // Walk records from the start in global order (parsing in place) until the
   // 100k-unique cap fills; ordering matters only up to that point, after which
   // occurrence counting is commutative and done in parallel in Phase 2. Touches
-  // only the prefix (typically a few hundred thousand reads), then stops. reads
-  // [0, fill_boundary) are counted here.
-  std::size_t fill_boundary = 0;
-  if (do_hash) {
+  // only the prefix (typically a few hundred thousand reads), then stops.
+  // This is independent of the newline count (it reads the file head and builds
+  // the map; the count only tallies boundaries), so when threads are available
+  // it runs on thread 0 CONCURRENTLY with the count on the others -- hiding its
+  // serial latency. The old `seen < total_reads` bound was redundant with
+  // `p < size` (you never see more records than exist), so dropping it removes
+  // the only dependency on the not-yet-known total, letting the two overlap.
+  bool dup_continue_storing = true;
+  std::size_t dup_seen = 0;
+  auto run_dup_prefix = [&]() {
+    if (!do_hash)
+      return;
     bool continue_storing = true;
     std::size_t seen = 0;
     std::size_t p = 0;
-    while (p < size && continue_storing && seen < total_reads) {
+    while (p < size && continue_storing) {
       std::size_t seq_off, seqlen;
       const std::size_t next = parse_record(base, size, p, seq_off, seqlen);
       const char *key = base + seq_off;
@@ -1612,8 +1604,54 @@ read_chunked_core(FalcoConfig &config, FastqStats &master,
       ++seen;
       p = next;
     }
-    fill_boundary = continue_storing ? total_reads : seen;
+    dup_continue_storing = continue_storing;
+    dup_seen = seen;
+  };
+
+  const bool overlap_dup = do_hash && nthreads > 1;
+#ifdef _OPENMP
+#pragma omp parallel num_threads(nthreads)
+  {
+    const int tid = omp_get_thread_num();
+    const int nth = omp_get_num_threads();
+    if (overlap_dup && tid == 0) {
+      run_dup_prefix();  // concurrent with the count on threads 1..nth-1
+    }
+    else {
+      // count-chunk workers: all threads normally, or 1..nth-1 when the dup
+      // prefix occupies thread 0. Strided so every chunk is covered exactly once.
+      const int wbase = overlap_dup ? 1 : 0;
+      const int wstride = overlap_dup ? (nth - 1) : nth;
+      if (wstride > 0)
+        for (std::size_t t = static_cast<std::size_t>(tid - wbase);
+             t < nthreads; t += static_cast<std::size_t>(wstride))
+          count_chunk(t);
+    }
   }
+#else
+  for (std::size_t t = 0; t < nthreads; ++t)
+    count_chunk(t);
+#endif
+  if (!overlap_dup)
+    run_dup_prefix();  // serial fallback (single thread); no-op when !do_hash
+
+  // ---- global read indexing ----
+  // Subsampling flags (do_tile_read / do_kmer_read) are a cheap modulo of the
+  // global read index, computed inline in Phase 2.
+  std::vector<std::size_t> gstart(nthreads + 1, 0);
+  for (std::size_t t = 0; t < nthreads; ++t)
+    gstart[t + 1] = gstart[t] + counts[t];
+  const std::size_t total_reads = gstart[nthreads];
+
+  // Per-record (seqlen, tile) captured during Phase 2 only when tiles are
+  // present, for the serial tile-length reconstruction (needs global order).
+  std::vector<std::vector<std::pair<std::uint32_t, std::uint32_t>>>
+    tilerecs(nthreads);
+
+  // reads [0, fill_boundary) were counted in the prefix; if the cap never
+  // filled, every read was in the prefix (fill_boundary == total_reads).
+  const std::size_t fill_boundary =
+    do_hash ? (dup_continue_storing ? total_reads : dup_seen) : 0;
   // The map never reallocates after the cap (it is reserved to 100k), so this
   // base pointer stays valid for the read-only find()s in the parallel phase.
   const std::size_t nent = do_hash ? master.sequence_count.size() : 0;
