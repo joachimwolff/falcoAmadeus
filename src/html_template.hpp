@@ -212,11 +212,15 @@ button.sidebar-toggle {
   padding:0; margin-right:.5em; flex:0 0 auto; transition:background .15s, transform .15s;
 }
 button.sidebar-toggle:hover { background:var(--brand); color:#fff; transform:scale(1.08); }
-/* Collapsed sidebar: hide the summary panel ONLY. div.main's margin is
-   independent of the sidebar (see the rule above), so the modules and their
-   Plotly charts stay exactly where they are -- centered when there is room --
-   whether the menu is shown or hidden. Toggling never moves the graphics. */
+/* Collapsed sidebar: hide the summary panel, and drop the sidebar reservation
+   from the content's left margin so the freed strip is actually used. The floor
+   only mattered to keep clear of the sidebar; with the sidebar gone the content
+   just centers (or, when the window is too narrow to center, fills the width).
+   On a wide screen this collapsed margin already equals the shown one (both are
+   the centering offset), so the graphics do NOT move; the content only reclaims
+   space on the narrower windows where the reservation was wasting it. */
 body.nav-collapsed div.summary { display:none; }
+body.nav-collapsed div.main { margin-left:max(0px, calc((100% - 1180px) / 2)); }
 /* Center the Plotly modebar icons inside their (hover) background squares. */
 .js-plotly-plot .modebar-btn { display:inline-flex !important; align-items:center; justify-content:center; }
 .js-plotly-plot .modebar-btn svg { vertical-align:middle; display:block; }
