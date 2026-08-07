@@ -24,6 +24,8 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <functional>
+#include <thread>
 #include <unordered_map>
 #ifdef _OPENMP
 #include <omp.h>
@@ -1508,7 +1510,8 @@ parse_record(const char *base, std::size_t size, std::size_t p,
 // memory-mapped uncompressed path and the gz path (which decompresses to RAM).
 static void
 read_chunked_core(FalcoConfig &config, FastqStats &master,
-                  std::size_t nthreads, const char *base, std::size_t size) {
+                  std::size_t nthreads, const char *base, std::size_t size,
+                  std::function<void()> release_input = {}) {
   const std::size_t BUF = FastqStats::SHORT_READ_THRESHOLD;
   // dispatcher-only reader, used for its parsed configuration flags
   ParallelWorker cfg(config, BUF);
@@ -1518,6 +1521,8 @@ read_chunked_core(FalcoConfig &config, FastqStats &master,
     master.num_reads = 0;
     if (tile_ignore)
       config.do_tile = false;
+    if (release_input)
+      release_input();  // still own the (empty) buffer -- release it
     return;
   }
   const bool do_hash = cfg.do_sequence_hash;
@@ -1741,6 +1746,17 @@ read_chunked_core(FalcoConfig &config, FastqStats &master,
     }
   }
 
+  // Phase 2 is done, so the input bytes (mmap / decompressed buffer) are no
+  // longer referenced -- the duplication map owns COPIES of its keys, and the
+  // GC replay, merges and tile reconstruction below read only worker state.
+  // Release the input on a background thread so its munmap/free (a ~80 ms TLB
+  // teardown for a ~1.75 GB region) overlaps that remaining serial work instead
+  // of stalling before the report. Joined before returning so ownership is
+  // clean even if the caller reuses the buffer.
+  std::thread releaser;
+  if (release_input)
+    releaser = std::thread(std::move(release_input));
+
   // ---- GC replay in global read order (exact FP reproduction) ----
   for (std::size_t t = 0; t < nthreads; ++t) {
     for (const GCRecord &gr : gcrec[t]) {
@@ -1882,13 +1898,21 @@ read_chunked_core(FalcoConfig &config, FastqStats &master,
 
   if (tile_ignore)
     config.do_tile = false;
+
+  if (releaser.joinable())
+    releaser.join();
 }
 
 void
 read_uncompressed_chunked(FalcoConfig &config, FastqStats &master,
                           std::size_t nthreads) {
-  PlainBlockReader src(config.filename);
-  read_chunked_core(config, master, nthreads, src.data(), src.size());
+  // Heap-allocated so the munmap can be handed to the background releaser inside
+  // read_chunked_core; the closure runs (and completes) before the core returns.
+  PlainBlockReader *src = new PlainBlockReader(config.filename);
+  const char *data = src->data();
+  const std::size_t sz = src->size();
+  read_chunked_core(config, master, nthreads, data, sz,
+                    [src]() { delete src; });
 }
 
 #if defined(USE_HTS) && defined(USE_LIBDEFLATE)
@@ -2030,8 +2054,8 @@ read_gz_chunked(FalcoConfig &config, FastqStats &master,
     std::size_t total = 0;
     char *out = decompress_bgzf_libdeflate(config.filename, nthreads, total);
     if (out != nullptr) {
-      read_chunked_core(config, master, nthreads, out, total);
-      std::free(out);
+      read_chunked_core(config, master, nthreads, out, total,
+                        [out]() { std::free(out); });
       return;
     }
     // not BGZF (plain gzip) -> fall through to the streaming bgzf reader below
@@ -2084,8 +2108,8 @@ read_gz_chunked(FalcoConfig &config, FastqStats &master,
     total += static_cast<std::size_t>(n);
   }
   bgzf_close(fp);
-  read_chunked_core(config, master, nthreads, buf, total);
-  std::free(buf);
+  read_chunked_core(config, master, nthreads, buf, total,
+                    [buf]() { std::free(buf); });
 #else
   read_gz_parallel(config, master, nthreads);
 #endif
