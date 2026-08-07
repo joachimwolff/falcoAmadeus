@@ -483,7 +483,14 @@ StreamReader::read_sequence_line(FastqStats &stats) {
   adapters_found.reset();
 
   if (do_adapters_slow) {
-    const std::string seq_line_str = cur_char;
+    // cur_char points at the sequence line. In the memory-mapped parallel path
+    // it is terminated by the field separator (newline), NOT a NUL, so building
+    // a std::string directly from it would copy to the next NUL -- i.e. to the
+    // end of the whole file. Bound the search string to the sequence line.
+    std::size_t sl = 0;
+    while (cur_char[sl] != field_separator && cur_char[sl] != '\0')
+      ++sl;
+    const std::string seq_line_str(cur_char, sl);
     for (std::size_t i = 0; i != num_adapters; ++i) {
       const std::size_t adapt_index = seq_line_str.find(adapter_seqs[i], 0);
       if (adapt_index < stats.SHORT_READ_THRESHOLD) {
