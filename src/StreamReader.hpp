@@ -364,6 +364,72 @@ class PlainBlockReader {
   size_t size() const { return static_cast<size_t>(end_ - p_); }
 };
 
+#ifdef USE_HTS
+// A gzip/BGZF line source backed by htslib's BGZF reader, exposing the same
+// getline()/eof() interface as GzBlockDecompressor. htslib decompresses with
+// libdeflate (both external libraries), and for BGZF (bgzip) input it inflates
+// the blocks in parallel across n_threads via bgzf_mt -- so bgzip'd files
+// decompress on multiple cores instead of a single zlib stream. Plain gzip is
+// read as one stream but still with libdeflate. Reads big blocks with
+// bgzf_read and splits lines in place to avoid a per-line allocation.
+class BgzfBlockReader {
+ private:
+  BGZF *fp_ = nullptr;
+  std::vector<char> buf_;
+  size_t pos_ = 0, len_ = 0;
+  bool eof_ = false;
+  bool fill() {
+    const ssize_t n = bgzf_read(fp_, buf_.data(), buf_.size());
+    if (n <= 0) {
+      eof_ = true;
+      pos_ = len_ = 0;
+      return false;
+    }
+    len_ = static_cast<size_t>(n);
+    pos_ = 0;
+    return true;
+  }
+
+ public:
+  BgzfBlockReader(const std::string &path, int n_threads, size_t bufsize) {
+    fp_ = bgzf_open(path.c_str(), "r");
+    if (fp_ == nullptr)
+      throw std::runtime_error("Cannot open gzip FASTQ file : " + path);
+    if (n_threads > 1)
+      bgzf_mt(fp_, n_threads, 256);
+    buf_.resize(bufsize);
+  }
+  ~BgzfBlockReader() {
+    if (fp_ != nullptr)
+      bgzf_close(fp_);
+  }
+  BgzfBlockReader(const BgzfBlockReader &) = delete;
+  BgzfBlockReader &operator=(const BgzfBlockReader &) = delete;
+
+  // Copy one line (up to and including '\n', NUL-terminated) into dst, exactly
+  // like GzBlockDecompressor::getline. Returns bytes written (0 only at end).
+  size_t getline(char *dst, size_t maxlen) {
+    size_t i = 0;
+    const size_t lim = maxlen - 1;
+    while (i < lim) {
+      if (pos_ >= len_ && !fill())
+        break;
+      while (pos_ < len_ && i < lim) {
+        const char c = buf_[pos_++];
+        dst[i++] = c;
+        if (c == '\n') {
+          dst[i] = '\0';
+          return i;
+        }
+      }
+    }
+    dst[i] = '\0';
+    return i;
+  }
+  bool eof() const { return eof_ && pos_ >= len_; }
+};
+#endif  // USE_HTS
+
 /*******************************************************/
 /*************** READ FASTQ GZ RCORD *******************/
 /*******************************************************/
@@ -424,6 +490,12 @@ void read_uncompressed_parallel(FalcoConfig &config, FastqStats &master,
 // single-threaded pass; read_step == 1 only.
 void read_uncompressed_chunked(FalcoConfig &config, FastqStats &master,
                                size_t nthreads);
+
+// Gzip/BGZF driver: decompress the whole file to RAM (BGZF blocks inflated in
+// parallel via htslib bgzf_mt + libdeflate), then parse it with the chunked
+// parallel parser. Byte-identical; read_step == 1 only. Falls back to
+// read_gz_parallel when built without htslib.
+void read_gz_chunked(FalcoConfig &config, FastqStats &master, size_t nthreads);
 
 /*******************************************************/
 /*************** READ SAM RECORD ***********************/

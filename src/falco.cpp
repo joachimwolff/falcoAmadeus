@@ -702,11 +702,12 @@ analyze_and_write(FalcoConfig &falco_config, const std::string &filename,
   else if (falco_config.is_fastq_gz) {
     if (!falco_config.quiet)
       log_process("reading file as gzipped FASTQ format");
-    // multi-threaded parser: background inflate + parallel per-read stats,
-    // byte-identical to single-threaded. Only for read_step == 1; the
-    // subsampling counter logic is left to the serial path otherwise.
+    // multi-threaded parser: parallel (libdeflate/BGZF) decompression to RAM +
+    // chunked parallel parse, byte-identical to single-threaded. Only for
+    // read_step == 1; the subsampling counter logic is left to the serial path
+    // otherwise.
     if (falco_config.threads >= 2 && falco_config.read_step == 1) {
-      read_gz_parallel(falco_config, stats, falco_config.threads);
+      read_gz_chunked(falco_config, stats, falco_config.threads);
     }
     else {
       GzFastqReader in(falco_config, stats.SHORT_READ_THRESHOLD);

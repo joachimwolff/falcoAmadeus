@@ -18,6 +18,7 @@
 #include "StreamReader.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <string>
@@ -1375,6 +1376,14 @@ read_parallel_impl(FalcoConfig &config, FastqStats &master,
 void
 read_gz_parallel(FalcoConfig &config, FastqStats &master,
                  std::size_t nthreads) {
+#ifdef USE_HTS
+  // Decompress via htslib (libdeflate; BGZF blocks in parallel via bgzf_mt),
+  // then parse with the same dispatcher/worker machinery. Byte-identical: the
+  // decompressed bytes are the same as zlib's, so the parsed reads are too.
+  BgzfBlockReader decomp(config.filename, static_cast<int>(nthreads),
+                         (1u << 22));
+  read_parallel_impl(config, master, nthreads, decomp);
+#else
   gzFile gz = gzopen(std::data(config.filename), "r");
   if (gz == Z_NULL)
     throw std::runtime_error("Cannot open gzip FASTQ file : " + config.filename);
@@ -1386,6 +1395,7 @@ read_gz_parallel(FalcoConfig &config, FastqStats &master,
     read_parallel_impl(config, master, nthreads, decomp);
   }
   gzclose_r(gz);
+#endif
 }
 
 void
@@ -1489,13 +1499,12 @@ parse_record(const char *base, std::size_t size, std::size_t p,
 // a short serial prefix that fixes the tracked set, after which the remaining
 // reads are counted in parallel (occurrence counting is commutative). The result
 // is byte-identical to the single-threaded pass. read_step == 1 only.
-void
-read_uncompressed_chunked(FalcoConfig &config, FastqStats &master,
-                          std::size_t nthreads) {
-  PlainBlockReader src(config.filename);
-  const char *const base = src.data();
-  const std::size_t size = src.size();
-
+//
+// The core takes an in-memory (base, size) region so it can serve both the
+// memory-mapped uncompressed path and the gz path (which decompresses to RAM).
+static void
+read_chunked_core(FalcoConfig &config, FastqStats &master,
+                  std::size_t nthreads, const char *base, std::size_t size) {
   const std::size_t BUF = FastqStats::SHORT_READ_THRESHOLD;
   // dispatcher-only reader, used for its parsed configuration flags
   ParallelWorker cfg(config, BUF);
@@ -1831,6 +1840,70 @@ read_uncompressed_chunked(FalcoConfig &config, FastqStats &master,
 
   if (tile_ignore)
     config.do_tile = false;
+}
+
+void
+read_uncompressed_chunked(FalcoConfig &config, FastqStats &master,
+                          std::size_t nthreads) {
+  PlainBlockReader src(config.filename);
+  read_chunked_core(config, master, nthreads, src.data(), src.size());
+}
+
+void
+read_gz_chunked(FalcoConfig &config, FastqStats &master,
+                std::size_t nthreads) {
+#ifdef USE_HTS
+  // Decompress the whole file into RAM -- BGZF blocks are inflated in parallel
+  // across nthreads via bgzf_mt, and htslib uses libdeflate (both external
+  // libraries) -- then parse the decompressed bytes with the chunked parallel
+  // parser. Byte-identical to the serial path (same decompressed bytes).
+  BGZF *fp = bgzf_open(std::data(config.filename), "r");
+  if (fp == nullptr)
+    throw std::runtime_error("Cannot open gzip FASTQ file : " + config.filename);
+  bgzf_mt(fp, static_cast<int>(nthreads), 256);
+  // Read decompressed bytes straight into a raw (unzeroed) buffer -- pre-sized
+  // from a typical FASTQ gz ratio and grown only if exceeded. malloc avoids the
+  // ~2 GB zero-fill a sized std::vector would do before we overwrite it.
+  std::size_t cap =
+    static_cast<std::size_t>(get_file_size(config.filename)) * 5 + (1u << 24);
+  char *buf = static_cast<char *>(std::malloc(cap));
+  if (buf == nullptr) {
+    bgzf_close(fp);
+    throw std::runtime_error("Out of memory decompressing : " + config.filename);
+  }
+  // Fault the destination pages in parallel first. Otherwise the single
+  // bgzf_read thread pays every first-touch page fault serially while writing
+  // ~2 GB, which dominates (bgzf_mt decompresses at ~11 GB/s but the serial
+  // fault-in is far slower). Touching one byte per 4 KiB page across the
+  // threads spreads that kernel work out.
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(nthreads) schedule(static)
+#endif
+  for (std::size_t i = 0; i < cap; i += 4096)
+    buf[i] = 0;
+  const std::size_t STEP = (1u << 24);  // 16 MiB reads keep bgzf_mt pipelined
+  std::size_t total = 0;
+  for (;;) {
+    if (total + STEP > cap) {
+      cap = cap + cap / 2 + STEP;
+      buf = static_cast<char *>(std::realloc(buf, cap));
+      if (buf == nullptr) {
+        bgzf_close(fp);
+        throw std::runtime_error("Out of memory decompressing : " +
+                                 config.filename);
+      }
+    }
+    const ssize_t n = bgzf_read(fp, buf + total, STEP);
+    if (n <= 0)
+      break;
+    total += static_cast<std::size_t>(n);
+  }
+  bgzf_close(fp);
+  read_chunked_core(config, master, nthreads, buf, total);
+  std::free(buf);
+#else
+  read_gz_parallel(config, master, nthreads);
+#endif
 }
 
 /*******************************************************/
