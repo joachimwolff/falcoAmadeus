@@ -92,7 +92,16 @@ div.summary ul li a::before {
 div.summary ul li a.pass::before { background:var(--pass); }
 div.summary ul li a.warn::before { background:var(--warn); }
 div.summary ul li a.fail::before { background:var(--fail); }
-div.main { margin-left:var(--sidebar-w); padding:1.5em 2em 4.5em; max-width:1180px; }
+div.main {
+  /* Center the content when there is room, but never let it slide under the
+     fixed sidebar. margin-left is the page-centering offset, floored at the
+     sidebar width; it does NOT depend on whether the sidebar is shown, so
+     toggling the menu never moves the modules -- on a wide screen they stay
+     centered where they were; on a narrow one they stay clear of the sidebar. */
+  margin-left:max(var(--sidebar-w), calc((100% - 1180px) / 2));
+  margin-right:auto;
+  padding:1.5em 2em 4.5em; max-width:1180px;
+}
 div.module {
   background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
   box-shadow:var(--shadow); padding:1.35em 1.7em 1.6em; margin-bottom:1.5em;
@@ -203,11 +212,10 @@ button.sidebar-toggle {
   padding:0; margin-right:.5em; flex:0 0 auto; transition:background .15s, transform .15s;
 }
 button.sidebar-toggle:hover { background:var(--brand); color:#fff; transform:scale(1.08); }
-/* Collapsed sidebar: hide the summary panel ONLY. div.main keeps its exact
-   left offset and width (from the rule above), so the modules and their Plotly
-   charts never shift or resize when the sidebar is toggled -- hiding it must
-   not make the graphics jump. The freed strip on the left is left empty by
-   design; reclaiming it would move the content and cause exactly that jump. */
+/* Collapsed sidebar: hide the summary panel ONLY. div.main's margin is
+   independent of the sidebar (see the rule above), so the modules and their
+   Plotly charts stay exactly where they are -- centered when there is room --
+   whether the menu is shown or hidden. Toggling never moves the graphics. */
 body.nav-collapsed div.summary { display:none; }
 /* Center the Plotly modebar icons inside their (hover) background squares. */
 .js-plotly-plot .modebar-btn { display:inline-flex !important; align-items:center; justify-content:center; }
