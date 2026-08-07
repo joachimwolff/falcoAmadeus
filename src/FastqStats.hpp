@@ -232,8 +232,13 @@ struct FastqStats {
   DupHashMap sequence_count;
 
   /**************** FUNCTIONS ****************************/
-  // Default constructor that zeros everything
-  FastqStats();
+  // Default constructor that zeros everything. need_kmer controls whether the
+  // large (~65 MB) kmer_count table is allocated: the Kmer Content module is
+  // ignored by default (limits.txt), and when it is off kmer_count is never
+  // written, merged or read, so allocating/zeroing/freeing it -- once per master
+  // plus once per worker thread -- is pure overhead. Left true by default so any
+  // caller that does not thread do_kmer through still gets a safe full table.
+  explicit FastqStats(bool need_kmer = true);
 
   // Allocation of more read positions
   void allocate_new_base(const bool ignore_tile);

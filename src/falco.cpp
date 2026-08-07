@@ -679,7 +679,7 @@ analyze_and_write(FalcoConfig &falco_config, const std::string &filename,
   /****************** END PROCESSING CONFIG *******************/
   if (!falco_config.quiet)
     log_process("Started reading file " + falco_config.filename);
-  FastqStats stats;  // allocate all space to summarize data
+  FastqStats stats(falco_config.do_kmer);  // allocate all space to summarize data
 
   // Initializes a reader given the file format
   if (falco_config.is_sam) {

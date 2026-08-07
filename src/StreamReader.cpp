@@ -1673,7 +1673,7 @@ read_chunked_core(FalcoConfig &config, FastqStats &master,
 #pragma omp parallel for num_threads(nthreads) schedule(static)
 #endif
   for (std::size_t t = 0; t < nthreads; ++t) {
-    wstats[t].reset(new FastqStats());
+    wstats[t].reset(new FastqStats(config.do_kmer));
     ParallelWorker &w = *workers[t];
     FastqStats &ws = *wstats[t];
     const std::size_t n = counts[t];

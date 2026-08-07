@@ -48,7 +48,7 @@ make_gc_models() {
 /******************** FASTQ STATS FUNCTIONS *********************/
 /****************************************************************/
 // Default constructor
-FastqStats::FastqStats() {
+FastqStats::FastqStats(bool need_kmer) {
   lowest_char = std::numeric_limits<char>::max();
   encoding_offset = 0;
 
@@ -73,8 +73,13 @@ FastqStats::FastqStats() {
   position_quality_count.fill(0);
   pos_kmer_count.fill(0);
   pos_adapter_count.fill(0);
-  kmer_count =
-    std::vector<size_t>(SHORT_READ_THRESHOLD * (Constants::kmer_mask + 1), 0);
+  // Only the Kmer Content module touches kmer_count; when it is disabled leave
+  // the table empty (the write sites are guarded by do_kmer, the merge bounds
+  // itself to master.kmer_count.size(), and the module -- hence every read of
+  // kmer_count -- is skipped, so nothing indexes it).
+  if (need_kmer)
+    kmer_count =
+      std::vector<size_t>(SHORT_READ_THRESHOLD * (Constants::kmer_mask + 1), 0);
 }
 
 // Initialize as many gc models as fast bases
