@@ -2107,27 +2107,34 @@ decompress_bgzf_libdeflate(const std::string &path, std::size_t nthreads) {
   // then mmap it read-only so the parse can drop-behind. Fall back to a malloc'd
   // buffer written in place if a temp file cannot be created.
   const int tfd = open_unlinked_temp(path, utotal);
-  char *out = nullptr;
-  if (tfd < 0) {
+  char *out = nullptr;      // the destination the blocks inflate into
+  bool mapped = false;      // true when `out` is a file-backed shared mmap
+  if (tfd >= 0) {
+    // Inflate DIRECTLY into a shared writable mmap of the temp file: each thread
+    // writes its own (contiguous) page range with no inode lock and no scratch
+    // copy, unlike per-block pwrite which serialized on the file's i_rwsem. The
+    // dirty pages live in page cache (written back lazily); drop-behind keeps the
+    // process RSS bounded, and the parse re-reads the same file-backed pages.
+    void *m = mmap(nullptr, utotal, PROT_READ | PROT_WRITE, MAP_SHARED, tfd, 0);
+    if (m != MAP_FAILED) { out = static_cast<char *>(m); mapped = true; }
+  }
+  if (out == nullptr) {     // no temp file (or mmap failed): malloc fallback
     out = static_cast<char *>(std::malloc(utotal));
     if (out == nullptr) {
       munmap(const_cast<unsigned char *>(comp), csize);
+      if (tfd >= 0) close(tfd);
       throw std::runtime_error("Out of memory decompressing : " + path);
     }
   }
   const std::size_t nb = coff.size();
-  std::size_t maxu = 0;
-  for (std::size_t z = 0; z < nb; ++z) maxu = std::max(maxu, ulen[z]);
+  const std::size_t OPGSZ = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
   int ok = 1;
 #ifdef _OPENMP
 #pragma omp parallel num_threads(nthreads)
 #endif
   {
     libdeflate_decompressor *d = libdeflate_alloc_decompressor();
-    // when writing to a temp file each thread inflates into a small scratch
-    // buffer and pwrites it at the block's known offset (no shared big buffer).
-    char *scratch = (tfd >= 0) ? static_cast<char *>(std::malloc(maxu)) : nullptr;
-    if (d == nullptr || (tfd >= 0 && scratch == nullptr)) {
+    if (d == nullptr) {
 #ifdef _OPENMP
 #pragma omp atomic write
 #endif
@@ -2135,7 +2142,8 @@ decompress_bgzf_libdeflate(const std::string &path, std::size_t nthreads) {
     }
     else {
       // Contiguous block range per thread (not dynamic) so each thread consumes
-      // a monotonic compressed span and can drop-behind its pages.
+      // a monotonic compressed span and writes a monotonic uncompressed span,
+      // and can drop-behind both.
 #ifdef _OPENMP
       const std::size_t tid = static_cast<std::size_t>(omp_get_thread_num());
       const std::size_t nth = static_cast<std::size_t>(omp_get_num_threads());
@@ -2144,43 +2152,47 @@ decompress_bgzf_libdeflate(const std::string &path, std::size_t nthreads) {
 #endif
       const std::size_t lo = nb * tid / nth, hi = nb * (tid + 1) / nth;
       std::size_t cdropped = (lo < hi) ? coff[lo] : 0;
+      std::size_t udropped = (lo < hi) ? uoff[lo] : 0;
       for (std::size_t i = lo; i < hi; ++i) {
         std::size_t act = 0;
-        char *dst = (tfd >= 0) ? scratch : (out + uoff[i]);
-        if (libdeflate_gzip_decompress(d, comp + coff[i], clen[i], dst, ulen[i],
-                                       &act) != LIBDEFLATE_SUCCESS ||
-            act != ulen[i] ||
-            (tfd >= 0 &&
-             pwrite(tfd, scratch, ulen[i],
-                    static_cast<off_t>(uoff[i])) != static_cast<ssize_t>(ulen[i]))) {
+        if (libdeflate_gzip_decompress(d, comp + coff[i], clen[i], out + uoff[i],
+                                       ulen[i], &act) != LIBDEFLATE_SUCCESS ||
+            act != ulen[i]) {
 #ifdef _OPENMP
 #pragma omp atomic write
 #endif
           ok = 0;
         }
-        if (coff[i] - cdropped >= (std::size_t(2) << 20)) {  // release consumed
+        if (coff[i] - cdropped >= (std::size_t(2) << 20)) {  // release consumed compressed
           cdrop(cdropped, coff[i]);
           cdropped = coff[i];
+        }
+        // drop-behind the written uncompressed pages (dirty pages persist in the
+        // file's page cache for the parse; keeps decompress RSS bounded).
+        if (mapped && uoff[i] - udropped >= (std::size_t(4) << 20)) {
+          const std::size_t sa = (udropped + OPGSZ - 1) & ~(OPGSZ - 1);
+          const std::size_t sb = uoff[i] & ~(OPGSZ - 1);
+          if (sb > sa) madvise(out + sa, sb - sa, MADV_DONTNEED);
+          udropped = uoff[i];
         }
       }
     }
     if (d) libdeflate_free_decompressor(d);
-    std::free(scratch);
   }
   munmap(const_cast<unsigned char *>(comp), csize);
   if (!ok) {
-    if (tfd >= 0) close(tfd); else std::free(out);
+    if (mapped) munmap(out, utotal);
+    if (tfd >= 0) close(tfd);
+    if (!mapped) std::free(out);
     return result;
   }
   out_size = utotal;
-  if (tfd >= 0) {
-    char *m = static_cast<char *>(
-      mmap(nullptr, utotal, PROT_READ, MAP_PRIVATE, tfd, 0));
-    if (m == MAP_FAILED) { close(tfd); return result; }
-    madvise(m, utotal, MADV_SEQUENTIAL);
-    result.data = m; result.maplen = utotal; result.fd = tfd; result.can_drop = true;
+  if (mapped) {
+    result.data = out; result.maplen = utotal; result.fd = tfd;
+    result.can_drop = true;
   }
   else {
+    if (tfd >= 0) close(tfd);
     result.data = out;  // malloc fallback; can_drop stays false
   }
   return result;
@@ -2194,7 +2206,7 @@ read_gz_chunked(FalcoConfig &config, FastqStats &master,
   // Fast path: parallel BGZF block decompression with libdeflate, then parse.
   {
     GzBuffer g = decompress_bgzf_libdeflate(config.filename, nthreads);
-    if (g.data != nullptr) {
+  if (g.data != nullptr) {
       char *data = g.data;
       const std::size_t maplen = g.maplen;
       const int gfd = g.fd;
