@@ -875,6 +875,11 @@ class BamReader : public StreamReader {
   // [FalcoAmadeus] reused scratch for the ASCII-decoded SEQ (nibbles unpacked
   // once, then fed through the shared base-class sequence engine)
   std::vector<char> decode_buf;
+  // reused scratch for reversed qual of reads longer than the static buffer
+  std::vector<char> qual_rev_scratch;
+  // read_quality_line body on an explicit qual pointer (shared with the
+  // in-place parallel path)
+  void quality_pass(const char *qptr, std::size_t seq_len, FastqStats &stats);
  public:
   BamReader(FalcoConfig &fc, const size_t _buffer_size);
   size_t load();
@@ -894,6 +899,10 @@ class BamReader : public StreamReader {
   // sequence length and reports the parsed tile in tile_cur_out.
   size_t process_record_parallel(const char *rec, uint32_t bs, FastqStats &stats,
                                  GCRecord *gcr, size_t g, size_t &tile_cur_out);
+  // tile-less variant that parses the on-disk record bytes in place (no copy,
+  // no revcomp pass, no writes into the chunk buffer)
+  size_t process_record_parallel_inplace(const char *rec, FastqStats &stats,
+                                         GCRecord *gcr, size_t g);
   // decode just the duplication key (truncated, reverse-complemented) into dst.
   void decode_key(const char *rec, uint32_t bs, char *dst, size_t &keylen);
   ~BamReader();

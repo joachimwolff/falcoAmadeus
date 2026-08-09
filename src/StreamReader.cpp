@@ -530,7 +530,7 @@ StreamReader::postprocess_sequence_line(FastqStats &stats) {
 // so every edge case keeps exact serial semantics. Only used when do_kmer is off.
 // Both back ends are byte-identical by construction (identical integer math).
 #if defined(__x86_64__) || defined(__i386__)
-__attribute__((target("avx512f,avx512bw,avx512vl")))
+__attribute__((target("avx512f,avx512bw,avx512vl,bmi2")))
 void
 StreamReader::seq_simd_chunks(FastqStats &stats, const char *&c, std::size_t &rp,
     std::size_t bsz, char sep, char *buf, std::size_t &gc, std::size_t &nba,
@@ -618,21 +618,57 @@ StreamReader::seq_simd_chunks(FastqStats &stats, const char *&c, std::size_t &rp
           (static_cast<std::size_t>(buf[i] >> 1) & 3);
       nb += (nb != asz);
     }
-    // steady state: window always full -> no nba branch in the hot loop
-    for (; i < rp; ++i) {
-      k = (k << Constants::bit_shift_base) |
-          (static_cast<std::size_t>(buf[i] >> 1) & 3);
-      if (adap) {
-        k &= amask;
-        const std::size_t bmb = k & bmask;
+    if (adap && i < rp) {  // empty region must leave k byte-exact (unmasked)
+      // Steady state, chain-free: the serial recurrence k = ((k<<2)|code)&mask
+      // costs ~3 dependent cycles per base. Instead refill 8 codes at once
+      // (bswap orders the newest base lowest, pext pulls bits 1..2 of each
+      // ASCII byte, i.e. (ch>>1)&3) and form the window ending at lane j
+      // directly from the pre-group k and the fresh codes:
+      //   window_j = ((k << 2*(j+1)) | (g >> 2*(7-j))) & amask
+      // The mask cuts every bit where a masked and an unmasked k history
+      // differ, so each window equals the serial loop's masked value, and the
+      // eight probes are independent immediate-shift expressions out-of-order
+      // hardware can overlap. Probes fire on every steady-state base in
+      // ascending position order: byte-identical trajectory.
+      const auto probe = [&](std::size_t kk, std::size_t pos)
+          __attribute__((always_inline)) {
+        const std::size_t bmb = kk & bmask;
         if (bm[bmb >> 6] & (static_cast<std::uint64_t>(1) << (bmb & 63))) {
           for (std::size_t a = 0; a != nad; ++a)
-            if (k == ad[a] && !adapters_found[a]) {
-              ++stats.pos_adapter_count[(i << Constants::bit_shift_adapter) | a];
+            if (kk == ad[a] && !adapters_found[a]) {
+              ++stats
+                  .pos_adapter_count[(pos << Constants::bit_shift_adapter) | a];
               adapters_found[a] = true;
             }
         }
+      };
+      for (; i + 8 <= rp; i += 8) {
+        std::uint64_t w;
+        std::memcpy(&w, buf + i, 8);
+        const std::uint64_t g =
+            _pext_u64(__builtin_bswap64(w), 0x0606060606060606ULL);
+        probe(((k << 2) | (g >> 14)) & amask, i);
+        probe(((k << 4) | (g >> 12)) & amask, i + 1);
+        probe(((k << 6) | (g >> 10)) & amask, i + 2);
+        probe(((k << 8) | (g >> 8)) & amask, i + 3);
+        probe(((k << 10) | (g >> 6)) & amask, i + 4);
+        probe(((k << 12) | (g >> 4)) & amask, i + 5);
+        probe(((k << 14) | (g >> 2)) & amask, i + 6);
+        probe(((k << 16) | g) & amask, i + 7);
+        k = (k << 16) | g;
       }
+      // remaining < 8 bases: original masked chain
+      for (; i < rp; ++i) {
+        k = ((k << Constants::bit_shift_base) |
+             (static_cast<std::size_t>(buf[i] >> 1) & 3)) & amask;
+        probe(k, i);
+      }
+      k &= amask;  // the serial loop leaves k masked after its last probe
+    }
+    else {
+      for (; i < rp; ++i)
+        k = (k << Constants::bit_shift_base) |
+            (static_cast<std::size_t>(buf[i] >> 1) & 3);
     }
     kmer = k;
     nba = nb;
@@ -851,8 +887,8 @@ StreamReader::read_sequence_line(FastqStats &stats) {
   std::size_t next_trunc = next_truncation;  // 100 on entry
   const char sep = field_separator;
 #if defined(__x86_64__) || defined(__i386__)
-  static const bool fa_simd =
-      __builtin_cpu_supports("avx512bw") && !std::getenv("FA_NOSIMD");
+  static const bool fa_simd = __builtin_cpu_supports("avx512bw") &&
+      __builtin_cpu_supports("bmi2") && !std::getenv("FA_NOSIMD");
 #elif defined(__aarch64__)
   static const bool fa_simd = !std::getenv("FA_NOSIMD");  // NEON baseline
 #else
@@ -3522,6 +3558,56 @@ bam_decode_simd(const std::uint8_t *pk, std::size_t half, char *db) {
 }
 #endif
 
+// seq_nt16_str composed with the nibble complement. The complement of a 4-bit
+// base mask is its bit reversal (A=1<->T=8, C=2<->G=4, ambiguity codes
+// follow), so rc_str[nib] == seq_nt16_str[bitrev4(nib)]. Decoding base
+// L-1-j of the packed SEQ through this table yields exactly the byte the old
+// revcomp-in-place pass + forward decode produced at position j.
+static const char seq_nt16_rc_str[17] = "=TGKCYSBAWRDMHVN";
+
+// Reverse-complement decode: output j is base L-1-j complemented. Consumes the
+// packed input back-to-front, 32 bases per iteration; the input parity (L even
+// vs odd) decides whether a block starts on a byte boundary or needs a one-
+// nibble shift, and is constant per read. Tail (< 32 bases) is scalar.
+#if defined(__x86_64__) || defined(__i386__)
+__attribute__((target("ssse3"))) static void
+bam_decode_rc_simd(const std::uint8_t *pk, std::size_t L, char *db) {
+  const __m128i tbl = _mm_loadu_si128(
+      reinterpret_cast<const __m128i *>(seq_nt16_rc_str));
+  const __m128i m15 = _mm_set1_epi8(0x0f);
+  const __m128i rev =
+      _mm_set_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+  std::size_t j = 0;
+  for (; j + 32 <= L; j += 32) {
+    const std::size_t s = L - 32 - j;  // lowest input base of this block
+    __m128i v;
+    if ((L & 1) == 0) {  // s even: block starts on a byte boundary
+      v = _mm_loadu_si128(reinterpret_cast<const __m128i *>(pk + (s >> 1)));
+    }
+    else {  // s odd (>= 1): shift the packed stream by one nibble
+      const std::uint8_t *p0 = pk + ((s - 1) >> 1);
+      const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i *>(p0));
+      const __m128i b2 =
+          _mm_loadu_si128(reinterpret_cast<const __m128i *>(p0 + 1));
+      v = _mm_or_si128(_mm_slli_epi16(_mm_and_si128(a, m15), 4),
+                       _mm_and_si128(_mm_srli_epi16(b2, 4), m15));
+    }
+    const __m128i hi = _mm_and_si128(_mm_srli_epi16(v, 4), m15);
+    const __m128i lo = _mm_and_si128(v, m15);
+    const __m128i hc = _mm_shuffle_epi8(tbl, hi);
+    const __m128i lc = _mm_shuffle_epi8(tbl, lo);
+    const __m128i A = _mm_unpacklo_epi8(hc, lc);  // bases s .. s+15, ascending
+    const __m128i B = _mm_unpackhi_epi8(hc, lc);  // bases s+16 .. s+31
+    _mm_storeu_si128(reinterpret_cast<__m128i *>(db + j),
+                     _mm_shuffle_epi8(B, rev));
+    _mm_storeu_si128(reinterpret_cast<__m128i *>(db + j + 16),
+                     _mm_shuffle_epi8(A, rev));
+  }
+  for (; j < L; ++j)
+    db[j] = seq_nt16_rc_str[bam_seqi(pk, L - 1 - j)];
+}
+#endif
+
 void
 BamReader::read_sequence_line(FastqStats &stats) {
   if (!do_read)
@@ -3573,7 +3659,17 @@ BamReader::read_quality_line(FastqStats &stats) {
     read_fast_forward_line_eof();
     return;
   }
+  quality_pass(cur_char, b->core.l_qseq, stats);
+}
 
+// The body of read_quality_line after its early-outs, operating on an explicit
+// qual pointer so the in-place parallel path can feed it bytes straight from
+// the chunk buffer (the pointer is only written through on the pre-existing
+// slow walking path, which the in-place path never reaches with an unwritable
+// source). Identical statement order to the original.
+void
+BamReader::quality_pass(const char *qptr, std::size_t seq_len,
+                        FastqStats &stats) {
   // reset quality counts
   read_pos = 0;
   cur_quality = 0;
@@ -3586,8 +3682,7 @@ BamReader::read_quality_line(FastqStats &stats) {
     cur_tile_quality = &stats.tile_position_quality[tile_cur];
     cur_tile_count = &stats.tile_position_count[tile_cur];
   }
-
-  const std::size_t seq_len = b->core.l_qseq;
+  cur_char = const_cast<char *>(qptr);
   // [FalcoAmadeus] Fast path for the overwhelmingly common case (no per-tile
   // work, read fits the static buffer): local accumulators, a single
   // lowest_char store, and no dead buffer traffic (the old loop's
@@ -3924,6 +4019,111 @@ BamReader::decode_key(const char *rec, uint32_t bs, char *dst,
     dst[i] = seq_nt16_str[bam_seqi(seq, i)];
 }
 
+// In-place record processing for the fused (tile-less) driver: no bam_load_raw
+// copy, no reverse-complement pass, no qual std::reverse, and no writes into
+// the chunk buffer at all. The sequence decodes straight from the packed
+// on-disk bytes (through the reverse-complement table for reverse-strand
+// records, which produces byte-for-byte the characters the copy+revcomp path
+// decoded), and the quality pass reads the on-disk qual forward or backward.
+// A backward read visits (position rp, qual q[len-1-rp]) -- exactly the pairs
+// the reversed copy produced, in the same order -- so every histogram, sum and
+// min matches the copying path bit-for-bit.
+std::size_t
+BamReader::process_record_parallel_inplace(const char *rec, FastqStats &stats,
+                                           GCRecord *gcr, std::size_t g) {
+  const unsigned char *r = reinterpret_cast<const unsigned char *>(rec);
+  auto rd16 = [&](int o) {
+    return static_cast<uint16_t>(r[o] | (r[o + 1] << 8));
+  };
+  const std::size_t l_qname = r[8];
+  const std::size_t n_cigar = rd16(12);
+  const bool is_rev = (rd16(14) & BAM_FREVERSE) != 0;
+  uint32_t l_qseq;
+  std::memcpy(&l_qseq, r + 16, 4);
+  const std::size_t seq_len = l_qseq;
+  const std::uint8_t *pk = r + 32 + l_qname + 4 * n_cigar;  // packed SEQ
+  const char *qp =
+      reinterpret_cast<const char *>(pk) + ((seq_len + 1) >> 1);  // qual
+
+  do_read = true;  // the fused driver guarantees read_step == 1
+  cur_gc_record = gcr;
+  do_kmer_read = (g % num_reads_for_kmer == 0);
+  do_tile_read = false;  // this path requires tile_ignore
+  tile_cur = 0;
+
+  // ---- sequence: decode once, run the shared base-class engine ----
+  if (decode_buf.size() < seq_len + 64)
+    decode_buf.resize(seq_len + 64);  // slack for the 64B SIMD overread
+  char *const db = decode_buf.data();
+  const std::size_t half = seq_len >> 1;
+#if defined(__x86_64__) || defined(__i386__)
+  static const bool bam_simd =
+      __builtin_cpu_supports("ssse3") && !std::getenv("FA_NOSIMD");
+  if (bam_simd) {
+    if (is_rev)
+      bam_decode_rc_simd(pk, seq_len, db);
+    else
+      bam_decode_simd(pk, half, db);
+  }
+  else
+#endif
+  {
+    if (is_rev) {
+      for (std::size_t j = 0; j < seq_len; ++j)
+        db[j] = seq_nt16_rc_str[bam_seqi(pk, seq_len - 1 - j)];
+    }
+    else {
+      for (std::size_t j = 0; j < half; ++j) {
+        const std::uint8_t by = pk[j];
+        db[2 * j] = seq_nt16_str[by >> 4];
+        db[2 * j + 1] = seq_nt16_str[by & 0xf];
+      }
+      if (seq_len & 1)
+        db[seq_len - 1] = seq_nt16_str[pk[half] >> 4];
+    }
+  }
+#if defined(__x86_64__) || defined(__i386__)
+  if (bam_simd && !is_rev && (seq_len & 1))
+    db[seq_len - 1] = seq_nt16_str[pk[half] >> 4];
+#endif
+  db[seq_len] = field_separator;  // the base engine scans to the separator
+  cur_char = db;
+  StreamReader::read_sequence_line(stats);
+
+  // ---- quality ----
+  if (r[9] == 255)  // missing qual: the copying path only skipped ahead here
+    return seq_len;
+  if (!is_rev) {
+    quality_pass(qp, seq_len, stats);
+  }
+  else if (seq_len <= buffer_size) {
+    // reversed fast path: same (position, value) sequence as the copying path
+    std::size_t cq = 0;
+    char lowest = stats.lowest_char;
+    for (std::size_t rp = 0; rp < seq_len; ++rp) {
+      const std::uint8_t qv = static_cast<std::uint8_t>(qp[seq_len - 1 - rp]);
+      lowest = min8(lowest, static_cast<char>(qv + 33));
+      ++stats.position_quality_count[(rp << Constants::bit_shift_quality) | qv];
+      cq += qv;
+    }
+    stats.lowest_char = lowest;
+    read_pos = seq_len;
+    cur_quality = cq;
+    if (read_pos != 0)
+      ++stats.quality_count[cur_quality / read_pos];
+  }
+  else {
+    // reversed read longer than the static buffer (rare): materialise the
+    // reversed qual and run the ordinary walking pass on it
+    if (qual_rev_scratch.size() < seq_len)
+      qual_rev_scratch.resize(seq_len);
+    for (std::size_t rp = 0; rp < seq_len; ++rp)
+      qual_rev_scratch[rp] = qp[seq_len - 1 - rp];
+    quality_pass(qual_rev_scratch.data(), seq_len, stats);
+  }
+  return seq_len;
+}
+
 // Walk the BAM records: parse the header to find the first record, then follow
 // the block_size prefixes. Returns records_start, or SIZE_MAX on malformed input.
 static std::size_t
@@ -4202,23 +4402,39 @@ read_bam_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads) {
   std::vector<std::size_t> tcount(nthreads, 0);
   std::size_t total = 0;
   leftover.clear();
+  const bool fa_times = std::getenv("FA_TIMES") != nullptr;
+  double t_dc = 0, t_walk = 0, t_parse = 0, t_gc = 0;
+  auto now = [] {
+    return std::chrono::duration<double>(
+             std::chrono::steady_clock::now().time_since_epoch()).count();
+  };
   for (std::size_t c = 0; c < nchunks; ++c) {
     const std::size_t off = leftover.size();
     if (off) std::memcpy(buf, leftover.data(), off);
+    double t0 = fa_times ? now() : 0;
     const std::size_t un = decompress_chunk(c, off);
+    if (fa_times) { t_dc += now() - t0; t0 = now(); }
     if (un == SIZE_MAX) break;
     const std::size_t end = off + un;
     std::size_t q = (c == 0) ? bam_records_start(buf, end) : 0;
     if (q == SIZE_MAX) break;
-    // walk this chunk's complete records; the trailing partial one -> leftover
+    // walk this chunk's complete records; the trailing partial one -> leftover.
+    // Each block_size load feeds the next record's address, so the chain is
+    // bound by cache latency, not bandwidth; a streaming prefetch cursor a few
+    // KB ahead hides it (the walk is sequential, so every prefetched line is
+    // used). Prefetch is a hint: harmless past `end`.
     offs.clear();
+    std::size_t pf = q;
     while (q + 4 <= end) {
+      for (; pf < q + 2048; pf += 64)
+        __builtin_prefetch(buf + pf);
       const std::size_t bsz = rd_bsz(q);
       if (q + 4 + bsz > end) break;
       offs.push_back(q);
       q += 4 + bsz;
     }
     leftover.assign(buf + q, buf + end);
+    if (fa_times) { t_walk += now() - t0; t0 = now(); }
     const std::size_t nrec = offs.size();
     if (nrec == 0) continue;
     // parallel parse: contiguous record sub-range per thread
@@ -4238,10 +4454,8 @@ read_bam_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads) {
       for (std::size_t j = lo; j < hi; ++j) {
         const std::size_t g = total + j;
         const std::size_t p = offs[j];
-        const std::size_t bsz = rd_bsz(p);
-        std::size_t tile_cur = 0;
-        const std::size_t seqlen = w.process_record_parallel(
-          buf + p + 4, static_cast<uint32_t>(bsz), ws, &gc[j - lo], g, tile_cur);
+        const std::size_t seqlen = w.process_record_parallel_inplace(
+          buf + p + 4, ws, &gc[j - lo], g);
         if (count_dup && g >= fill_boundary) {
           const auto it = master.sequence_count.find(
             w.buffer, get_truncate_point(seqlen));
@@ -4250,6 +4464,7 @@ read_bam_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads) {
         }
       }
     }
+    if (fa_times) { t_parse += now() - t0; t0 = now(); }
     // replay this chunk's GC in global read order (threads 0..nth-1)
     for (std::size_t t = 0; t < nthreads; ++t) {
       const std::vector<GCRecord> &gc = gcr[t];
@@ -4264,8 +4479,13 @@ read_bam_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads) {
           ++master.gc_count[gr.a];
       }
     }
+    if (fa_times) t_gc += now() - t0;
     total += nrec;
   }
+  if (fa_times)
+    std::fprintf(stderr,
+                 "[FA_TIMES bam] decompress %.3f walk %.3f parse %.3f gc %.3f "
+                 "(%zu chunks)\n", t_dc, t_walk, t_parse, t_gc, nchunks);
 
   std::vector<std::vector<GCRecord>> empty_gc(nthreads);
   merge_worker_stats(config, master, nthreads, total, wstats, empty_gc, deltas,
