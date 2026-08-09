@@ -1668,6 +1668,42 @@ merge_worker_stats(
 //
 // The core takes an in-memory (base, size) region so it can serve both the
 // memory-mapped uncompressed path and the gz path (which decompresses to RAM).
+// [FalcoAmadeus] The "first 100k unique" duplication prefix, shared by every
+// parallel driver (byte-split and BAM). next_key(p, key, klen, next) decodes the
+// record at p into the hash key and the following record offset, returning false
+// at end of input. The order-sensitive part -- which reads enter the tracked set
+// before the cap, and count_at_limit -- is identical across FASTQ/SAM/BAM; only
+// decoding one key differs, so it lives in the callback.
+template <class NextKey>
+static void
+dup_prefix_scan(FastqStats &master, std::size_t start, NextKey next_key,
+                bool &continue_storing_out, std::size_t &seen_out) {
+  bool continue_storing = true;
+  std::size_t seen = 0, p = start, next = 0, klen = 0;
+  const char *key = nullptr;
+  while (continue_storing && next_key(p, key, klen, next)) {
+    const auto it = master.sequence_count.find(key, klen);
+    if (it == master.sequence_count.end()) {
+      master.sequence_count.emplace(key, klen, 1);
+      master.count_at_limit = seen;
+      ++master.num_unique_seen;
+      if (master.num_unique_seen == Constants::unique_reads_stop_counting) {
+        continue_storing = false;
+        ++seen;
+        break;
+      }
+    }
+    else {
+      ++it->second;
+      master.count_at_limit += continue_storing;
+    }
+    ++seen;
+    p = next;
+  }
+  continue_storing_out = continue_storing;
+  seen_out = seen;
+}
+
 // [FalcoAmadeus] A record-parser POLICY makes read_bytesplit_core format-agnostic
 // for every delimiter-splittable format (FASTQ, gz-FASTQ, SAM): it supplies only
 // what differs -- find a record boundary at an arbitrary offset, count records in
@@ -1832,35 +1868,16 @@ read_bytesplit_core(FalcoConfig &config, FastqStats &master,
   auto run_dup_prefix = [&]() {
     if (!do_hash)
       return;
-    bool continue_storing = true;
-    std::size_t seen = 0;
-    std::size_t p = sync[0];  // first record (0 for FASTQ; past @ header for SAM)
-    while (p < size && continue_storing) {
-      const char *key; std::size_t klen;
-      const std::size_t next = P::dup_key(base, size, p, key, klen);
-      const auto it = master.sequence_count.find(key, klen);
-      if (it == master.sequence_count.end()) {
-        if (continue_storing) {
-          master.sequence_count.emplace(key, klen, 1);
-          master.count_at_limit = seen;
-          ++master.num_unique_seen;
-          if (master.num_unique_seen ==
-              Constants::unique_reads_stop_counting) {
-            continue_storing = false;
-            ++seen;
-            break;
-          }
-        }
-      }
-      else {
-        ++it->second;
-        master.count_at_limit += continue_storing;
-      }
-      ++seen;
-      p = next;
-    }
-    dup_continue_storing = continue_storing;
-    dup_seen = seen;
+    dup_prefix_scan(
+      master, sync[0],
+      [&](std::size_t p, const char *&key, std::size_t &klen,
+          std::size_t &next) -> bool {
+        if (p >= size)
+          return false;
+        next = P::dup_key(base, size, p, key, klen);
+        return true;
+      },
+      dup_continue_storing, dup_seen);
   };
 
   const bool overlap_dup = do_hash && nthreads > 1;
@@ -3020,29 +3037,23 @@ read_bam_chunked(FalcoConfig &config, FastqStats &master,
     bool dup_cont = true; std::size_t dup_seen = 0;
     if (do_hash) {
       BamReader keyer(config, BUF); keyer.bam_worker_init();
-      std::vector<char> key(BUF + 8);
-      std::size_t pp = rec0;
-      while (pp + 4 <= size && dup_cont) {
-        const std::size_t bsz = rd_bsz(pp);
-        if (pp + 4 + bsz > size) break;
-        std::size_t klen = 0;
-        keyer.decode_key(base + pp + 4, static_cast<uint32_t>(bsz),
-                         key.data(), klen);
-        const auto it = master.sequence_count.find(key.data(), klen);
-        if (it == master.sequence_count.end()) {
-          master.sequence_count.emplace(key.data(), klen, 1);
-          master.count_at_limit = dup_seen;
-          ++master.num_unique_seen;
-          if (master.num_unique_seen == Constants::unique_reads_stop_counting) {
-            dup_cont = false; ++dup_seen; break;
-          }
-        }
-        else {
-          ++it->second;
-          master.count_at_limit += dup_cont;
-        }
-        ++dup_seen; pp += 4 + bsz;
-      }
+      std::vector<char> keybuf(BUF + 8);
+      dup_prefix_scan(
+        master, rec0,
+        [&](std::size_t p, const char *&key, std::size_t &klen,
+            std::size_t &next) -> bool {
+          if (p + 4 > size)
+            return false;
+          const std::size_t bsz = rd_bsz(p);
+          if (p + 4 + bsz > size)
+            return false;
+          keyer.decode_key(base + p + 4, static_cast<uint32_t>(bsz),
+                           keybuf.data(), klen);
+          key = keybuf.data();
+          next = p + 4 + bsz;
+          return true;
+        },
+        dup_cont, dup_seen);
     }
     const std::size_t nent = do_hash ? master.sequence_count.size() : 0;
     const auto mbegin = master.sequence_count.begin();
