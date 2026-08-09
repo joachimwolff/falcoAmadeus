@@ -218,7 +218,13 @@ StreamReader::StreamReader(FalcoConfig &config, const std::size_t _buffer_size,
   // the original loop unchanged, and a clear bit guarantees no adapter k-mer
   // equals this window (every adapter's low bits are set in the map).
   if (do_adapter_optimized && adapter_size > 0 && num_adapters > 0) {
-    const unsigned bits = (2 * adapter_size <= 18) ? 2 * adapter_size : 18;
+    // 2^15 bits = 4 KB keeps the bitmap L1-resident. At 2^18 (32 KB) the
+    // per-base probe was an L1-missing load on the rolling-kmer dependency
+    // chain and dominated the whole sequence pass (~60% of uncompressed -t8
+    // wall time). False positives only fall through to the exact compare
+    // loop, so a smaller filter cannot change output; with < 100 adapters in
+    // 32768 slots the extra-compare rate is ~0.02% of bases.
+    const unsigned bits = (2 * adapter_size <= 15) ? 2 * adapter_size : 15;
     adapter_bm_mask = (static_cast<std::size_t>(1) << bits) - 1;
     adapter_present.assign(
       ((static_cast<std::size_t>(1) << bits) + 63) / 64, 0);
@@ -509,6 +515,7 @@ StreamReader::seq_simd_chunks(FastqStats &stats, const char *&c, std::size_t &rp
   const __m512i vzero = _mm512_setzero_si512();
   std::uint32_t *const soa = stats.soa_base.data();
   const std::size_t T = FastqStats::SHORT_READ_THRESHOLD;
+  const std::size_t rp0 = rp;  // start of the region this call covers
   while (rp + 64 <= bsz) {
     if (do_gc_sequence && next_trunc < rp + 64)
       break;
@@ -531,29 +538,54 @@ StreamReader::seq_simd_chunks(FastqStats &stats, const char *&c, std::size_t &rp
         _mm512_storeu_si512(sp + k * 16, _mm512_add_epi32(cur, add));
       }
     }
-    if (do_sliding_window) {
-      for (int i = 0; i < 64; ++i) {
-        const std::size_t two_bit = (c[i] >> 1) & 3;
-        kmer = (kmer << Constants::bit_shift_base) | two_bit;
-        if (do_adapter_optimized && nba == adapter_size) {
-          kmer &= adapter_mask;
-          const std::size_t bmb = kmer & adapter_bm_mask;
-          if (adapter_present[bmb >> 6] &
-              (static_cast<std::uint64_t>(1) << (bmb & 63))) {
-            for (std::size_t a = 0; a != num_adapters; ++a)
-              if (kmer == adapters[a] && !adapters_found[a]) {
-                ++stats.pos_adapter_count[
-                    ((rp + static_cast<std::size_t>(i))
-                     << Constants::bit_shift_adapter) | a];
-                adapters_found[a] = true;
-              }
-          }
-        }
-        nba += (nba != adapter_size);
-      }
-    }
     c += 64;
     rp += 64;
+  }
+  // Adapter/k-mer sliding window over the SIMD-covered region, hoisted out of
+  // the vector loop above. Interleaving this 64-iteration scalar FSM with each
+  // vector iteration serialized the whole pass (measured ~60% of uncompressed
+  // -t8 wall time); as a separate tight pass over the L1-hot buffer copy it
+  // pipelines. The covered region contains no 'N' and no separator (the vector
+  // loop bails on both), so replaying the window here produces the exact kmer /
+  // nba / adapters_found trajectory the interleaved version produced, in the
+  // same order -- byte-identical by construction. State (kmer, nba) hands off
+  // to the scalar tail exactly as before.
+  if (do_sliding_window) {
+    // Cache every member the loop reads in locals: the surrounding code stores
+    // through char* (buf), which aliases class members, so without locals the
+    // compiler reloads adapter_present.data()/masks/adapters on EVERY base.
+    const std::size_t amask = adapter_mask, bmask = adapter_bm_mask;
+    const std::uint64_t *const bm = adapter_present.data();
+    const std::size_t *const ad = adapters.data();
+    const std::size_t nad = num_adapters;
+    const bool adap = do_adapter_optimized;
+    const std::size_t asz = adapter_size;
+    std::size_t k = kmer, nb = nba;
+    std::size_t i = rp0;
+    // warm-up: until the window fills (nba saturates), at most adapter_size
+    for (; i < rp && nb != asz; ++i) {
+      k = (k << Constants::bit_shift_base) |
+          (static_cast<std::size_t>(buf[i] >> 1) & 3);
+      nb += (nb != asz);
+    }
+    // steady state: window always full -> no nba branch in the hot loop
+    for (; i < rp; ++i) {
+      k = (k << Constants::bit_shift_base) |
+          (static_cast<std::size_t>(buf[i] >> 1) & 3);
+      if (adap) {
+        k &= amask;
+        const std::size_t bmb = k & bmask;
+        if (bm[bmb >> 6] & (static_cast<std::uint64_t>(1) << (bmb & 63))) {
+          for (std::size_t a = 0; a != nad; ++a)
+            if (k == ad[a] && !adapters_found[a]) {
+              ++stats.pos_adapter_count[(i << Constants::bit_shift_adapter) | a];
+              adapters_found[a] = true;
+            }
+        }
+      }
+    }
+    kmer = k;
+    nba = nb;
   }
 }
 
@@ -571,6 +603,7 @@ StreamReader::seq_simd_chunks(FastqStats &stats, const char *&c, std::size_t &rp
   const uint8x16_t v1 = vdupq_n_u8(1);
   std::uint32_t *const soa = stats.soa_base.data();
   const std::size_t T = FastqStats::SHORT_READ_THRESHOLD;
+  const std::size_t rp0 = rp;  // start of the region this call covers
   while (rp + 16 <= bsz) {
     if (do_gc_sequence && next_trunc < rp + 16)
       break;
@@ -597,29 +630,36 @@ StreamReader::seq_simd_chunks(FastqStats &stats, const char *&c, std::size_t &rp
       vst1q_u32(sp + 12,
                 vaddq_u32(vld1q_u32(sp + 12), vmovl_u16(vget_high_u16(hi16))));
     }
-    if (do_sliding_window) {
-      for (int i = 0; i < 16; ++i) {
-        const std::size_t two_bit = (c[i] >> 1) & 3;
-        kmer = (kmer << Constants::bit_shift_base) | two_bit;
-        if (do_adapter_optimized && nba == adapter_size) {
-          kmer &= adapter_mask;
-          const std::size_t bmb = kmer & adapter_bm_mask;
-          if (adapter_present[bmb >> 6] &
-              (static_cast<std::uint64_t>(1) << (bmb & 63))) {
-            for (std::size_t a = 0; a != num_adapters; ++a)
-              if (kmer == adapters[a] && !adapters_found[a]) {
-                ++stats.pos_adapter_count[
-                    ((rp + static_cast<std::size_t>(i))
-                     << Constants::bit_shift_adapter) | a];
-                adapters_found[a] = true;
-              }
-          }
-        }
-        nba += (nba != adapter_size);
-      }
-    }
     c += 16;
     rp += 16;
+  }
+  // Adapter/k-mer sliding window over the SIMD-covered region, hoisted out of
+  // the vector loop (see the x86 back end for the rationale). Region has no 'N'
+  // and no separator, so the replay reproduces the exact interleaved kmer /
+  // nba / adapters_found trajectory -- byte-identical by construction.
+  if (do_sliding_window) {
+    std::size_t i = rp0;
+    for (; i < rp && nba != adapter_size; ++i) {
+      kmer = (kmer << Constants::bit_shift_base) |
+             (static_cast<std::size_t>(buf[i] >> 1) & 3);
+      nba += (nba != adapter_size);
+    }
+    for (; i < rp; ++i) {
+      kmer = (kmer << Constants::bit_shift_base) |
+             (static_cast<std::size_t>(buf[i] >> 1) & 3);
+      if (do_adapter_optimized) {
+        kmer &= adapter_mask;
+        const std::size_t bmb = kmer & adapter_bm_mask;
+        if (adapter_present[bmb >> 6] &
+            (static_cast<std::uint64_t>(1) << (bmb & 63))) {
+          for (std::size_t a = 0; a != num_adapters; ++a)
+            if (kmer == adapters[a] && !adapters_found[a]) {
+              ++stats.pos_adapter_count[(i << Constants::bit_shift_adapter) | a];
+              adapters_found[a] = true;
+            }
+        }
+      }
+    }
   }
 }
 

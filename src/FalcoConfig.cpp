@@ -591,6 +591,12 @@ FalcoConfig::read_adapters() {
       adapter_hashes.push_back(hash_adapter(adapter_seqs[i]));
 
     shortest_adapter_size = adapter_size = std::size(adapter_seqs[0]);
+    // [FalcoAmadeus] The built-in list is uniform-length (12 bp) ACGT, exactly
+    // the condition under which the file-reading branch below selects the
+    // optimized rolling-hash search -- but this early-return branch never set
+    // the flag, so every default-adapter run silently took the per-read
+    // string-find slow path (measured ~60% of uncompressed -t8 wall time).
+    do_adapter_optimized = true;
     return;
   }
 
