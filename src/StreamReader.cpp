@@ -1402,12 +1402,23 @@ read_parallel_impl(FalcoConfig &config, FastqStats &master,
   std::vector<ParRec> recs;
   std::vector<GCRecord> gcrec;
 
+  // Deferred-duplication state. The dispatcher hashes only the serial "first
+  // 100k unique" prefix; once the cap fills, occurrence counting is commutative
+  // and handed to the parallel workers (per-thread deltas), which was the
+  // dominant serial cost on this path. fill_boundary is the global read index
+  // where the cap filled; nent==0 means deferral is still inactive.
+  std::vector<std::vector<std::size_t>> deltas(nthreads);
+  std::size_t fill_boundary = SIZE_MAX;
+  std::size_t nent = 0;
+  auto dmbegin = master.sequence_count.begin();
+
   {
     bool eof = false;
     while (!eof) {
       // ---- serial dispatch: stage up to CHUNK reads ----
       arena.clear();
       recs.clear();
+      const std::size_t chunk_g0 = master.num_reads;  // global index of read 0
       while (recs.size() < CHUNK) {
         const std::size_t hlen = decomp.getline(lbp, lbsz);  // header
         if (hlen == 0 && decomp.eof()) {
@@ -1431,23 +1442,25 @@ read_parallel_impl(FalcoConfig &config, FastqStats &master,
         if (seqlen > 0 && lbp[seqlen - 1] == '\n')
           --seqlen;
 
-        // duplication counting (serial, in read order -> identical map state)
-        if (do_hash) {
+        // duplication: serial "first 100k unique" prefix only (order-dependent).
+        // After the cap fills, the dispatcher stops hashing and the workers tally
+        // occurrences in parallel against the now-frozen map (deferred below).
+        if (do_hash && continue_storing) {
           dup_key.assign(lbp, get_truncate_point(seqlen));
           const auto it = master.sequence_count.find(dup_key);
           if (it == master.sequence_count.end()) {
-            if (continue_storing) {
-              master.sequence_count.emplace(dup_key, 1);
-              master.count_at_limit = master.num_reads;
-              ++master.num_unique_seen;
-              if (master.num_unique_seen ==
-                  Constants::unique_reads_stop_counting)
-                continue_storing = false;
+            master.sequence_count.emplace(dup_key, 1);
+            master.count_at_limit = master.num_reads;
+            ++master.num_unique_seen;
+            if (master.num_unique_seen ==
+                Constants::unique_reads_stop_counting) {
+              continue_storing = false;
+              fill_boundary = master.num_reads + 1;  // next read -> worker-counted
             }
           }
           else {
             ++it->second;
-            master.count_at_limit += continue_storing;
+            ++master.count_at_limit;  // continue_storing is true here
           }
         }
 
@@ -1485,6 +1498,16 @@ read_parallel_impl(FalcoConfig &config, FastqStats &master,
       gcrec.assign(recs.size(), GCRecord{0, 0, 0});
       char *const base = arena.data();
       const std::size_t n = recs.size();
+      // Freeze the map the first time a chunk reaches past the prefix cap, and
+      // size the per-thread deltas; the map never grows again after this.
+      const bool chunk_count_dup =
+        do_hash && fill_boundary != SIZE_MAX && (chunk_g0 + n > fill_boundary);
+      if (chunk_count_dup && nent == 0) {
+        nent = master.sequence_count.size();
+        dmbegin = master.sequence_count.begin();
+        for (std::size_t t = 0; t < nthreads; ++t)
+          deltas[t].assign(nent, 0);
+      }
 #ifdef _OPENMP
 #pragma omp parallel num_threads(nthreads)
 #endif
@@ -1512,6 +1535,15 @@ read_parallel_impl(FalcoConfig &config, FastqStats &master,
           w.tile_cur = r.tile_cur;
           w.force_eof = r.qual_no_nl;
           w.read_quality_line(ws);
+
+          // deferred duplication: post-cap occurrence count against the frozen
+          // map (read-only find; each thread writes only its own delta slot).
+          if (chunk_count_dup && chunk_g0 + i >= fill_boundary) {
+            const auto it = master.sequence_count.find(
+              base + r.seq_off, get_truncate_point(r.seqlen));
+            if (it != master.sequence_count.end())
+              ++deltas[tid][static_cast<std::size_t>(it - dmbegin)];
+          }
         }
       }
 
@@ -1528,6 +1560,12 @@ read_parallel_impl(FalcoConfig &config, FastqStats &master,
       }
     }
   }
+
+  // ---- merge deferred duplication occurrence counts into the frozen map ----
+  if (nent > 0)
+    for (std::size_t t = 0; t < nthreads; ++t)
+      for (std::size_t s = 0; s < nent; ++s)
+        (dmbegin + s)->second += deltas[t][s];
 
   // ---- merge worker accumulators into master ----
   auto add_arr = [](auto &dst, const auto &src) {
