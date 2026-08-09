@@ -1498,6 +1498,160 @@ parse_record(const char *base, std::size_t size, std::size_t p,
   return q ? static_cast<std::size_t>(q - base) + 1 : size;
 }
 
+// [FalcoAmadeus] Combine per-thread worker state into `master`, reproducing the
+// exact single-threaded result. Shared by every parallel driver (FASTQ chunked
+// and BAM chunked) since they all produce the same per-thread structures:
+//  - gcrec[t]   : GC contributions in each thread's (globally contiguous) order
+//  - deltas[t]  : per-thread duplication occurrence deltas (post-cap)
+//  - tilerecs[t]: (seqlen, tile) per read for the tile-length reconstruction
+//  - gstart[t]  : global index of thread t's first read
+// The GC replay walks threads in order so the double additions land in global
+// read order (non-associative FP -> byte-identical).
+static void
+merge_worker_stats(
+    FalcoConfig &config, FastqStats &master, std::size_t nthreads,
+    std::size_t total_reads,
+    std::vector<std::unique_ptr<FastqStats>> &wstats,
+    std::vector<std::vector<GCRecord>> &gcrec,
+    std::vector<std::vector<std::size_t>> &deltas,
+    std::vector<std::vector<std::pair<std::uint32_t, std::uint32_t>>> &tilerecs,
+    std::vector<std::size_t> &gstart, bool count_dup, bool tile_ignore) {
+  // ---- GC replay in global read order (exact FP reproduction) ----
+  for (std::size_t t = 0; t < nthreads; ++t) {
+    for (const GCRecord &gr : gcrec[t]) {
+      if (gr.kind == 1) {
+        for (const auto &v : master.gc_models[gr.a].models[gr.b])
+          master.gc_count[v.percent] += v.increment;
+      }
+      else if (gr.kind == 2) {
+        ++master.gc_count[gr.a];  // a = percent bin (kind 2)
+      }
+    }
+  }
+
+  // ---- merge per-thread duplication deltas into the map ----
+  const std::size_t nent = master.sequence_count.size();
+  const auto mbegin = master.sequence_count.begin();
+  if (count_dup) {
+    for (std::size_t t = 0; t < nthreads; ++t) {
+      if (deltas[t].empty())
+        continue;
+      for (std::size_t i = 0; i < nent; ++i)
+        (mbegin + i)->second += deltas[t][i];
+    }
+  }
+  master.num_reads = total_reads;
+
+  // ---- merge worker accumulators into master (kmer bounded to max read len) ----
+  std::size_t merge_max_rl = 0;
+  for (std::size_t t = 0; t < nthreads; ++t)
+    merge_max_rl = std::max(merge_max_rl, wstats[t]->max_read_length);
+  {
+    const std::size_t nk = std::min(
+      master.kmer_count.size(),
+      (merge_max_rl + 1) << Constants::bit_shift_kmer);
+    std::size_t *const mk = master.kmer_count.data();
+#ifdef _OPENMP
+#pragma omp parallel num_threads(nthreads)
+#endif
+    {
+#ifdef _OPENMP
+      const int tid = omp_get_thread_num();
+      const int nth = omp_get_num_threads();
+      const std::size_t lo = nk * tid / nth;
+      const std::size_t hi = nk * (tid + 1) / nth;
+#else
+      const std::size_t lo = 0, hi = nk;
+#endif
+      for (std::size_t t = 0; t < nthreads; ++t) {
+        const std::size_t *const wk = wstats[t]->kmer_count.data();
+        for (std::size_t i = lo; i < hi; ++i)
+          mk[i] += wk[i];
+      }
+    }
+  }
+  auto add_arr = [](auto &dst, const auto &src) {
+    for (std::size_t i = 0; i < dst.size(); ++i)
+      dst[i] += src[i];
+  };
+  auto add_vec = [](std::vector<std::size_t> &dst,
+                    const std::vector<std::size_t> &src) {
+    if (dst.size() < src.size())
+      dst.resize(src.size(), 0);
+    for (std::size_t i = 0; i < src.size(); ++i)
+      dst[i] += src[i];
+  };
+  for (std::size_t t = 0; t < nthreads; ++t) {
+    FastqStats &ws = *wstats[t];
+    add_arr(master.base_count, ws.base_count);
+    add_arr(master.n_base_count, ws.n_base_count);
+    add_arr(master.position_quality_count, ws.position_quality_count);
+    add_arr(master.quality_count, ws.quality_count);
+    add_arr(master.read_length_freq, ws.read_length_freq);
+    add_arr(master.pos_kmer_count, ws.pos_kmer_count);
+    add_arr(master.pos_adapter_count, ws.pos_adapter_count);
+    master.total_bases += ws.total_bases;
+    master.total_gc += ws.total_gc;
+    master.empty_reads += ws.empty_reads;
+    master.max_read_length =
+      std::max(master.max_read_length, ws.max_read_length);
+    master.lowest_char = std::min(master.lowest_char, ws.lowest_char);
+    add_vec(master.long_base_count, ws.long_base_count);
+    add_vec(master.long_n_base_count, ws.long_n_base_count);
+    add_vec(master.long_position_quality_count, ws.long_position_quality_count);
+    add_vec(master.long_read_length_freq, ws.long_read_length_freq);
+    master.num_extra_bases = std::max(master.num_extra_bases, ws.num_extra_bases);
+  }
+
+  // ---- tile maps: reconstruct lengths in global read order, then sum ----
+  if (!tile_ignore) {
+    std::unordered_map<std::size_t, std::size_t> tile_len;
+    std::size_t max_len = 0;
+    for (std::size_t t = 0; t < nthreads; ++t) {
+      const std::size_t g0 = gstart[t];
+      const std::vector<std::pair<std::uint32_t, std::uint32_t>> &recs =
+        tilerecs[t];
+      for (std::size_t j = 0; j < recs.size(); ++j) {
+        const std::size_t seqlen = recs[j].first;
+        const std::size_t tile_cur = recs[j].second;
+        const bool do_tile_read =
+          (g0 + j) % StreamReader::num_reads_for_tile == 0;
+        if (do_tile_read) {
+          if (tile_len.find(tile_cur) == tile_len.end())
+            tile_len[tile_cur] = max_len;  // length at first sight
+          if (tile_cur != 0)
+            tile_len[tile_cur] = std::max(tile_len[tile_cur], seqlen);
+        }
+        max_len = std::max(max_len, seqlen);
+      }
+    }
+    for (const auto &kv : tile_len) {
+      master.tile_position_quality[kv.first] =
+        std::vector<double>(kv.second, 0.0);
+      master.tile_position_count[kv.first] =
+        std::vector<std::size_t>(kv.second, 0);
+    }
+    for (std::size_t t = 0; t < nthreads; ++t) {
+      for (const auto &kv : wstats[t]->tile_position_quality) {
+        auto &dst = master.tile_position_quality[kv.first];
+        const auto &s = kv.second;
+        const std::size_t lim = std::min(s.size(), dst.size());
+        for (std::size_t i = 0; i < lim; ++i)
+          dst[i] += s[i];
+      }
+      for (const auto &kv : wstats[t]->tile_position_count) {
+        auto &dst = master.tile_position_count[kv.first];
+        const auto &s = kv.second;
+        const std::size_t lim = std::min(s.size(), dst.size());
+        for (std::size_t i = 0; i < lim; ++i)
+          dst[i] += s[i];
+      }
+    }
+  }
+  if (tile_ignore)
+    config.do_tile = false;
+}
+
 // Fully parallel uncompressed-FASTQ driver. The file is memory-mapped and split
 // into one contiguous byte range per thread; each thread syncs to a record
 // boundary and parses its range in place (zero-copy), accumulating the per-base
@@ -1792,147 +1946,8 @@ read_chunked_core(FalcoConfig &config, FastqStats &master,
   if (release_input)
     releaser = std::thread(std::move(release_input));
 
-  // ---- GC replay in global read order (exact FP reproduction) ----
-  for (std::size_t t = 0; t < nthreads; ++t) {
-    for (const GCRecord &gr : gcrec[t]) {
-      if (gr.kind == 1) {
-        for (const auto &v : master.gc_models[gr.a].models[gr.b])
-          master.gc_count[v.percent] += v.increment;
-      }
-      else if (gr.kind == 2) {
-        ++master.gc_count[gr.a];  // a = percent bin (kind 2)
-      }
-    }
-  }
-
-  // ---- merge per-thread duplication deltas into the map ----
-  if (count_dup) {
-    for (std::size_t t = 0; t < nthreads; ++t) {
-      if (deltas[t].empty())
-        continue;
-      for (std::size_t i = 0; i < nent; ++i)
-        (mbegin + i)->second += deltas[t][i];
-    }
-  }
-  master.num_reads = total_reads;
-
-  // ---- merge worker accumulators into master ----
-  // kmer_count is sized for the 500 bp maximum but is indexed by read position
-  // (rp << bit_shift_kmer | kmer); positions beyond the longest read are never
-  // written and stay zero in every worker, so only the first
-  // max_read_length * (kmer_mask+1) entries can be non-zero. Bounding the merge
-  // to that skips summing the (typically ~85%) all-zero tail. It is merged by
-  // index-partitioned slices in parallel (each thread owns a contiguous range,
-  // reading every worker's slice sequentially).
-  std::size_t merge_max_rl = 0;
-  for (std::size_t t = 0; t < nthreads; ++t)
-    merge_max_rl = std::max(merge_max_rl, wstats[t]->max_read_length);
-  {
-    const std::size_t nk = std::min(
-      master.kmer_count.size(),
-      (merge_max_rl + 1) << Constants::bit_shift_kmer);
-    std::size_t *const mk = master.kmer_count.data();
-#ifdef _OPENMP
-#pragma omp parallel num_threads(nthreads)
-#endif
-    {
-#ifdef _OPENMP
-      const int tid = omp_get_thread_num();
-      const int nth = omp_get_num_threads();
-      const std::size_t lo = nk * tid / nth;
-      const std::size_t hi = nk * (tid + 1) / nth;
-#else
-      const std::size_t lo = 0, hi = nk;
-#endif
-      for (std::size_t t = 0; t < nthreads; ++t) {
-        const std::size_t *const wk = wstats[t]->kmer_count.data();
-        for (std::size_t i = lo; i < hi; ++i)
-          mk[i] += wk[i];
-      }
-    }
-  }
-  auto add_arr = [](auto &dst, const auto &src) {
-    for (std::size_t i = 0; i < dst.size(); ++i)
-      dst[i] += src[i];
-  };
-  auto add_vec = [](std::vector<std::size_t> &dst,
-                    const std::vector<std::size_t> &src) {
-    if (dst.size() < src.size())
-      dst.resize(src.size(), 0);
-    for (std::size_t i = 0; i < src.size(); ++i)
-      dst[i] += src[i];
-  };
-  for (std::size_t t = 0; t < nthreads; ++t) {
-    FastqStats &ws = *wstats[t];
-    add_arr(master.base_count, ws.base_count);
-    add_arr(master.n_base_count, ws.n_base_count);
-    add_arr(master.position_quality_count, ws.position_quality_count);
-    add_arr(master.quality_count, ws.quality_count);
-    add_arr(master.read_length_freq, ws.read_length_freq);
-    add_arr(master.pos_kmer_count, ws.pos_kmer_count);
-    add_arr(master.pos_adapter_count, ws.pos_adapter_count);
-    master.total_bases += ws.total_bases;
-    master.total_gc += ws.total_gc;
-    master.empty_reads += ws.empty_reads;
-    master.max_read_length =
-      std::max(master.max_read_length, ws.max_read_length);
-    master.lowest_char = std::min(master.lowest_char, ws.lowest_char);
-    add_vec(master.long_base_count, ws.long_base_count);
-    add_vec(master.long_n_base_count, ws.long_n_base_count);
-    add_vec(master.long_position_quality_count, ws.long_position_quality_count);
-    add_vec(master.long_read_length_freq, ws.long_read_length_freq);
-    master.num_extra_bases = std::max(master.num_extra_bases, ws.num_extra_bases);
-  }
-
-  // tile maps: reconstruct master vector lengths in global read order (mirrors
-  // read_parallel_impl's dispatcher bookkeeping), then sum the worker maps
-  if (!tile_ignore) {
-    std::unordered_map<std::size_t, std::size_t> tile_len;
-    std::size_t max_len = 0;
-    for (std::size_t t = 0; t < nthreads; ++t) {
-      const std::size_t g0 = gstart[t];
-      const std::vector<std::pair<std::uint32_t, std::uint32_t>> &recs =
-        tilerecs[t];
-      for (std::size_t j = 0; j < recs.size(); ++j) {
-        const std::size_t seqlen = recs[j].first;
-        const std::size_t tile_cur = recs[j].second;
-        const bool do_tile_read =
-          (g0 + j) % StreamReader::num_reads_for_tile == 0;
-        if (do_tile_read) {
-          if (tile_len.find(tile_cur) == tile_len.end())
-            tile_len[tile_cur] = max_len;  // length at first sight
-          if (tile_cur != 0)
-            tile_len[tile_cur] = std::max(tile_len[tile_cur], seqlen);
-        }
-        max_len = std::max(max_len, seqlen);
-      }
-    }
-    for (const auto &kv : tile_len) {
-      master.tile_position_quality[kv.first] =
-        std::vector<double>(kv.second, 0.0);
-      master.tile_position_count[kv.first] =
-        std::vector<std::size_t>(kv.second, 0);
-    }
-    for (std::size_t t = 0; t < nthreads; ++t) {
-      for (const auto &kv : wstats[t]->tile_position_quality) {
-        auto &dst = master.tile_position_quality[kv.first];
-        const auto &s = kv.second;
-        const std::size_t lim = std::min(s.size(), dst.size());
-        for (std::size_t i = 0; i < lim; ++i)
-          dst[i] += s[i];
-      }
-      for (const auto &kv : wstats[t]->tile_position_count) {
-        auto &dst = master.tile_position_count[kv.first];
-        const auto &s = kv.second;
-        const std::size_t lim = std::min(s.size(), dst.size());
-        for (std::size_t i = 0; i < lim; ++i)
-          dst[i] += s[i];
-      }
-    }
-  }
-
-  if (tile_ignore)
-    config.do_tile = false;
+  merge_worker_stats(config, master, nthreads, total_reads, wstats,
+                     gcrec, deltas, tilerecs, gstart, count_dup, tile_ignore);
 
   if (releaser.joinable())
     releaser.join();
