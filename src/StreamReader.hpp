@@ -220,8 +220,8 @@ class StreamReader{
   inline void skip_separator();  // keep going forward while = separator
   inline void read_tile_line(FastqStats &stats);  // get tile from read name
   inline void read_sequence_line(FastqStats &stats);  // parse sequence
-  // [FalcoAmadeus] AVX-512 fast path for sequence composition (see .cpp).
-  void seq_avx512_chunks(FastqStats &stats, const char *&c, size_t &rp,
+  // [FalcoAmadeus] Portable SIMD fast path (AVX-512 / NEON; see .cpp).
+  void seq_simd_chunks(FastqStats &stats, const char *&c, size_t &rp,
                          size_t bsz, char sep, char *buf, size_t &gc, size_t &nba,
                          size_t &kmer, size_t &next_trunc);
   inline void read_quality_line(FastqStats &stats);  // parse quality
