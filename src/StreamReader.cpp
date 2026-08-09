@@ -1668,14 +1668,90 @@ merge_worker_stats(
 //
 // The core takes an in-memory (base, size) region so it can serve both the
 // memory-mapped uncompressed path and the gz path (which decompresses to RAM).
+// [FalcoAmadeus] A record-parser POLICY makes read_bytesplit_core format-agnostic
+// for every delimiter-splittable format (FASTQ, gz-FASTQ, SAM): it supplies only
+// what differs -- find a record boundary at an arbitrary offset, count records in
+// a range, pull the dup key, decode one record's stats. Everything else (chunking,
+// global read indexing, dup cap, GC replay, tile, merge) lives once in the driver.
+// BAM cannot use this (no delimiter to split on) and keeps its own walk driver.
+struct FastqPolicy {
+  using Worker = ParallelWorker;
+  static std::size_t find_start(const char *base, std::size_t size,
+                                std::size_t from) {
+    return find_record_start(base, size, from);
+  }
+  template <class Drop>
+  static std::size_t count_chunk(const char *base, std::size_t lo,
+                                 std::size_t hi, std::size_t size, Drop drop) {
+    const std::size_t DW = std::size_t(8) << 20;
+    std::size_t nl = 0;
+    for (std::size_t off = lo; off < hi; off += DW) {
+      const std::size_t end = std::min(off + DW, hi);
+      nl += static_cast<std::size_t>(std::count(base + off, base + end, '\n'));
+      drop(off, end);
+    }
+    if (hi == size && base[size - 1] != '\n')
+      ++nl;  // final record has no trailing newline
+    return nl / 4;
+  }
+  static std::size_t dup_key(const char *base, std::size_t size, std::size_t p,
+                             const char *&key, std::size_t &klen) {
+    std::size_t seq_off, seqlen;
+    const std::size_t next = parse_record(base, size, p, seq_off, seqlen);
+    key = base + seq_off;
+    klen = get_truncate_point(seqlen);
+    return next;
+  }
+  static std::size_t parse_one(Worker &w, FastqStats &ws, const char *base,
+                               std::size_t size, std::size_t p, std::size_t g,
+                               GCRecord *gc, bool tile_ignore, bool can_be_last,
+                               std::size_t &seqlen_out, std::size_t &tile_out,
+                               const char *&key_out) {
+    const char *h = static_cast<const char *>(memchr(base + p, '\n', size - p));
+    const std::size_t seq_off = static_cast<std::size_t>(h - base) + 1;
+    std::size_t tile_cur = 0;
+    if (!tile_ignore) {
+      w.cur_char = const_cast<char *>(base + p);
+      w.get_tile_value();
+      tile_cur = w.tile_cur;
+    }
+    w.cur_char = const_cast<char *>(base + seq_off);
+    w.do_read = true;
+    w.do_kmer_read = (g % StreamReader::num_reads_for_kmer == 0);
+    w.cur_gc_record = gc;
+    w.read_sequence_line(ws);
+    const std::size_t seqlen = w.read_pos;
+    const char *seq_nl = w.cur_char;
+    const std::size_t plus_off = static_cast<std::size_t>(seq_nl - base) + 1;
+    const char *pl = static_cast<const char *>(
+      memchr(base + plus_off, '\n', size - plus_off));
+    const std::size_t qual_off = static_cast<std::size_t>(pl - base) + 1;
+    bool qual_no_nl = false;
+    if (can_be_last)
+      qual_no_nl = (memchr(base + qual_off, '\n', size - qual_off) == nullptr);
+    w.cur_char = const_cast<char *>(base + qual_off);
+    w.do_tile_read =
+      !tile_ignore && (g % StreamReader::num_reads_for_tile == 0);
+    w.tile_cur = tile_cur;
+    w.force_eof = qual_no_nl;
+    w.read_quality_line(ws);
+    seqlen_out = seqlen;
+    tile_out = tile_cur;
+    key_out = base + seq_off;
+    return qual_no_nl ? size
+                      : static_cast<std::size_t>(w.cur_char - base) + 1;
+  }
+};
+
+template <class P>
 static void
-read_chunked_core(FalcoConfig &config, FastqStats &master,
+read_bytesplit_core(FalcoConfig &config, FastqStats &master,
                   std::size_t nthreads, const char *base, std::size_t size,
                   std::function<void()> release_input = {},
                   bool can_drop = false) {
   const std::size_t BUF = FastqStats::SHORT_READ_THRESHOLD;
   // dispatcher-only reader, used for its parsed configuration flags
-  ParallelWorker cfg(config, BUF);
+  typename P::Worker cfg(config, BUF);
   const bool tile_ignore = cfg.tile_ignore;
   if (base == nullptr || size == 0) {
     // empty input: nothing to parse; mirror the serial path's tile handling
@@ -1715,17 +1791,17 @@ read_chunked_core(FalcoConfig &config, FastqStats &master,
 #pragma omp parallel for num_threads(nthreads) schedule(static)
 #endif
   for (std::size_t t = 1; t < nthreads; ++t)
-    sync[t] = find_record_start(base, size, t * (size / nthreads));
+    sync[t] = P::find_start(base, size, t * (size / nthreads));
   // enforce monotonicity (tiny chunks / very long records)
   for (std::size_t t = 1; t <= nthreads; ++t)
     if (sync[t] < sync[t - 1])
       sync[t] = sync[t - 1];
 
   // ---- per-thread parallel workers (parse config + per-base state) ----
-  std::vector<std::unique_ptr<ParallelWorker>> workers;
+  std::vector<std::unique_ptr<typename P::Worker>> workers;
   workers.reserve(nthreads);
   for (std::size_t t = 0; t < nthreads; ++t)
-    workers.emplace_back(new ParallelWorker(config, BUF));
+    workers.emplace_back(new typename P::Worker(config, BUF));
 
   // ---- Phase 1: count records per chunk (parallel newline count) ----
   // Chunks are record-aligned, so each record is exactly 4 newlines; only the
@@ -1737,17 +1813,7 @@ read_chunked_core(FalcoConfig &config, FastqStats &master,
     const std::size_t lo = sync[t], hi = sync[t + 1];
     if (lo >= hi)
       return;
-    // Count newlines block by block, releasing each block once counted so the
-    // count pass never holds the whole chunk resident.
-    std::size_t nl = 0;
-    for (std::size_t off = lo; off < hi; off += DROP_WINDOW) {
-      const std::size_t end = std::min(off + DROP_WINDOW, hi);
-      nl += static_cast<std::size_t>(std::count(base + off, base + end, '\n'));
-      drop_range(off, end);
-    }
-    if (hi == size && base[size - 1] != '\n')
-      ++nl;  // final record has no trailing newline
-    counts[t] = nl / 4;
+    counts[t] = P::count_chunk(base, lo, hi, size, drop_range);
   };
 
   // ---- duplication prefix: fixes the "first 100k unique" set ----
@@ -1770,10 +1836,8 @@ read_chunked_core(FalcoConfig &config, FastqStats &master,
     std::size_t seen = 0;
     std::size_t p = 0;
     while (p < size && continue_storing) {
-      std::size_t seq_off, seqlen;
-      const std::size_t next = parse_record(base, size, p, seq_off, seqlen);
-      const char *key = base + seq_off;
-      const std::size_t klen = get_truncate_point(seqlen);
+      const char *key; std::size_t klen;
+      const std::size_t next = P::dup_key(base, size, p, key, klen);
       const auto it = master.sequence_count.find(key, klen);
       if (it == master.sequence_count.end()) {
         if (continue_storing) {
@@ -1865,7 +1929,7 @@ read_chunked_core(FalcoConfig &config, FastqStats &master,
 #endif
   for (std::size_t t = 0; t < nthreads; ++t) {
     wstats[t].reset(new FastqStats(config.do_kmer));
-    ParallelWorker &w = *workers[t];
+    typename P::Worker &w = *workers[t];
     FastqStats &ws = *wstats[t];
     const std::size_t n = counts[t];
     std::vector<GCRecord> &gc = gcrec[t];
@@ -1882,56 +1946,21 @@ read_chunked_core(FalcoConfig &config, FastqStats &master,
     std::size_t dropped = sync[t];   // bytes released behind the cursor so far
     for (std::size_t j = 0; j < n; ++j) {
       const std::size_t g = g0 + j;
-      // header -> sequence start (+ optional tile field)
-      const char *h =
-        static_cast<const char *>(memchr(base + p, '\n', size - p));
-      const std::size_t seq_off = static_cast<std::size_t>(h - base) + 1;
-      std::size_t tile_cur = 0;
-      if (!tile_ignore) {
-        w.cur_char = const_cast<char *>(base + p);
-        w.get_tile_value();
-        tile_cur = w.tile_cur;
-      }
-      // sequence (scans to '\n'; sets read_pos = seqlen, cur_char at the '\n')
-      w.cur_char = const_cast<char *>(base + seq_off);
-      w.do_read = true;
-      w.do_kmer_read = (g % StreamReader::num_reads_for_kmer == 0);
-      w.cur_gc_record = &gc[j];
-      w.read_sequence_line(ws);
-      const std::size_t seqlen = w.read_pos;
-      const char *seq_nl = w.cur_char;
-      // '+' line -> quality start
-      const std::size_t plus_off = static_cast<std::size_t>(seq_nl - base) + 1;
-      const char *pl = static_cast<const char *>(
-        memchr(base + plus_off, '\n', size - plus_off));
-      const std::size_t qual_off = static_cast<std::size_t>(pl - base) + 1;
-      // only the file's final record can lack a trailing newline
-      bool qual_no_nl = false;
-      if (last_chunk && j + 1 == n)
-        qual_no_nl =
-          (memchr(base + qual_off, '\n', size - qual_off) == nullptr);
-      // quality
-      w.cur_char = const_cast<char *>(base + qual_off);
-      w.do_tile_read =
-        !tile_ignore && (g % StreamReader::num_reads_for_tile == 0);
-      w.tile_cur = tile_cur;
-      w.force_eof = qual_no_nl;
-      w.read_quality_line(ws);
+      std::size_t seqlen = 0, tile_cur = 0;
+      const char *key = nullptr;
+      p = P::parse_one(w, ws, base, size, p, g, &gc[j], tile_ignore,
+                       last_chunk && (j + 1 == n), seqlen, tile_cur, key);
       // duplication occurrence count (post-cap; map is read-only here)
       if (count_dup && g >= fill_boundary) {
-        const auto it = master.sequence_count.find(
-          base + seq_off, get_truncate_point(seqlen));
+        const auto it =
+          master.sequence_count.find(key, get_truncate_point(seqlen));
         if (it != master.sequence_count.end())
           ++d[static_cast<std::size_t>(it - mbegin)];
       }
       if (!tile_ignore)
         tr.push_back({static_cast<std::uint32_t>(seqlen),
                       static_cast<std::uint32_t>(tile_cur)});
-      // advance to the next record
-      p = qual_no_nl ? size
-                     : static_cast<std::size_t>(w.cur_char - base) + 1;
-      // release the pages this thread has already parsed (everything before the
-      // next record start p is consumed); keeps the resident window ~DROP_WINDOW.
+      // release parsed pages; keeps the resident window ~DROP_WINDOW.
       if (can_drop && p - dropped >= DROP_WINDOW) {
         drop_range(dropped, p);
         dropped = p;
@@ -1955,6 +1984,16 @@ read_chunked_core(FalcoConfig &config, FastqStats &master,
 
   if (releaser.joinable())
     releaser.join();
+}
+
+// FASTQ / gz-FASTQ instantiation of the byte-split driver.
+static void
+read_chunked_core(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
+                  const char *base, std::size_t size,
+                  std::function<void()> release_input = {},
+                  bool can_drop = false) {
+  read_bytesplit_core<FastqPolicy>(config, master, nthreads, base, size,
+                                   std::move(release_input), can_drop);
 }
 
 void
