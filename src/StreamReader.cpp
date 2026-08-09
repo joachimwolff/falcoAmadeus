@@ -1515,19 +1515,23 @@ merge_worker_stats(
     std::vector<std::vector<GCRecord>> &gcrec,
     std::vector<std::vector<std::size_t>> &deltas,
     std::vector<std::vector<std::pair<std::uint32_t, std::uint32_t>>> &tilerecs,
-    std::vector<std::size_t> &gstart, bool count_dup, bool tile_ignore) {
+    std::vector<std::size_t> &gstart, bool count_dup, bool tile_ignore,
+    bool skip_gc = false) {
   // ---- GC replay in global read order (exact FP reproduction) ----
-  for (std::size_t t = 0; t < nthreads; ++t) {
-    for (const GCRecord &gr : gcrec[t]) {
-      if (gr.kind == 1) {
-        for (const auto &v : master.gc_models[gr.a].models[gr.b])
-          master.gc_count[v.percent] += v.increment;
-      }
-      else if (gr.kind == 2) {
-        ++master.gc_count[gr.a];  // a = percent bin (kind 2)
+  // skip_gc: the segment-batched BAM driver already replayed GC per segment
+  // (in global order), so gcrec holds nothing to replay here.
+  if (!skip_gc)
+    for (std::size_t t = 0; t < nthreads; ++t) {
+      for (const GCRecord &gr : gcrec[t]) {
+        if (gr.kind == 1) {
+          for (const auto &v : master.gc_models[gr.a].models[gr.b])
+            master.gc_count[v.percent] += v.increment;
+        }
+        else if (gr.kind == 2) {
+          ++master.gc_count[gr.a];  // a = percent bin (kind 2)
+        }
       }
     }
-  }
 
   // ---- merge per-thread duplication deltas into the map ----
   const std::size_t nent = master.sequence_count.size();
@@ -2154,7 +2158,7 @@ decompress_bgzf_libdeflate(const std::string &path, std::size_t nthreads) {
 #endif
           ok = 0;
         }
-        if (coff[i] - cdropped >= (std::size_t(8) << 20)) {  // release consumed
+        if (coff[i] - cdropped >= (std::size_t(2) << 20)) {  // release consumed
           cdrop(cdropped, coff[i]);
           cdropped = coff[i];
         }
@@ -2843,33 +2847,13 @@ read_bam_chunked(FalcoConfig &config, FastqStats &master,
       ++total; p += 4 + bsz;
       if (p - w1drop >= (std::size_t(4) << 20)) { bdrop(w1drop, p); w1drop = p; }
     }
-    // Walk 2: per-thread chunk-start byte offsets (record-aligned).
-    std::vector<std::size_t> gstart(nthreads + 1, 0);
-    std::vector<std::size_t> choff(nthreads + 1, rec0);
-    std::vector<std::size_t> counts(nthreads, 0);
-    for (std::size_t t = 0; t <= nthreads; ++t)
-      gstart[t] = total * t / nthreads;
-    {
-      std::size_t idx = 0, q = rec0, tcur = 0, w2drop = rec0;
-      choff[0] = rec0;
-      while (q + 4 <= size && idx < total) {
-        while (tcur < nthreads && idx == gstart[tcur]) choff[tcur++] = q;
-        const std::size_t bsz = rd_bsz(q);
-        q += 4 + bsz; ++idx;
-        if (q - w2drop >= (std::size_t(4) << 20)) { bdrop(w2drop, q); w2drop = q; }
-      }
-      while (tcur <= nthreads) choff[tcur++] = q;
-    }
-    choff[nthreads] = (total > 0) ? choff[nthreads] : rec0;
-    for (std::size_t t = 0; t < nthreads; ++t)
-      counts[t] = gstart[t + 1] - gstart[t];
-
     // dispatcher-only reader for config flags
     ParallelWorker cfg(config, BUF);
     const bool tile_ignore = cfg.tile_ignore;
     const bool do_hash = cfg.do_sequence_hash;
 
     // ---- duplication prefix (serial): fix the "first 100k unique" set ----
+    // (independent of the offset walk below, so it runs first for both paths)
     std::size_t fill_boundary = 0;
     if (do_hash) {
       BamReader keyer(config, BUF); keyer.bam_worker_init();
@@ -2902,12 +2886,125 @@ read_bam_chunked(FalcoConfig &config, FastqStats &master,
     const auto mbegin = master.sequence_count.begin();
     const bool count_dup = do_hash && (fill_boundary < total);
 
-    // ---- parallel parse ----
     std::vector<std::unique_ptr<FastqStats>> wstats(nthreads);
-    std::vector<std::vector<GCRecord>> gcrec(nthreads);
     std::vector<std::vector<std::size_t>> deltas(nthreads);
     std::vector<std::vector<std::pair<std::uint32_t, std::uint32_t>>>
       tilerecs(nthreads);
+    std::vector<std::size_t> gstart(nthreads + 1, 0);  // tile reconstruction only
+
+    if (tile_ignore) {
+      // ---- segment-batched parse (no tiles): hold one segment of GC records --
+      // A segment is `nthreads` blocks of `sub` reads laid out in global read
+      // order; replaying its blocks in thread order lands the fractional GC
+      // additions in exact serial order. gcrec (gseg) is reused every segment,
+      // so peak memory is O(one segment) instead of O(all reads).
+      const std::size_t sub = std::max<std::size_t>(
+        1, (std::size_t(2) << 20) / std::max<std::size_t>(1, nthreads));
+      const std::size_t nsub = total == 0 ? 0 : (total + sub - 1) / sub;
+      // offset grid: byte offset of record k*sub (replaces walk 2).
+      std::vector<std::size_t> suboff(nsub + 1, rec0);
+      {
+        std::size_t idx = 0, q = rec0, k = 0, wdrop = rec0;
+        while (q + 4 <= size && idx < total) {
+          if (idx == k * sub && k <= nsub) suboff[k++] = q;
+          const std::size_t bsz = rd_bsz(q);
+          q += 4 + bsz; ++idx;
+          if (q - wdrop >= (std::size_t(4) << 20)) { bdrop(wdrop, q); wdrop = q; }
+        }
+        while (k <= nsub) suboff[k++] = q;
+      }
+      for (std::size_t t = 0; t < nthreads; ++t) {
+        wstats[t].reset(new FastqStats(config.do_kmer));
+        if (count_dup) deltas[t].assign(nent, 0);
+      }
+      std::vector<std::vector<GCRecord>> gseg(nthreads);
+      // Persistent per-thread workers: constructing a BamReader inside the
+      // per-segment parallel region would alloc/free once per segment across
+      // every thread arena and fragment glibc's heap badly at high -t. Build
+      // them once here (like the full-buffer path does) and reuse every segment.
+      std::vector<std::unique_ptr<BamReader>> bw(nthreads);
+      for (std::size_t t = 0; t < nthreads; ++t) {
+        gseg[t].assign(sub, GCRecord{0, 0, 0});
+        bw[t].reset(new BamReader(config, BUF));
+        bw[t]->bam_worker_init();
+      }
+      std::vector<std::size_t> segn(nthreads, 0);
+      const std::size_t nseg = nsub == 0 ? 0 : (nsub + nthreads - 1) / nthreads;
+      for (std::size_t sgi = 0; sgi < nseg; ++sgi) {
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(nthreads) schedule(static)
+#endif
+        for (std::size_t t = 0; t < nthreads; ++t) {
+          const std::size_t kk = sgi * nthreads + t;
+          if (kk >= nsub) { segn[t] = 0; continue; }
+          const std::size_t g0 = kk * sub;
+          const std::size_t nrec = std::min(sub, total - g0);
+          segn[t] = nrec;
+          FastqStats &ws = *wstats[t];
+          BamReader &w = *bw[t];
+          std::size_t q = suboff[kk], jdrop = suboff[kk];
+          for (std::size_t j = 0; j < nrec; ++j) {
+            const std::size_t bsz = rd_bsz(q);
+            std::size_t tile_cur = 0;
+            const std::size_t seqlen = w.process_record_parallel(
+              base + q + 4, static_cast<uint32_t>(bsz), ws, &gseg[t][j],
+              g0 + j, tile_cur);
+            if (count_dup && g0 + j >= fill_boundary) {
+              const auto it = master.sequence_count.find(
+                w.buffer, get_truncate_point(seqlen));
+              if (it != master.sequence_count.end())
+                ++deltas[t][static_cast<std::size_t>(it - mbegin)];
+            }
+            q += 4 + bsz;
+            if (q - jdrop >= (std::size_t(512) << 10)) { bdrop(jdrop, q); jdrop = q; }
+          }
+        }
+        // replay this segment's GC in global read order (blocks t=0,1,2,...)
+        for (std::size_t t = 0; t < nthreads; ++t) {
+          const std::vector<GCRecord> &gc = gseg[t];
+          const std::size_t nrec = segn[t];
+          for (std::size_t j = 0; j < nrec; ++j) {
+            const GCRecord &gr = gc[j];
+            if (gr.kind == 1) {
+              for (const auto &v : master.gc_models[gr.a].models[gr.b])
+                master.gc_count[v.percent] += v.increment;
+            }
+            else if (gr.kind == 2)
+              ++master.gc_count[gr.a];
+          }
+        }
+      }
+      std::vector<std::vector<GCRecord>> empty_gc(nthreads);
+      merge_worker_stats(config, master, nthreads, total, wstats, empty_gc,
+                         deltas, tilerecs, gstart, count_dup, tile_ignore,
+                         /*skip_gc=*/true);
+      if (g.can_drop) { munmap(g.data, g.maplen); if (g.fd >= 0) close(g.fd); }
+      else std::free(g.data);
+      return;
+    }
+
+    // ---- full-buffer parse (tiles present): one contiguous chunk per thread --
+    // Walk 2: per-thread chunk-start byte offsets (record-aligned).
+    std::vector<std::size_t> choff(nthreads + 1, rec0);
+    std::vector<std::size_t> counts(nthreads, 0);
+    for (std::size_t t = 0; t <= nthreads; ++t)
+      gstart[t] = total * t / nthreads;
+    {
+      std::size_t idx = 0, q = rec0, tcur = 0, w2drop = rec0;
+      choff[0] = rec0;
+      while (q + 4 <= size && idx < total) {
+        while (tcur < nthreads && idx == gstart[tcur]) choff[tcur++] = q;
+        const std::size_t bsz = rd_bsz(q);
+        q += 4 + bsz; ++idx;
+        if (q - w2drop >= (std::size_t(4) << 20)) { bdrop(w2drop, q); w2drop = q; }
+      }
+      while (tcur <= nthreads) choff[tcur++] = q;
+    }
+    choff[nthreads] = (total > 0) ? choff[nthreads] : rec0;
+    for (std::size_t t = 0; t < nthreads; ++t)
+      counts[t] = gstart[t + 1] - gstart[t];
+
+    std::vector<std::vector<GCRecord>> gcrec(nthreads);
 #ifdef _OPENMP
 #pragma omp parallel for num_threads(nthreads) schedule(static)
 #endif
@@ -2918,7 +3015,7 @@ read_bam_chunked(FalcoConfig &config, FastqStats &master,
       const std::size_t n = counts[t], g0 = gstart[t];
       gcrec[t].assign(n, GCRecord{0, 0, 0});
       if (count_dup) deltas[t].assign(nent, 0);
-      if (!tile_ignore) tilerecs[t].reserve(n);
+      tilerecs[t].reserve(n);
       std::size_t q = choff[t], jdrop = choff[t];
       for (std::size_t j = 0; j < n; ++j) {
         const std::size_t bsz = rd_bsz(q);
@@ -2932,11 +3029,10 @@ read_bam_chunked(FalcoConfig &config, FastqStats &master,
           if (it != master.sequence_count.end())
             ++deltas[t][static_cast<std::size_t>(it - mbegin)];
         }
-        if (!tile_ignore)
-          tilerecs[t].push_back({static_cast<std::uint32_t>(seqlen),
-                                 static_cast<std::uint32_t>(tile_cur)});
+        tilerecs[t].push_back({static_cast<std::uint32_t>(seqlen),
+                               static_cast<std::uint32_t>(tile_cur)});
         q += 4 + bsz;
-        if (q - jdrop >= (std::size_t(2) << 20)) { bdrop(jdrop, q); jdrop = q; }
+        if (q - jdrop >= (std::size_t(512) << 10)) { bdrop(jdrop, q); jdrop = q; }
       }
     }
     (void)nent; (void)mbegin;
