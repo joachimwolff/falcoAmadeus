@@ -16,6 +16,7 @@
  */
 
 #include "StreamReader.hpp"
+#include <atomic>
 
 #include <algorithm>
 #include <cstdlib>
@@ -3072,34 +3073,52 @@ read_bam_chunked(FalcoConfig &config, FastqStats &master,
       // so peak memory is O(one segment) instead of O(all reads).
       const std::size_t sub = std::max<std::size_t>(
         1, (std::size_t(2) << 20) / std::max<std::size_t>(1, nthreads));
-      // Single walk: record the byte offset of every sub-th record AND count the
-      // total (one scan of the decompressed stream, not a count + an offset pass).
-      std::vector<std::size_t> suboff;
-      suboff.reserve(4096);
-      std::size_t total = 0;
-      {
-        std::size_t q = rec0, wdrop = rec0;
-        while (q + 4 <= size) {
+      // count_dup / fill_boundary come from the dup-prefix alone (no total): if
+      // dup_cont, every read fit under the 100k cap so nothing is occurrence-
+      // counted; otherwise reads at global index >= dup_seen are counted.
+      const std::size_t fill_boundary = dup_cont ? SIZE_MAX : dup_seen;
+      const bool count_dup = do_hash && !dup_cont;
+
+      // ---- STREAMING: overlap the serial offset walk with the parallel parse.
+      // A background thread walks record boundaries (the ~1.2 s serial phase) and
+      // publishes each sub-block start as it finds it; the parse consumes a
+      // segment as soon as its blocks are bounded, so the walk hides under the
+      // compute-bound parse instead of preceding it. Both keep drop-behind, so
+      // pages the walker releases are just re-faulted from page cache by the
+      // trailing parse -- identical fault count, bounded memory, and the GC
+      // replay order (segments in order, blocks 0..nth-1) is unchanged.
+      const std::size_t min_rec = 36;  // 4 (block_size prefix) + 32 (core) floor
+      const std::size_t max_sub = size / (min_rec * sub) + 8;
+      std::vector<std::size_t> suboff(max_sub + 2, 0);
+      std::atomic<std::size_t> published{0};  // suboff entries written (release)
+      std::atomic<std::size_t> total_a{0};
+      std::atomic<bool> walk_done{false};
+      std::thread walker([&]() {
+        std::size_t q = rec0, wdrop = rec0, cnt = 0, k = 0;
+        while (q + 4 <= size && k + 1 < suboff.size()) {
           const std::size_t bsz = rd_bsz(q);
           if (q + 4 + bsz > size) break;
-          if (total % sub == 0) suboff.push_back(q);
-          ++total; q += 4 + bsz;
+          if (cnt % sub == 0) {
+            suboff[k] = q;
+            published.store(k + 1, std::memory_order_release);
+            ++k;
+          }
+          ++cnt; q += 4 + bsz;
           if (q - wdrop >= (std::size_t(4) << 20)) { bdrop(wdrop, q); wdrop = q; }
         }
-        suboff.push_back(q);  // sentinel: end of the last block
-      }
-      const std::size_t nsub = suboff.empty() ? 0 : suboff.size() - 1;
-      const std::size_t fill_boundary = dup_cont ? total : dup_seen;
-      const bool count_dup = do_hash && (fill_boundary < total);
+        suboff[k] = q;  // sentinel: end of the last block
+        published.store(k + 1, std::memory_order_release);
+        total_a.store(cnt, std::memory_order_release);
+        walk_done.store(true, std::memory_order_release);
+      });
+
       for (std::size_t t = 0; t < nthreads; ++t) {
         wstats[t].reset(new FastqStats(config.do_kmer));
         if (count_dup) deltas[t].assign(nent, 0);
       }
       std::vector<std::vector<GCRecord>> gseg(nthreads);
-      // Persistent per-thread workers: constructing a BamReader inside the
-      // per-segment parallel region would alloc/free once per segment across
-      // every thread arena and fragment glibc's heap badly at high -t. Build
-      // them once here (like the full-buffer path does) and reuse every segment.
+      // Persistent per-thread workers (built once; per-segment construction would
+      // fragment glibc arenas at high -t).
       std::vector<std::unique_ptr<BamReader>> bw(nthreads);
       for (std::size_t t = 0; t < nthreads; ++t) {
         gseg[t].assign(sub, GCRecord{0, 0, 0});
@@ -3107,21 +3126,32 @@ read_bam_chunked(FalcoConfig &config, FastqStats &master,
         bw[t]->bam_worker_init();
       }
       std::vector<std::size_t> segn(nthreads, 0);
-      const std::size_t nseg = nsub == 0 ? 0 : (nsub + nthreads - 1) / nthreads;
-      for (std::size_t sgi = 0; sgi < nseg; ++sgi) {
+      // sub-block kk is bounded once both suboff[kk] and suboff[kk+1] are known
+      // (published > kk+1); if the walk is finished and it still is not, kk is
+      // past the last block.
+      auto block_ready = [&](std::size_t kk) -> bool {
+        for (;;) {
+          if (published.load(std::memory_order_acquire) > kk + 1)
+            return true;
+          if (walk_done.load(std::memory_order_acquire))
+            return published.load(std::memory_order_acquire) > kk + 1;
+        }
+      };
+      for (std::size_t sgi = 0;; ++sgi) {
+        std::atomic<bool> any{false};
 #ifdef _OPENMP
 #pragma omp parallel for num_threads(nthreads) schedule(static)
 #endif
         for (std::size_t t = 0; t < nthreads; ++t) {
           const std::size_t kk = sgi * nthreads + t;
-          if (kk >= nsub) { segn[t] = 0; continue; }
+          if (!block_ready(kk)) { segn[t] = 0; continue; }
+          any.store(true, std::memory_order_relaxed);
           const std::size_t g0 = kk * sub;
-          const std::size_t nrec = std::min(sub, total - g0);
-          segn[t] = nrec;
+          const std::size_t bend = suboff[kk + 1];
           FastqStats &ws = *wstats[t];
           BamReader &w = *bw[t];
-          std::size_t q = suboff[kk], jdrop = suboff[kk];
-          for (std::size_t j = 0; j < nrec; ++j) {
+          std::size_t q = suboff[kk], jdrop = suboff[kk], j = 0;
+          while (q < bend) {
             const std::size_t bsz = rd_bsz(q);
             std::size_t tile_cur = 0;
             const std::size_t seqlen = w.process_record_parallel(
@@ -3133,10 +3163,13 @@ read_bam_chunked(FalcoConfig &config, FastqStats &master,
               if (it != master.sequence_count.end())
                 ++deltas[t][static_cast<std::size_t>(it - mbegin)];
             }
-            q += 4 + bsz;
+            q += 4 + bsz; ++j;
             if (q - jdrop >= (std::size_t(512) << 10)) { bdrop(jdrop, q); jdrop = q; }
           }
+          segn[t] = j;
         }
+        if (!any.load(std::memory_order_relaxed))
+          break;
         // replay this segment's GC in global read order (blocks t=0,1,2,...)
         for (std::size_t t = 0; t < nthreads; ++t) {
           const std::vector<GCRecord> &gc = gseg[t];
@@ -3152,6 +3185,8 @@ read_bam_chunked(FalcoConfig &config, FastqStats &master,
           }
         }
       }
+      walker.join();
+      const std::size_t total = total_a.load(std::memory_order_acquire);
       std::vector<std::vector<GCRecord>> empty_gc(nthreads);
       merge_worker_stats(config, master, nthreads, total, wstats, empty_gc,
                          deltas, tilerecs, gstart, count_dup, tile_ignore,
