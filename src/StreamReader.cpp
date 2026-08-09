@@ -3049,6 +3049,326 @@ bam_read_serial(FalcoConfig &config, FastqStats &master) {
     config.do_tile = false;
 }
 
+// [FalcoAmadeus] Walk the BGZF block index WITHOUT decompressing: returns the
+// per-block (compressed offset/len, uncompressed offset/len) and the compressed
+// mmap. Used by the fused BAM driver so it can decompress one chunk at a time.
+struct BgzfIndex {
+  int fd = -1;
+  std::size_t csize = 0;
+  std::vector<std::size_t> coff, clen, uoff, ulen;
+  std::size_t utotal = 0;
+  bool ok = false;
+};
+
+static BgzfIndex
+bgzf_walk_index(const std::string &path) {
+  BgzfIndex r;
+  const int fd = open(path.c_str(), O_RDONLY);
+  if (fd < 0)
+    return r;
+  struct stat stt;
+  if (fstat(fd, &stt) != 0) { close(fd); return r; }
+  const std::size_t csize = static_cast<std::size_t>(stt.st_size);
+  if (csize < 18) { close(fd); return r; }
+  const unsigned char *comp = static_cast<const unsigned char *>(
+    mmap(nullptr, csize, PROT_READ, MAP_PRIVATE, fd, 0));
+  if (comp == MAP_FAILED) { close(fd); return r; }
+  madvise(const_cast<unsigned char *>(comp), csize, MADV_SEQUENTIAL);
+  const std::size_t WPG = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+  std::size_t wdrop = 0;
+  auto le16 = [](const unsigned char *q) {
+    return static_cast<std::size_t>(q[0]) | (static_cast<std::size_t>(q[1]) << 8);
+  };
+  auto le32 = [](const unsigned char *q) {
+    return static_cast<std::size_t>(q[0]) | (static_cast<std::size_t>(q[1]) << 8) |
+           (static_cast<std::size_t>(q[2]) << 16) |
+           (static_cast<std::size_t>(q[3]) << 24);
+  };
+  std::size_t p = 0, utotal = 0;
+  bool bgzf_ok = true;
+  while (p + 18 <= csize) {
+    if (!(comp[p] == 0x1f && comp[p + 1] == 0x8b && comp[p + 2] == 8 &&
+          (comp[p + 3] & 4))) {
+      bgzf_ok = (p != 0);
+      break;
+    }
+    const std::size_t xlen = le16(comp + p + 10);
+    std::size_t xp = p + 12;
+    const std::size_t xe = xp + xlen;
+    std::size_t bsize = 0;
+    while (xp + 4 <= xe && xe <= csize) {
+      const std::size_t sl = le16(comp + xp + 2);
+      if (comp[xp] == 'B' && comp[xp + 1] == 'C' && sl == 2) {
+        bsize = le16(comp + xp + 4) + 1;
+        break;
+      }
+      xp += 4 + sl;
+    }
+    if (bsize == 0 || p + bsize > csize) {
+      bgzf_ok = (p != 0 && bsize != 0);
+      break;
+    }
+    const std::size_t isize = le32(comp + p + bsize - 4);
+    if (isize > 0) {
+      r.coff.push_back(p);
+      r.clen.push_back(bsize);
+      r.uoff.push_back(utotal);
+      r.ulen.push_back(isize);
+    }
+    utotal += isize;
+    p += bsize;
+    if (p - wdrop >= (std::size_t(16) << 20)) {  // release scanned headers
+      const std::size_t sa = (wdrop + WPG - 1) & ~(WPG - 1), sb = p & ~(WPG - 1);
+      if (sb > sa) madvise(const_cast<unsigned char *>(comp) + sa, sb - sa, MADV_DONTNEED);
+      wdrop = p;
+    }
+  }
+  munmap(const_cast<unsigned char *>(comp), csize);  // decompression pread()s instead
+  if (!bgzf_ok || r.coff.empty()) { close(fd); return r; }
+  r.fd = fd; r.csize = csize; r.utotal = utotal; r.ok = true;
+  return r;
+}
+
+// [FalcoAmadeus] FUSED parallel BAM driver: decompress ONE ~128 MB chunk of BGZF
+// blocks at a time into a REUSED anonymous huge-page buffer (faulted once, then
+// reused -> no 2M-page-fault temp-file write and no 8 GB materialisation), carry
+// the record that straddles the chunk boundary as a leftover prefix, walk the
+// chunk's record offsets, and parse them in parallel. Byte-identical to the
+// serial BamReader: subsampling uses the global read index, GC replays per chunk
+// in global order, and duplication keeps FastQC's first-100k-unique semantics via
+// a short serial prefix pass. read_step == 1 only; falls back to the serial reader
+// if the input is not BGZF-walkable.
+void
+read_bam_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads) {
+  const std::size_t BUF = FastqStats::SHORT_READ_THRESHOLD;
+#if defined(USE_HTS) && defined(USE_LIBDEFLATE)
+  BgzfIndex ix = bgzf_walk_index(config.filename);
+  if (!ix.ok) { bam_read_serial(config, master); return; }
+  const std::size_t nb = ix.coff.size();
+
+  ParallelWorker cfg(config, BUF);
+  const bool tile_ignore = cfg.tile_ignore;
+  const bool do_hash = cfg.do_sequence_hash;
+  if (!tile_ignore) {  // fused path is tile-less; tiled BAM uses the full-buffer driver
+    close(ix.fd);
+    read_bam_chunked(config, master, nthreads);
+    return;
+  }
+
+  // ---- group blocks into ~128 MB decompressed chunks ----
+  const std::size_t CHUNK = std::size_t(64) << 20;
+  std::vector<std::size_t> cb;  // block-index boundaries; chunk c = [cb[c], cb[c+1])
+  cb.push_back(0);
+  { std::size_t acc = 0;
+    for (std::size_t b = 0; b < nb; ++b) {
+      acc += ix.ulen[b];
+      if (acc >= CHUNK) { cb.push_back(b + 1); acc = 0; }
+    }
+    if (cb.back() != nb) cb.push_back(nb);
+  }
+  const std::size_t nchunks = cb.size() - 1;
+  std::size_t chunk_max = 0;
+  for (std::size_t c = 0; c < nchunks; ++c) {
+    const std::size_t b0 = cb[c], b1 = cb[c + 1];
+    chunk_max = std::max(chunk_max,
+                         ix.uoff[b1 - 1] + ix.ulen[b1 - 1] - ix.uoff[b0]);
+  }
+  const std::size_t SLACK = std::size_t(16) << 20;  // leftover (one straddling record)
+  const std::size_t bufcap = chunk_max + SLACK;
+  char *buf = static_cast<char *>(mmap(nullptr, bufcap, PROT_READ | PROT_WRITE,
+                                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+  if (buf == MAP_FAILED) {
+    close(ix.fd);
+    bam_read_serial(config, master);
+    return;
+  }
+  madvise(buf, bufcap, MADV_HUGEPAGE);
+  auto rd_bsz = [&](std::size_t q) {
+    int32_t v; std::memcpy(&v, buf + q, 4); return static_cast<std::size_t>(v);
+  };
+  // Decompress chunk c into buf+off: pread the chunk's compressed bytes into a
+  // reused buffer (so the ~compressed-file never stays resident), inflate the
+  // blocks in parallel. Returns the uncompressed size (SIZE_MAX on error).
+  std::vector<char> cbuf;
+  auto decompress_chunk = [&](std::size_t c, std::size_t off) -> std::size_t {
+    const std::size_t b0 = cb[c], b1 = cb[c + 1];
+    const std::size_t base_c = ix.coff[b0], base_uoff = ix.uoff[b0];
+    const std::size_t clen_total =
+      ((b1 < nb) ? ix.coff[b1] : ix.csize) - base_c;
+    if (cbuf.size() < clen_total) cbuf.resize(clen_total);
+    std::size_t got = 0;
+    while (got < clen_total) {
+      const ssize_t n = pread(ix.fd, cbuf.data() + got, clen_total - got,
+                              static_cast<off_t>(base_c + got));
+      if (n <= 0) return SIZE_MAX;
+      got += static_cast<std::size_t>(n);
+    }
+    int ok2 = 1;
+#ifdef _OPENMP
+#pragma omp parallel num_threads(nthreads)
+#endif
+    {
+      libdeflate_decompressor *d = libdeflate_alloc_decompressor();
+#ifdef _OPENMP
+#pragma omp for schedule(dynamic)
+#endif
+      for (std::size_t b = b0; b < b1; ++b) {
+        std::size_t act = 0;
+        if (d == nullptr ||
+            libdeflate_gzip_decompress(
+              d, cbuf.data() + (ix.coff[b] - base_c), ix.clen[b],
+              buf + off + (ix.uoff[b] - base_uoff), ix.ulen[b], &act) !=
+              LIBDEFLATE_SUCCESS ||
+            act != ix.ulen[b]) {
+#ifdef _OPENMP
+#pragma omp atomic write
+#endif
+          ok2 = 0;
+        }
+      }
+      if (d) libdeflate_free_decompressor(d);
+    }
+    return ok2 ? (ix.uoff[b1 - 1] + ix.ulen[b1 - 1] - base_uoff) : SIZE_MAX;
+  };
+
+  std::vector<char> leftover;
+
+  // ---- duplication prefix (serial): first 100k unique, across chunks ----
+  bool dup_cont = true; std::size_t dup_seen = 0;
+  if (do_hash) {
+    BamReader keyer(config, BUF); keyer.bam_worker_init();
+    std::vector<char> keybuf(BUF + 8);
+    for (std::size_t c = 0; c < nchunks && dup_cont; ++c) {
+      const std::size_t off = leftover.size();
+      if (off) std::memcpy(buf, leftover.data(), off);
+      const std::size_t un = decompress_chunk(c, off);
+      if (un == SIZE_MAX) break;
+      const std::size_t end = off + un;
+      std::size_t q = (c == 0) ? bam_records_start(buf, end) : 0;
+      if (q == SIZE_MAX) break;
+      while (q + 4 <= end && dup_cont) {
+        const std::size_t bsz = rd_bsz(q);
+        if (q + 4 + bsz > end) break;  // straddles into next chunk
+        std::size_t klen = 0;
+        keyer.decode_key(buf + q + 4, static_cast<uint32_t>(bsz), keybuf.data(),
+                         klen);
+        const auto it = master.sequence_count.find(keybuf.data(), klen);
+        if (it == master.sequence_count.end()) {
+          master.sequence_count.emplace(keybuf.data(), klen, 1);
+          master.count_at_limit = dup_seen;
+          ++master.num_unique_seen;
+          if (master.num_unique_seen == Constants::unique_reads_stop_counting) {
+            dup_cont = false; ++dup_seen; break;
+          }
+        }
+        else {
+          ++it->second;
+          master.count_at_limit += dup_cont;
+        }
+        ++dup_seen; q += 4 + bsz;
+      }
+      leftover.assign(buf + q, buf + end);
+    }
+  }
+  const std::size_t nent = do_hash ? master.sequence_count.size() : 0;
+  const auto mbegin = master.sequence_count.begin();
+  const std::size_t fill_boundary = dup_cont ? SIZE_MAX : dup_seen;
+  const bool count_dup = do_hash && !dup_cont;
+
+  // ---- main pass: fused decompress + parallel parse, chunk by chunk ----
+  std::vector<std::unique_ptr<FastqStats>> wstats(nthreads);
+  std::vector<std::unique_ptr<BamReader>> bw(nthreads);
+  std::vector<std::vector<std::size_t>> deltas(nthreads);
+  std::vector<std::vector<GCRecord>> gcr(nthreads);
+  std::vector<std::vector<std::pair<std::uint32_t, std::uint32_t>>> tilerecs(nthreads);
+  for (std::size_t t = 0; t < nthreads; ++t) {
+    wstats[t].reset(new FastqStats(config.do_kmer));
+    bw[t].reset(new BamReader(config, BUF));
+    bw[t]->bam_worker_init();
+    if (count_dup) deltas[t].assign(nent, 0);
+  }
+  std::vector<std::size_t> gstart(nthreads + 1, 0);  // tile reconstruction only
+  std::vector<std::size_t> offs;                     // record offsets in the chunk
+  std::vector<std::size_t> tcount(nthreads, 0);
+  std::size_t total = 0;
+  leftover.clear();
+  for (std::size_t c = 0; c < nchunks; ++c) {
+    const std::size_t off = leftover.size();
+    if (off) std::memcpy(buf, leftover.data(), off);
+    const std::size_t un = decompress_chunk(c, off);
+    if (un == SIZE_MAX) break;
+    const std::size_t end = off + un;
+    std::size_t q = (c == 0) ? bam_records_start(buf, end) : 0;
+    if (q == SIZE_MAX) break;
+    // walk this chunk's complete records; the trailing partial one -> leftover
+    offs.clear();
+    while (q + 4 <= end) {
+      const std::size_t bsz = rd_bsz(q);
+      if (q + 4 + bsz > end) break;
+      offs.push_back(q);
+      q += 4 + bsz;
+    }
+    leftover.assign(buf + q, buf + end);
+    const std::size_t nrec = offs.size();
+    if (nrec == 0) continue;
+    // parallel parse: contiguous record sub-range per thread
+    for (std::size_t t = 0; t <= nthreads; ++t)
+      gstart[t] = nrec * t / nthreads;  // reused as chunk-local split
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(nthreads) schedule(static)
+#endif
+    for (std::size_t t = 0; t < nthreads; ++t) {
+      const std::size_t lo = gstart[t], hi = gstart[t + 1];
+      tcount[t] = hi - lo;
+      if (lo >= hi) continue;
+      FastqStats &ws = *wstats[t];
+      BamReader &w = *bw[t];
+      std::vector<GCRecord> &gc = gcr[t];
+      if (gc.size() < hi - lo) gc.assign(hi - lo, GCRecord{0, 0, 0});
+      for (std::size_t j = lo; j < hi; ++j) {
+        const std::size_t g = total + j;
+        const std::size_t p = offs[j];
+        const std::size_t bsz = rd_bsz(p);
+        std::size_t tile_cur = 0;
+        const std::size_t seqlen = w.process_record_parallel(
+          buf + p + 4, static_cast<uint32_t>(bsz), ws, &gc[j - lo], g, tile_cur);
+        if (count_dup && g >= fill_boundary) {
+          const auto it = master.sequence_count.find(
+            w.buffer, get_truncate_point(seqlen));
+          if (it != master.sequence_count.end())
+            ++deltas[t][static_cast<std::size_t>(it - mbegin)];
+        }
+      }
+    }
+    // replay this chunk's GC in global read order (threads 0..nth-1)
+    for (std::size_t t = 0; t < nthreads; ++t) {
+      const std::vector<GCRecord> &gc = gcr[t];
+      const std::size_t n = tcount[t];
+      for (std::size_t j = 0; j < n; ++j) {
+        const GCRecord &gr = gc[j];
+        if (gr.kind == 1) {
+          for (const auto &v : master.gc_models[gr.a].models[gr.b])
+            master.gc_count[v.percent] += v.increment;
+        }
+        else if (gr.kind == 2)
+          ++master.gc_count[gr.a];
+      }
+    }
+    total += nrec;
+  }
+
+  std::vector<std::vector<GCRecord>> empty_gc(nthreads);
+  merge_worker_stats(config, master, nthreads, total, wstats, empty_gc, deltas,
+                     tilerecs, gstart, count_dup, /*tile_ignore=*/true,
+                     /*skip_gc=*/true);
+  munmap(buf, bufcap);
+  close(ix.fd);
+  return;
+#else
+  bam_read_serial(config, master);
+#endif
+}
+
 void
 read_bam_chunked(FalcoConfig &config, FastqStats &master,
                  std::size_t nthreads) {

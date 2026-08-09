@@ -703,7 +703,7 @@ analyze_and_write(FalcoConfig &falco_config, const std::string &filename,
       // parallel BAM (byte-identical; tile reconstructed inside). -t1 keeps the
       // streaming serial reader: with no parallelism the extra offset-walk +
       // temp-file write cost more than they save.
-      read_bam_chunked(falco_config, stats, falco_config.threads);
+      read_bam_fused(falco_config, stats, falco_config.threads);
     }
     else {
       BamReader in(falco_config, stats.SHORT_READ_THRESHOLD);

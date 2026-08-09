@@ -511,6 +511,10 @@ void read_gz_chunked(FalcoConfig &config, FastqStats &master, size_t nthreads);
 // parallel across nthreads, byte-identical to the serial BamReader path.
 void read_bam_chunked(FalcoConfig &config, FastqStats &master, size_t nthreads);
 
+// [FalcoAmadeus] FUSED BAM driver: decompress one chunk at a time into a reused
+// huge-page buffer and parse it, never materialising the whole stream.
+void read_bam_fused(FalcoConfig &config, FastqStats &master, size_t nthreads);
+
 /*******************************************************/
 /*************** READ SAM RECORD ***********************/
 /*******************************************************/
