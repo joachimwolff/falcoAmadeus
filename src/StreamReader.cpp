@@ -2435,14 +2435,247 @@ read_bytesplit_core(FalcoConfig &config, FastqStats &master,
     releaser.join();
 }
 
-// FASTQ / gz-FASTQ instantiation of the byte-split driver.
+// [FalcoAmadeus] Chunked (zero-copy) variant of the byte-split driver for
+// in-memory input. read_bytesplit_core parses each thread's whole range in one
+// pass and must therefore hold ONE GCRecord PER READ until the final ordered
+// GC replay -- 4 bytes x reads, ~650 MB at 163M reads, the dominant RSS term
+// on big uncompressed/BGZF inputs. This walks the SAME buffer in ~128 MB
+// record-aligned slices (no copy: chunks are slices of the mapping), running
+// sync / count / dup-prefix / parallel parse / ordered GC replay PER SLICE, so
+// per-read state is bounded by a slice (~6 MB) and consumed slices are dropped
+// (madvise) behind the cursor. Identical results: the dup "first 100k unique"
+// prefix continues across slices with the same global read order, per-slice GC
+// replay preserves the exact global FP accumulation order, and subsampling
+// indices are the same global g. Tile-less input only; tiled falls back to the
+// whole-buffer driver (tile reconstruction wants globally contiguous ranges).
+template <class P>
+static void
+read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
+                 const char *base, std::size_t size,
+                 std::function<void()> release_input = {},
+                 bool can_drop = false) {
+  const std::size_t BUF = FastqStats::SHORT_READ_THRESHOLD;
+  typename P::Worker cfg(config, BUF);
+  const bool tile_ignore = cfg.tile_ignore;
+  const bool do_hash = cfg.do_sequence_hash;
+  if (!tile_ignore || size == 0) {
+    read_bytesplit_core<P>(config, master, nthreads, base, size,
+                           std::move(release_input), can_drop);
+    return;
+  }
+  config.do_tile = false;  // mirror the whole-buffer driver's tile-less path
+
+  const std::size_t CHUNK = std::size_t(128) << 20;
+  const std::size_t PGSZ = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+  auto drop_range = [&](std::size_t a, std::size_t b) {
+    if (!can_drop)
+      return;
+    const std::size_t sa = (a + PGSZ - 1) & ~(PGSZ - 1);
+    const std::size_t sb = b & ~(PGSZ - 1);
+    if (sb > sa)
+      madvise(const_cast<char *>(base) + sa, sb - sa, MADV_DONTNEED);
+  };
+
+  std::vector<std::unique_ptr<typename P::Worker>> workers(nthreads);
+  std::vector<std::unique_ptr<FastqStats>> wstats(nthreads);
+  std::vector<std::vector<std::size_t>> deltas(nthreads);
+  std::vector<std::vector<GCRecord>> gcr(nthreads);
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(nthreads) schedule(static)
+#endif
+  for (std::size_t t = 0; t < nthreads; ++t) {
+    workers[t].reset(new typename P::Worker(config, BUF));
+    workers[t]->hard_end = base + size;
+    wstats[t].reset(new FastqStats(config.do_kmer));
+  }
+
+  bool dup_cont = true;
+  std::size_t dup_seen = 0, nent = 0, total = 0;
+  auto mbegin = master.sequence_count.begin();
+  std::vector<std::size_t> sync(nthreads + 1), counts(nthreads),
+    gstart(nthreads + 1);
+  auto nodrop = [](std::size_t, std::size_t) {};
+
+  std::size_t off = P::find_start(base, size, 0);
+  std::size_t dropped = 0;
+  while (off < size) {
+    const std::size_t end = std::min(off + CHUNK, size);
+    // ---- slice limit: last record boundary <= end (whole tail slice at EOF) --
+    std::size_t plimit;
+    if (end == size) {
+      plimit = size;
+    }
+    else {
+      const std::size_t BACK = std::size_t(8) << 20;
+      std::size_t q = P::find_start(base, end, end > BACK ? end - BACK : 0);
+      if (q >= end || q < off)
+        q = off;  // records longer than the probe window: walk from the front
+      for (;;) {
+        const char *k;
+        std::size_t kl;
+        const std::size_t r = P::dup_key(base, end, q, k, kl);
+        if (r >= end)
+          break;  // record at q straddles end -> next slice starts at q
+        q = r;
+      }
+      plimit = (q > off) ? q : end;  // degenerate giant record: take the slice
+    }
+
+    // ---- Phase 0: per-thread record-boundary sync points over [off, plimit) --
+    sync[0] = off;
+    sync[nthreads] = plimit;
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(nthreads) schedule(static)
+#endif
+    for (std::size_t t = 1; t < nthreads; ++t)
+      sync[t] =
+        P::find_start(base, plimit, off + t * ((plimit - off) / nthreads));
+    for (std::size_t t = 1; t <= nthreads; ++t)
+      if (sync[t] < sync[t - 1])
+        sync[t] = sync[t - 1];
+
+    // ---- Phase 1: records per thread ----
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(nthreads) schedule(static)
+#endif
+    for (std::size_t t = 0; t < nthreads; ++t)
+      counts[t] = (sync[t] < sync[t + 1])
+        ? P::count_chunk(base, sync[t], sync[t + 1], plimit, nodrop)
+        : 0;
+    gstart[0] = total;
+    for (std::size_t t = 0; t < nthreads; ++t)
+      gstart[t + 1] = gstart[t] + counts[t];
+    const std::size_t nrec = gstart[nthreads] - total;
+
+    // ---- duplication prefix continues across slices (global read order) ----
+    if (do_hash && dup_cont) {
+      std::size_t p = off;
+      while (dup_cont && p < plimit) {
+        const char *key;
+        std::size_t klen;
+        const std::size_t next = P::dup_key(base, plimit, p, key, klen);
+        const auto it = master.sequence_count.find(key, klen);
+        if (it == master.sequence_count.end()) {
+          master.sequence_count.emplace(key, klen, 1);
+          master.count_at_limit = dup_seen;
+          ++master.num_unique_seen;
+          if (master.num_unique_seen == Constants::unique_reads_stop_counting) {
+            dup_cont = false;
+            ++dup_seen;
+            break;
+          }
+        }
+        else {
+          ++it->second;
+          master.count_at_limit += dup_cont;
+        }
+        ++dup_seen;
+        p = next;
+      }
+    }
+    const std::size_t fill_boundary = dup_cont ? SIZE_MAX : dup_seen;
+    const bool count_dup = do_hash && !dup_cont;
+    if (count_dup && nent == 0) {
+      nent = master.sequence_count.size();
+      mbegin = master.sequence_count.begin();
+      for (std::size_t t = 0; t < nthreads; ++t)
+        deltas[t].assign(nent, 0);
+    }
+
+    // ---- Phase 2: parallel parse (deferred dup, per-thread drop-behind) ----
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(nthreads) schedule(static)
+#endif
+    for (std::size_t t = 0; t < nthreads; ++t) {
+      const std::size_t n = counts[t];
+      std::vector<GCRecord> &gc = gcr[t];
+      if (gc.size() < n)
+        gc.assign(n, GCRecord{0, 0, 0});
+      typename P::Worker &w = *workers[t];
+      FastqStats &ws = *wstats[t];
+      const std::size_t g0 = gstart[t];
+      const bool tail = (plimit == size) && (sync[t + 1] == plimit);
+      std::size_t p = sync[t];
+      std::size_t tdrop = sync[t];
+      const std::size_t DW = std::size_t(1) << 20;
+      std::uint64_t ph = 0;
+      const char *pp = nullptr;
+      std::size_t pn = 0;
+      bool pv = false;
+      for (std::size_t j = 0; j < n; ++j) {
+        const std::size_t g = g0 + j;
+        std::size_t seqlen = 0, tile_cur = 0;
+        const char *key = nullptr;
+        p = P::parse_one(w, ws, base, plimit, p, g, &gc[j], tile_ignore,
+                         tail && (j + 1 == n), seqlen, tile_cur, key);
+        if (count_dup && g >= fill_boundary) {
+          const std::size_t klen = get_truncate_point(seqlen);
+          const std::uint64_t h = DupHashMap::hash_of(key, klen);
+          master.sequence_count.prefetch(h);
+          if (pv) {
+            const auto it = master.sequence_count.find_hashed(ph, pp, pn);
+            if (it != master.sequence_count.end())
+              ++deltas[t][static_cast<std::size_t>(it - mbegin)];
+          }
+          ph = h; pp = key; pn = klen; pv = true;
+        }
+        if (can_drop && p - tdrop >= DW) {
+          drop_range(tdrop, p);
+          tdrop = p;
+        }
+      }
+      if (pv) {
+        const auto it = master.sequence_count.find_hashed(ph, pp, pn);
+        if (it != master.sequence_count.end())
+          ++deltas[t][static_cast<std::size_t>(it - mbegin)];
+      }
+    }
+
+    // ---- ordered GC replay for this slice (global read order) ----
+    for (std::size_t t = 0; t < nthreads; ++t) {
+      const std::vector<GCRecord> &gc = gcr[t];
+      const std::size_t n = counts[t];
+      for (std::size_t j = 0; j < n; ++j) {
+        const GCRecord &gr = gc[j];
+        if (gr.kind == 1) {
+          for (const auto &v : master.gc_models[gr.a].models[gr.b])
+            master.gc_count[v.percent] += v.increment;
+        }
+        else if (gr.kind == 2) {
+          ++master.gc_count[gr.a];
+        }
+      }
+    }
+    total += nrec;
+    drop_range(dropped, plimit);
+    dropped = plimit;
+    off = plimit;
+  }
+
+  std::thread releaser;
+  if (release_input)
+    releaser = std::thread(std::move(release_input));
+  std::vector<std::vector<GCRecord>> empty_gc(nthreads);
+  std::vector<std::vector<std::pair<std::uint32_t, std::uint32_t>>> tilerecs(
+    nthreads);
+  const bool count_dup_final = do_hash && !dup_cont;
+  merge_worker_stats(config, master, nthreads, total, wstats, empty_gc, deltas,
+                     tilerecs, gstart, count_dup_final,
+                     /*tile_ignore=*/true, /*skip_gc=*/true);
+  if (releaser.joinable())
+    releaser.join();
+}
+
+// FASTQ / gz-FASTQ instantiation of the byte-split driver. Routes tile-less
+// input through the sliced driver (bounded per-read state); tiled input takes
+// the whole-buffer driver inside read_bytes_fused's fallback.
 static void
 read_chunked_core(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
                   const char *base, std::size_t size,
                   std::function<void()> release_input = {},
                   bool can_drop = false) {
-  read_bytesplit_core<FastqPolicy>(config, master, nthreads, base, size,
-                                   std::move(release_input), can_drop);
+  read_bytes_fused<FastqPolicy>(config, master, nthreads, base, size,
+                                std::move(release_input), can_drop);
 }
 
 #ifdef USE_ISAL
@@ -2784,8 +3017,8 @@ read_sam_chunked(FalcoConfig &config, FastqStats &master, std::size_t nthreads) 
   PlainBlockReader *src = new PlainBlockReader(config.filename);
   const char *data = src->data();
   const std::size_t sz = src->size();
-  read_bytesplit_core<SamPolicy>(config, master, nthreads, data, sz,
-                                 [src]() { delete src; }, /*can_drop=*/true);
+  read_bytes_fused<SamPolicy>(config, master, nthreads, data, sz,
+                              [src]() { delete src; }, /*can_drop=*/true);
 }
 
 void
