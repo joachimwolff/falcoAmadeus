@@ -2839,27 +2839,20 @@ read_bam_chunked(FalcoConfig &config, FastqStats &master,
     auto rd_bsz = [&](std::size_t p) {
       int32_t v; std::memcpy(&v, base + p, 4); return static_cast<std::size_t>(v);
     };
-    // Walk 1: count records.
-    std::size_t total = 0, p = rec0, w1drop = rec0;
-    while (p + 4 <= size) {
-      const std::size_t bsz = rd_bsz(p);
-      if (p + 4 + bsz > size) break;
-      ++total; p += 4 + bsz;
-      if (p - w1drop >= (std::size_t(4) << 20)) { bdrop(w1drop, p); w1drop = p; }
-    }
     // dispatcher-only reader for config flags
     ParallelWorker cfg(config, BUF);
     const bool tile_ignore = cfg.tile_ignore;
     const bool do_hash = cfg.do_sequence_hash;
 
     // ---- duplication prefix (serial): fix the "first 100k unique" set ----
-    // (independent of the offset walk below, so it runs first for both paths)
-    std::size_t fill_boundary = 0;
+    // Walks only the file head. dup_cont/dup_seen feed each path's fill_boundary
+    // once it has counted total in its single offset walk (BAM scanned once).
+    bool dup_cont = true; std::size_t dup_seen = 0;
     if (do_hash) {
       BamReader keyer(config, BUF); keyer.bam_worker_init();
       std::vector<char> key(BUF + 8);
-      bool cont = true; std::size_t seen = 0, pp = rec0;
-      while (pp + 4 <= size && cont) {
+      std::size_t pp = rec0;
+      while (pp + 4 <= size && dup_cont) {
         const std::size_t bsz = rd_bsz(pp);
         if (pp + 4 + bsz > size) break;
         std::size_t klen = 0;
@@ -2868,23 +2861,21 @@ read_bam_chunked(FalcoConfig &config, FastqStats &master,
         const auto it = master.sequence_count.find(key.data(), klen);
         if (it == master.sequence_count.end()) {
           master.sequence_count.emplace(key.data(), klen, 1);
-          master.count_at_limit = seen;
+          master.count_at_limit = dup_seen;
           ++master.num_unique_seen;
           if (master.num_unique_seen == Constants::unique_reads_stop_counting) {
-            cont = false; ++seen; break;
+            dup_cont = false; ++dup_seen; break;
           }
         }
         else {
           ++it->second;
-          master.count_at_limit += cont;
+          master.count_at_limit += dup_cont;
         }
-        ++seen; pp += 4 + bsz;
+        ++dup_seen; pp += 4 + bsz;
       }
-      fill_boundary = cont ? total : seen;
     }
     const std::size_t nent = do_hash ? master.sequence_count.size() : 0;
     const auto mbegin = master.sequence_count.begin();
-    const bool count_dup = do_hash && (fill_boundary < total);
 
     std::vector<std::unique_ptr<FastqStats>> wstats(nthreads);
     std::vector<std::vector<std::size_t>> deltas(nthreads);
@@ -2900,19 +2891,25 @@ read_bam_chunked(FalcoConfig &config, FastqStats &master,
       // so peak memory is O(one segment) instead of O(all reads).
       const std::size_t sub = std::max<std::size_t>(
         1, (std::size_t(2) << 20) / std::max<std::size_t>(1, nthreads));
-      const std::size_t nsub = total == 0 ? 0 : (total + sub - 1) / sub;
-      // offset grid: byte offset of record k*sub (replaces walk 2).
-      std::vector<std::size_t> suboff(nsub + 1, rec0);
+      // Single walk: record the byte offset of every sub-th record AND count the
+      // total (one scan of the decompressed stream, not a count + an offset pass).
+      std::vector<std::size_t> suboff;
+      suboff.reserve(4096);
+      std::size_t total = 0;
       {
-        std::size_t idx = 0, q = rec0, k = 0, wdrop = rec0;
-        while (q + 4 <= size && idx < total) {
-          if (idx == k * sub && k <= nsub) suboff[k++] = q;
+        std::size_t q = rec0, wdrop = rec0;
+        while (q + 4 <= size) {
           const std::size_t bsz = rd_bsz(q);
-          q += 4 + bsz; ++idx;
+          if (q + 4 + bsz > size) break;
+          if (total % sub == 0) suboff.push_back(q);
+          ++total; q += 4 + bsz;
           if (q - wdrop >= (std::size_t(4) << 20)) { bdrop(wdrop, q); wdrop = q; }
         }
-        while (k <= nsub) suboff[k++] = q;
+        suboff.push_back(q);  // sentinel: end of the last block
       }
+      const std::size_t nsub = suboff.empty() ? 0 : suboff.size() - 1;
+      const std::size_t fill_boundary = dup_cont ? total : dup_seen;
+      const bool count_dup = do_hash && (fill_boundary < total);
       for (std::size_t t = 0; t < nthreads; ++t) {
         wstats[t].reset(new FastqStats(config.do_kmer));
         if (count_dup) deltas[t].assign(nent, 0);
@@ -2984,6 +2981,18 @@ read_bam_chunked(FalcoConfig &config, FastqStats &master,
     }
 
     // ---- full-buffer parse (tiles present): one contiguous chunk per thread --
+    std::size_t total = 0;
+    {
+      std::size_t q = rec0, wc = rec0;
+      while (q + 4 <= size) {
+        const std::size_t bsz = rd_bsz(q);
+        if (q + 4 + bsz > size) break;
+        ++total; q += 4 + bsz;
+        if (q - wc >= (std::size_t(4) << 20)) { bdrop(wc, q); wc = q; }
+      }
+    }
+    const std::size_t fill_boundary = dup_cont ? total : dup_seen;
+    const bool count_dup = do_hash && (fill_boundary < total);
     // Walk 2: per-thread chunk-start byte offsets (record-aligned).
     std::vector<std::size_t> choff(nthreads + 1, rec0);
     std::vector<std::size_t> counts(nthreads, 0);
