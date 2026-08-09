@@ -2659,7 +2659,16 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
   }
   config.do_tile = false;  // mirror the whole-buffer driver's tile-less path
 
-  const std::size_t CHUNK = std::size_t(128) << 20;
+  // Slice size scales with the thread count: parsed pages stay resident until
+  // the slice's deferred drop, so the slice is the driver's RSS window. 16 MB
+  // per thread keeps -t1 near the serial readers' footprint while -t8+ keeps
+  // the full 128 MB slices. Slicing CANNOT affect output: the dup prefix,
+  // range decomposition and GC replay all preserve the global record order
+  // whatever the slice boundaries (and the t1..tN identity gate covers the
+  // different slicings empirically).
+  const std::size_t CHUNK =
+    std::min(std::size_t(128) << 20,
+             std::max(std::size_t(16) << 20, nthreads * (std::size_t(16) << 20)));
   const std::size_t PGSZ = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
   auto drop_range = [&](std::size_t a, std::size_t b) {
     if (!can_drop)

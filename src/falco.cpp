@@ -690,11 +690,19 @@ analyze_and_write(FalcoConfig &falco_config, const std::string &filename,
   // skipped.
   const bool par = falco_config.threads >= 2 && falco_config.read_step == 1;
   const bool par_seek = par && falco_config.seekable_input;
+  // [FalcoAmadeus] Seekable FASTQ/SAM with read_step == 1 routes through the
+  // byte-split drivers at EVERY thread count, including -t1: the drivers are
+  // byte-identical to the serial readers at any nthreads (the standing t1==tN
+  // invariance), and the in-place mmap parse skips the serial readers'
+  // per-line fgets copies. Pipes/stdin and read_step > 1 keep the streaming
+  // serial readers.
+  const bool bytesplit_seek =
+    falco_config.read_step == 1 && falco_config.seekable_input;
   if (falco_config.is_sam) {
     if (!falco_config.quiet)
       log_process("reading file as SAM format");
-    if (par_seek) {
-      // parallel SAM on the shared byte-split driver (tile reconstructed inside).
+    if (bytesplit_seek) {
+      // byte-split SAM driver (tile reconstructed inside), any thread count
       read_sam_chunked(falco_config, stats, falco_config.threads);
     }
     else {
@@ -728,7 +736,9 @@ analyze_and_write(FalcoConfig &falco_config, const std::string &filename,
     // chunked parallel parse, byte-identical to single-threaded. Only for
     // read_step == 1; the subsampling counter logic is left to the serial path
     // otherwise.
-    if (par && falco_config.seekable_input) {
+    if (bytesplit_seek) {
+      // fused gz driver at every thread count: -t1 also gains the in-place
+      // chunk parse over the serial reader's per-line getline copies
       read_gz_chunked(falco_config, stats, falco_config.threads);
     }
     else if (par) {
@@ -747,7 +757,7 @@ analyze_and_write(FalcoConfig &falco_config, const std::string &filename,
     // multi-threaded parser: memory-mapped dispatch + parallel per-read stats,
     // byte-identical to single-threaded. Only for read_step == 1 (same reason
     // as the gzipped path).
-    if (par_seek) {
+    if (bytesplit_seek) {
       read_uncompressed_chunked(falco_config, stats, falco_config.threads);
     }
     else {
