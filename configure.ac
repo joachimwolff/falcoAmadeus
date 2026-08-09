@@ -70,6 +70,16 @@ AS_IF([test "x$enable_hts" = "xyes"],
 )
 AM_CONDITIONAL([HAVE_LIBDEFLATE], [test "x$have_libdeflate" = "xyes"])
 
+dnl Optionally use Intel ISA-L igzip for fast streaming gzip inflate. Independent
+dnl of HTSLib -- it accelerates the plain (non-BGZF) gzip path, whose single
+dnl DEFLATE stream cannot be parallel-decompressed. Falls back to zlib/htslib.
+have_isal=no
+AC_CHECK_HEADER([isa-l/igzip_lib.h],
+  [AC_CHECK_LIB([isal], [isal_inflate],
+    [have_isal=yes
+     LIBS="-lisal $LIBS"], [])], [])
+AM_CONDITIONAL([HAVE_ISAL], [test "x$have_isal" = "xyes"])
+
 AC_CONFIG_FILES([Makefile])
 dnl make the test data files available in the build tree
 AC_CONFIG_LINKS([

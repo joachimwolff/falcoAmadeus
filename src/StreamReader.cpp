@@ -1546,7 +1546,15 @@ read_parallel_impl(FalcoConfig &config, FastqStats &master,
 void
 read_gz_parallel(FalcoConfig &config, FastqStats &master,
                  std::size_t nthreads) {
-#ifdef USE_HTS
+#if defined(USE_ISAL)
+  // Plain (non-BGZF) gzip is one DEFLATE stream, so the inflate is serial no
+  // matter the thread count -- decompression throughput is the ceiling. ISA-L's
+  // vectorized inflate is markedly faster than zlib here; stream it one bounded
+  // block at a time on a background thread while the worker pool parses. Same
+  // decompressed bytes and order -> byte-identical to every other path.
+  IsalBlockReader decomp(config.filename, (1u << 22), 6);
+  read_parallel_impl(config, master, nthreads, decomp);
+#elif defined(USE_HTS)
   // Decompress via htslib (libdeflate; BGZF blocks in parallel via bgzf_mt),
   // then parse with the same dispatcher/worker machinery. Byte-identical: the
   // decompressed bytes are the same as zlib's, so the parsed reads are too.

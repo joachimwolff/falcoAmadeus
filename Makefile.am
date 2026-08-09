@@ -30,6 +30,9 @@ endif
 if HAVE_LIBDEFLATE
 CPPFLAGS += -DUSE_LIBDEFLATE
 endif
+if HAVE_ISAL
+CPPFLAGS += -DUSE_ISAL
+endif
 
 bin_PROGRAMS = falcoAmadeus
 

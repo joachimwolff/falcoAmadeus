@@ -31,6 +31,12 @@
 // Optional zlib usage
 #include <zlib.h>
 
+// Optional Intel ISA-L igzip (fast vectorized gzip inflate)
+#ifdef USE_ISAL
+#include <cstdint>
+#include <isa-l/igzip_lib.h>
+#endif
+
 // Memory map
 #include <unistd.h>
 #include <fcntl.h>
@@ -309,6 +315,213 @@ class GzBlockDecompressor {
   bool eof() const { return consumed_eof; }
   size_t compressed_offset() const { return comp_offset.load(); }
 };
+
+#ifdef USE_ISAL
+/*******************************************************/
+/*************** ISA-L GZ DECOMPRESSOR *****************/
+/*******************************************************/
+// Streaming gzip decompressor backed by Intel ISA-L igzip. Same consumer
+// interface as GzBlockDecompressor / BgzfBlockReader (getline + eof), but it
+// inflates on a background thread with ISA-L's vectorized inflate, which is
+// markedly faster than zlib on a single (non-BGZF) DEFLATE stream (the one
+// stream cannot be parallel-decompressed, so serial inflate speed is the cap).
+// Bounded memory: a small compressed input buffer plus a fixed pool of
+// decompressed blocks. Transparently steps across concatenated gzip members.
+class IsalBlockReader {
+ private:
+  int fd_ = -1;
+  std::string path_;
+  const size_t block_size_;
+  std::vector<uint8_t> in_buf_;      // compressed input staging
+  struct inflate_state state_;
+  bool input_eof_ = false;           // no more compressed bytes from the file
+
+  std::vector<std::vector<char>> blocks_;  // fixed pool of decompressed blocks
+  std::vector<size_t> lens_;
+  std::queue<int> free_q_, filled_q_;
+  std::mutex mtx_;
+  std::condition_variable free_cv_, filled_cv_;
+  std::thread worker_;
+  bool producer_done_ = false, stop_requested_ = false;
+  std::string err_;                  // set if the background inflate failed
+
+  int cur_idx_ = -1;
+  size_t cur_pos_ = 0, cur_len_ = 0;
+  bool consumed_eof_ = false;
+
+  // Fill `out` (cap bytes) with decompressed data; returns bytes produced,
+  // 0 only at true end of stream. Refills compressed input as needed and steps
+  // across concatenated gzip members.
+  size_t inflate_fill(char *out, size_t cap) {
+    state_.next_out = reinterpret_cast<uint8_t *>(out);
+    state_.avail_out = static_cast<uint32_t>(cap);
+    while (state_.avail_out > 0) {
+      if (state_.avail_in == 0 && !input_eof_) {
+        const ssize_t n = ::read(fd_, in_buf_.data(), in_buf_.size());
+        if (n <= 0)
+          input_eof_ = true;
+        else {
+          state_.next_in = in_buf_.data();
+          state_.avail_in = static_cast<uint32_t>(n);
+        }
+      }
+      if (state_.avail_in == 0 && input_eof_)
+        break;  // nothing left to feed
+      const int ret = isal_inflate(&state_);
+      if (ret != ISAL_DECOMP_OK)
+        throw std::runtime_error("ISA-L inflate error (" + std::to_string(ret) +
+                                 ") on : " + path_);
+      if (state_.block_state == ISAL_BLOCK_FINISH) {
+        // Finished one gzip member. Peek for a concatenated next member; make
+        // sure at least the 2 magic bytes are contiguous at the buffer front.
+        if (state_.avail_in < 2 && !input_eof_) {
+          size_t off = 0;
+          if (state_.avail_in == 1) { in_buf_[0] = state_.next_in[0]; off = 1; }
+          const ssize_t n = ::read(fd_, in_buf_.data() + off, in_buf_.size() - off);
+          if (n <= 0)
+            input_eof_ = true;
+          state_.next_in = in_buf_.data();
+          state_.avail_in = static_cast<uint32_t>(off + (n > 0 ? (size_t)n : 0));
+        }
+        if (state_.avail_in >= 2 && state_.next_in[0] == 0x1f &&
+            state_.next_in[1] == 0x8b) {
+          uint8_t *keep_in = state_.next_in;
+          const uint32_t keep_av = state_.avail_in;
+          isal_inflate_reset(&state_);
+          state_.crc_flag = ISAL_GZIP;
+          state_.next_in = keep_in;   // reset clears these; restore the member
+          state_.avail_in = keep_av;
+        } else {
+          input_eof_ = true;          // trailing bytes are not another member
+          break;
+        }
+      }
+    }
+    return cap - state_.avail_out;
+  }
+
+  void producer_loop() {
+    while (true) {
+      int idx;
+      {
+        std::unique_lock<std::mutex> lk(mtx_);
+        free_cv_.wait(lk, [&] { return !free_q_.empty() || stop_requested_; });
+        if (stop_requested_)
+          return;
+        idx = free_q_.front();
+        free_q_.pop();
+      }
+      size_t n = 0;
+      std::string e;
+      try {
+        n = inflate_fill(blocks_[idx].data(), block_size_);
+      } catch (const std::exception &ex) {
+        e = ex.what();
+      }
+      std::lock_guard<std::mutex> lk(mtx_);
+      if (n > 0 && e.empty()) {
+        lens_[idx] = n;
+        filled_q_.push(idx);
+      } else {
+        free_q_.push(idx);
+        producer_done_ = true;
+        if (!e.empty())
+          err_ = e;
+        filled_cv_.notify_one();
+        return;
+      }
+      filled_cv_.notify_one();
+    }
+  }
+
+  bool ensure_data() {
+    if (cur_idx_ >= 0 && cur_pos_ < cur_len_)
+      return true;
+    if (cur_idx_ >= 0) {
+      {
+        std::lock_guard<std::mutex> lk(mtx_);
+        free_q_.push(cur_idx_);
+      }
+      free_cv_.notify_one();
+      cur_idx_ = -1;
+    }
+    std::unique_lock<std::mutex> lk(mtx_);
+    filled_cv_.wait(lk, [&] { return !filled_q_.empty() || producer_done_; });
+    if (filled_q_.empty()) {  // producer finished and nothing left to consume
+      consumed_eof_ = true;
+      if (!err_.empty()) {
+        const std::string e = err_;
+        lk.unlock();
+        throw std::runtime_error(e);
+      }
+      return false;
+    }
+    cur_idx_ = filled_q_.front();
+    filled_q_.pop();
+    cur_pos_ = 0;
+    cur_len_ = lens_[cur_idx_];
+    return true;
+  }
+
+ public:
+  IsalBlockReader(const std::string &path, size_t bs, int npool)
+      : path_(path), block_size_(bs), in_buf_(1u << 20) {
+    fd_ = ::open(path.c_str(), O_RDONLY);
+    if (fd_ < 0)
+      throw std::runtime_error("Cannot open gzip FASTQ file : " + path);
+#ifdef POSIX_FADV_SEQUENTIAL
+    posix_fadvise(fd_, 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
+    isal_inflate_init(&state_);
+    state_.crc_flag = ISAL_GZIP;  // parse the gzip header/trailer, verify crc
+    blocks_.resize(npool);
+    lens_.assign(npool, 0);
+    for (int i = 0; i < npool; ++i) {
+      blocks_[i].resize(block_size_);
+      free_q_.push(i);
+    }
+    worker_ = std::thread(&IsalBlockReader::producer_loop, this);
+  }
+  ~IsalBlockReader() {
+    {
+      std::lock_guard<std::mutex> lk(mtx_);
+      stop_requested_ = true;
+    }
+    free_cv_.notify_all();
+    filled_cv_.notify_all();
+    if (worker_.joinable())
+      worker_.join();
+    if (fd_ >= 0)
+      ::close(fd_);
+  }
+  IsalBlockReader(const IsalBlockReader &) = delete;
+  IsalBlockReader &operator=(const IsalBlockReader &) = delete;
+
+  // Copy one line (up to and including '\n', NUL-terminated) into dst, exactly
+  // like gzgets. Returns bytes written (0 only at end of stream).
+  size_t getline(char *dst, size_t maxlen) {
+    size_t i = 0;
+    const size_t lim = maxlen - 1;
+    while (i < lim) {
+      if (!ensure_data())
+        break;
+      const std::vector<char> &blk = blocks_[cur_idx_];
+      while (cur_pos_ < cur_len_ && i < lim) {
+        const char c = blk[cur_pos_++];
+        dst[i++] = c;
+        if (c == '\n') {
+          dst[i] = '\0';
+          return i;
+        }
+      }
+    }
+    dst[i] = '\0';
+    return i;
+  }
+
+  bool eof() const { return consumed_eof_; }
+};
+#endif  // USE_ISAL
 
 /*******************************************************/
 /*********** PLAIN (UNCOMPRESSED) LINE SOURCE **********/
