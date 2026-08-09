@@ -456,8 +456,10 @@ StreamReader::postprocess_sequence_line(FastqStats &stats) {
     else {
       if (parallel_mode) {
         cur_gc_record->kind = 2;
-        cur_gc_record->a = read_pos;
-        cur_gc_record->b = cur_gc_count;
+        // store the percent bin directly (same integer division the serial path
+        // uses); the discrete replay is just ++gc_count[a].
+        cur_gc_record->a = 100 * cur_gc_count / read_pos;
+        cur_gc_record->b = 0;
       }
       else {
         ++stats.gc_count[100 * cur_gc_count / read_pos];
@@ -1306,7 +1308,7 @@ read_parallel_impl(FalcoConfig &config, FastqStats &master,
             master.gc_count[v.percent] += v.increment;
         }
         else if (gr.kind == 2) {
-          ++master.gc_count[100 * gr.b / gr.a];
+          ++master.gc_count[gr.a];  // a = percent bin (kind 2)
         }
       }
     }
@@ -1798,7 +1800,7 @@ read_chunked_core(FalcoConfig &config, FastqStats &master,
           master.gc_count[v.percent] += v.increment;
       }
       else if (gr.kind == 2) {
-        ++master.gc_count[100 * gr.b / gr.a];
+        ++master.gc_count[gr.a];  // a = percent bin (kind 2)
       }
     }
   }
@@ -2015,7 +2017,18 @@ decompress_bgzf_libdeflate(const std::string &path, std::size_t nthreads) {
   close(fd);
   if (comp == MAP_FAILED)
     throw std::runtime_error("Cannot mmap FASTQ file : " + path);
-  madvise(const_cast<unsigned char *>(comp), csize, MADV_WILLNEED);
+  madvise(const_cast<unsigned char *>(comp), csize, MADV_SEQUENTIAL);
+  // Drop-behind on the compressed input mmap: the block-index walk and the
+  // decompression both consume it once, so releasing consumed pages keeps its
+  // resident set a small window instead of the whole ~compressed file (which,
+  // at scale, was the gz peak). Safe -- read-only file-backed, never re-read.
+  const std::size_t CPGSZ = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+  auto cdrop = [&](std::size_t a, std::size_t b) {
+    const std::size_t sa = (a + CPGSZ - 1) & ~(CPGSZ - 1);
+    const std::size_t sb = b & ~(CPGSZ - 1);
+    if (sb > sa)
+      madvise(const_cast<unsigned char *>(comp) + sa, sb - sa, MADV_DONTNEED);
+  };
 
   auto le16 = [](const unsigned char *q) {
     return static_cast<std::size_t>(q[0]) | (static_cast<std::size_t>(q[1]) << 8);
@@ -2027,7 +2040,7 @@ decompress_bgzf_libdeflate(const std::string &path, std::size_t nthreads) {
   };
 
   std::vector<std::size_t> coff, clen, uoff, ulen;
-  std::size_t p = 0, utotal = 0;
+  std::size_t p = 0, utotal = 0, walk_dropped = 0;
   bool bgzf_ok = true;
   while (p + 18 <= csize) {
     // gzip magic + CM=deflate + FLG.FEXTRA
@@ -2061,6 +2074,10 @@ decompress_bgzf_libdeflate(const std::string &path, std::size_t nthreads) {
     }
     utotal += isize;
     p += bsize;
+    if (p - walk_dropped >= (std::size_t(16) << 20)) {  // release scanned headers
+      cdrop(walk_dropped, p);
+      walk_dropped = p;
+    }
   }
   if (!bgzf_ok || coff.empty()) {
     munmap(const_cast<unsigned char *>(comp), csize);
@@ -2098,10 +2115,17 @@ decompress_bgzf_libdeflate(const std::string &path, std::size_t nthreads) {
       ok = 0;
     }
     else {
+      // Contiguous block range per thread (not dynamic) so each thread consumes
+      // a monotonic compressed span and can drop-behind its pages.
 #ifdef _OPENMP
-#pragma omp for schedule(dynamic, 64)
+      const std::size_t tid = static_cast<std::size_t>(omp_get_thread_num());
+      const std::size_t nth = static_cast<std::size_t>(omp_get_num_threads());
+#else
+      const std::size_t tid = 0, nth = 1;
 #endif
-      for (std::size_t i = 0; i < nb; ++i) {
+      const std::size_t lo = nb * tid / nth, hi = nb * (tid + 1) / nth;
+      std::size_t cdropped = (lo < hi) ? coff[lo] : 0;
+      for (std::size_t i = lo; i < hi; ++i) {
         std::size_t act = 0;
         char *dst = (tfd >= 0) ? scratch : (out + uoff[i]);
         if (libdeflate_gzip_decompress(d, comp + coff[i], clen[i], dst, ulen[i],
@@ -2114,6 +2138,10 @@ decompress_bgzf_libdeflate(const std::string &path, std::size_t nthreads) {
 #pragma omp atomic write
 #endif
           ok = 0;
+        }
+        if (coff[i] - cdropped >= (std::size_t(8) << 20)) {  // release consumed
+          cdrop(cdropped, coff[i]);
+          cdropped = coff[i];
         }
       }
     }

@@ -63,13 +63,18 @@ get_truncate_point(const std::size_t read_pos) {
 // addition is not associative, so a reordered sum would not be byte-identical);
 // instead each worker stores one of these and a single serial pass replays them
 // in global read order, reproducing the exact sequential floating-point result.
+// Packed into 4 bytes (bitfields) so the per-read array stays small at scale:
+// at 50M reads a 12-byte record was ~600 MB; this is ~200 MB. The stored values
+// are tiny -- kind 1: a=trunc_length, b=trunc_gc, both <= SHORT_READ_THRESHOLD
+// (500); kind 2: a = the GC percentage bin (0..100), which is all the discrete
+// path needs (it just does ++gc_count[a]); so 15 bits each is ample.
 struct GCRecord {
   // 0 = no contribution (empty read or GC module off)
-  // 1 = short read, use the cached gc model with (a=trunc_length, b=trunc_gc)
-  // 2 = long read, discrete bin with (a=read_pos, b=cur_gc_count)
-  uint8_t kind;
-  uint32_t a;
-  uint32_t b;
+  // 1 = short read, cached gc model at (a=trunc_length, b=trunc_gc)
+  // 2 = long read, discrete bin a = 100*gc/read_pos (the percent), b unused
+  uint32_t b : 15;
+  uint32_t a : 15;
+  uint32_t kind : 2;
 };
 
 // Generic class that does as much as possible without assuming file format
