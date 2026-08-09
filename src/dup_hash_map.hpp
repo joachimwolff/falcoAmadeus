@@ -59,9 +59,26 @@ public:
   // file: we hash and compare the bytes in place, and only materialise a
   // std::string on the (<=100k) inserts.
   iterator find(const char *p, std::size_t n) {
-    std::size_t h = hash_key(p, n) & mask_;
+    return find_hashed(hash_key(p, n), p, n);
+  }
+  iterator find(const std::string &key) {
+    return find(key.data(), key.size());
+  }
+
+  // Split-phase lookup for the hot per-read path: hash_of + prefetch let the
+  // caller overlap the slot-table access (a 2 MB table, so typically an L2/L3
+  // load) with unrelated work, then find_hashed probes without re-hashing.
+  // Same probe sequence as find(), so identical results.
+  static std::uint64_t hash_of(const char *p, std::size_t n) {
+    return hash_key(p, n);
+  }
+  void prefetch(std::uint64_t h) const {
+    __builtin_prefetch(&slots_[h & mask_]);
+  }
+  iterator find_hashed(std::uint64_t hh, const char *p, std::size_t n) {
+    std::size_t h = static_cast<std::size_t>(hh) & mask_;
     for (;;) {
-      const std::int64_t idx = slots_[h];
+      const std::int32_t idx = slots_[h];
       if (idx < 0)
         return end();
       const std::string &k = entries_[static_cast<std::size_t>(idx)].first;
@@ -70,9 +87,6 @@ public:
       h = (h + 1) & mask_;
     }
   }
-  iterator find(const std::string &key) {
-    return find(key.data(), key.size());
-  }
 
   // Insert a key known not to be present (callers only emplace after a failed
   // find, exactly as the previous unordered_map code did).
@@ -80,7 +94,7 @@ public:
     std::size_t h = hash_key(p, n) & mask_;
     while (slots_[h] >= 0)
       h = (h + 1) & mask_;
-    slots_[h] = static_cast<std::int64_t>(entries_.size());
+    slots_[h] = static_cast<std::int32_t>(entries_.size());
     entries_.emplace_back(std::string(p, n), value);
   }
   void emplace(const std::string &key, std::size_t value) {
@@ -97,25 +111,39 @@ private:
     return x;
   }
 
-  // Strong, cheap hash over the (short, <=50 char) DNA key; 8 bytes at a time.
+  // Strong, cheap hash over the (short, <=50 char) DNA key. Two independent
+  // multiply-xor lanes halve the serial latency of the old chained-mix version
+  // (~90 -> ~40 cycles for a 50-byte key, and the lookup runs once per read);
+  // one full mix at the end restores avalanche. Changing the hash only remaps
+  // slots -- entry (insertion) order, which the modules iterate, is untouched.
   static std::uint64_t hash_key(const char *p, std::size_t n) {
-    std::uint64_t h = 0x9e3779b97f4a7c15ULL ^ (n * 0x9e3779b97f4a7c15ULL);
+    const std::uint64_t C1 = 0x9e3779b97f4a7c15ULL;
+    const std::uint64_t C2 = 0xc4ceb9fe1a85ec53ULL;
+    std::uint64_t a = C1 ^ (n * C1), b = C2;
     std::size_t i = 0;
-    for (; i + 8 <= n; i += 8) {
+    for (; i + 16 <= n; i += 16) {
+      std::uint64_t k1, k2;
+      std::memcpy(&k1, p + i, 8);
+      std::memcpy(&k2, p + i + 8, 8);
+      a = (a ^ k1) * C1;
+      b = (b ^ k2) * C2;
+    }
+    if (i + 8 <= n) {
       std::uint64_t k;
       std::memcpy(&k, p + i, 8);
-      h = mix(h ^ k);
+      a = (a ^ k) * C1;
+      i += 8;
     }
     if (i < n) {
       std::uint64_t tail = 0;
       std::memcpy(&tail, p + i, n - i);
-      h = mix(h ^ tail);
+      b = (b ^ tail) * C2;
     }
-    return h;
+    return mix(a ^ b);
   }
 
   std::vector<value_type> entries_;  // contiguous, reserved to cap (stable)
-  std::vector<std::int64_t> slots_;  // open-addressing index table (-1 = empty)
+  std::vector<std::int32_t> slots_;  // open-addressing index table (-1 = empty)
   std::size_t mask_ = 0;
 };
 

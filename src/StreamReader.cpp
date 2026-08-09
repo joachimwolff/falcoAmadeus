@@ -517,19 +517,40 @@ StreamReader::seq_simd_chunks(FastqStats &stats, const char *&c, std::size_t &rp
   const std::size_t T = FastqStats::SHORT_READ_THRESHOLD;
   const std::size_t rp0 = rp;  // start of the region this call covers
   while (rp + 64 <= bsz) {
-    if (do_gc_sequence && next_trunc < rp + 64)
-      break;
     const __m512i v = _mm512_loadu_si512(c);
-    if (_mm512_cmpeq_epi8_mask(v, vsep))
-      break;
-    if (_mm512_cmpeq_epi8_mask(v, vN))
-      break;
-    _mm512_storeu_si512(buf + rp, v);
+    const __mmask64 msep = _mm512_cmpeq_epi8_mask(v, vsep);
+    const __mmask64 mN = _mm512_cmpeq_epi8_mask(v, vN);
+    // Number of lanes this block contributes: up to the separator when one is
+    // present (the tail is then processed MASKED instead of falling to the
+    // scalar loop -- same lanes the scalar loop would have processed).
+    const unsigned mlen =
+        msep ? static_cast<unsigned>(__builtin_ctzll(msep)) : 64u;
+    if (mlen == 0)
+      break;  // separator at lane 0: nothing left on this line
+    const __mmask64 valid =
+        (mlen == 64) ? ~static_cast<__mmask64>(0)
+                     : ((static_cast<__mmask64>(1) << mlen) - 1);
+    if (mN & valid)
+      break;  // 'N' before the separator: scalar path keeps exact semantics
+    _mm512_mask_storeu_epi8(buf + rp, valid, v);
     const __m512i t = _mm512_and_si512(_mm512_srli_epi16(v, 1), v3);
-    gc += _mm512_reduce_add_epi64(
-        _mm512_sad_epu8(_mm512_and_si512(t, v1), vzero));
+    const __m512i tgc = _mm512_maskz_mov_epi8(valid, _mm512_and_si512(t, v1));
+    // GC truncation point inside this block's lanes (at most one: the step is
+    // 100 > 64). The scalar loop captures gc AFTER adding the base at index
+    // next_trunc, so the prefix mask is inclusive of that lane.
+    if (do_gc_sequence && next_trunc < rp + mlen) {
+      const unsigned L = static_cast<unsigned>(next_trunc - rp);  // < mlen <= 64
+      const __mmask64 pm = (static_cast<__mmask64>(1) << (L + 1)) - 1;
+      truncated_gc_count =
+          gc + _mm512_reduce_add_epi64(
+                   _mm512_sad_epu8(_mm512_maskz_mov_epi8(pm, tgc), vzero));
+      truncated_length = next_trunc;
+      next_trunc += 100;
+    }
+    gc += _mm512_reduce_add_epi64(_mm512_sad_epu8(tgc, vzero));
     for (int code = 0; code < 4; ++code) {
-      const __mmask64 m = _mm512_cmpeq_epi8_mask(t, _mm512_set1_epi8(code));
+      const __mmask64 m =
+          _mm512_cmpeq_epi8_mask(t, _mm512_set1_epi8(code)) & valid;
       std::uint32_t *const sp = soa + static_cast<std::size_t>(code) * T + rp;
       for (int k = 0; k < 4; ++k) {
         const __m512i cur = _mm512_loadu_si512(sp + k * 16);
@@ -538,8 +559,10 @@ StreamReader::seq_simd_chunks(FastqStats &stats, const char *&c, std::size_t &rp
         _mm512_storeu_si512(sp + k * 16, _mm512_add_epi32(cur, add));
       }
     }
-    c += 64;
-    rp += 64;
+    c += mlen;
+    rp += mlen;
+    if (mlen < 64)
+      break;  // *c is now the separator; the caller's loop exits immediately
   }
   // Adapter/k-mer sliding window over the SIMD-covered region, hoisted out of
   // the vector loop above. Interleaving this 64-iteration scalar FSM with each
@@ -2264,6 +2287,13 @@ read_bytesplit_core(FalcoConfig &config, FastqStats &master,
     const bool last_chunk = (sync[t + 1] == size);
     std::size_t p = sync[t];
     std::size_t dropped = sync[t];   // bytes released behind the cursor so far
+    // Deferred-by-one duplication lookup: hash + prefetch the current read's
+    // slot, execute the PREVIOUS read's probe -- the slot load (2 MB table,
+    // L2/L3) overlaps a full record parse. Post-cap occurrence counting is
+    // commutative, so probe order does not matter; keys point into `base`,
+    // which outlives the loop (drop-behind trails ~8 MB, never one record).
+    std::uint64_t ph = 0; const char *pp = nullptr; std::size_t pn = 0;
+    bool pv = false;
     for (std::size_t j = 0; j < n; ++j) {
       const std::size_t g = g0 + j;
       std::size_t seqlen = 0, tile_cur = 0;
@@ -2272,10 +2302,15 @@ read_bytesplit_core(FalcoConfig &config, FastqStats &master,
                        last_chunk && (j + 1 == n), seqlen, tile_cur, key);
       // duplication occurrence count (post-cap; map is read-only here)
       if (count_dup && g >= fill_boundary) {
-        const auto it =
-          master.sequence_count.find(key, get_truncate_point(seqlen));
-        if (it != master.sequence_count.end())
-          ++d[static_cast<std::size_t>(it - mbegin)];
+        const std::size_t klen = get_truncate_point(seqlen);
+        const std::uint64_t h = DupHashMap::hash_of(key, klen);
+        master.sequence_count.prefetch(h);
+        if (pv) {
+          const auto it = master.sequence_count.find_hashed(ph, pp, pn);
+          if (it != master.sequence_count.end())
+            ++d[static_cast<std::size_t>(it - mbegin)];
+        }
+        ph = h; pp = key; pn = klen; pv = true;
       }
       if (!tile_ignore)
         tr.push_back({static_cast<std::uint32_t>(seqlen),
@@ -2285,6 +2320,11 @@ read_bytesplit_core(FalcoConfig &config, FastqStats &master,
         drop_range(dropped, p);
         dropped = p;
       }
+    }
+    if (pv) {
+      const auto it = master.sequence_count.find_hashed(ph, pp, pn);
+      if (it != master.sequence_count.end())
+        ++d[static_cast<std::size_t>(it - mbegin)];
     }
   }
 
@@ -2475,6 +2515,13 @@ read_gz_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads) {
       const std::size_t g0 = gstart[t];
       const bool tail = eof && (sync[t + 1] == plimit);
       std::size_t p = sync[t];
+      // Deferred-by-one dup lookup (see read_bytesplit_core): overlap the slot
+      // load with the next record's parse. Keys point into `buf`, which is
+      // stable until after this parallel region (the straddle memmove runs
+      // later, on the dispatcher thread), and the pending probe is flushed
+      // before this thread leaves the region.
+      std::uint64_t ph = 0; const char *pp = nullptr; std::size_t pn = 0;
+      bool pv = false;
       for (std::size_t j = 0; j < n; ++j) {
         const std::size_t g = g0 + j;
         std::size_t seqlen = 0, tile_cur = 0;
@@ -2482,11 +2529,21 @@ read_gz_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads) {
         p = FastqPolicy::parse_one(w, ws, buf, plimit, p, g, &gc[j], tile_ignore,
                                    tail && (j + 1 == n), seqlen, tile_cur, key);
         if (count_dup && g >= fill_boundary) {
-          const auto it =
-            master.sequence_count.find(key, get_truncate_point(seqlen));
-          if (it != master.sequence_count.end())
-            ++deltas[t][static_cast<std::size_t>(it - mbegin)];
+          const std::size_t klen = get_truncate_point(seqlen);
+          const std::uint64_t h = DupHashMap::hash_of(key, klen);
+          master.sequence_count.prefetch(h);
+          if (pv) {
+            const auto it = master.sequence_count.find_hashed(ph, pp, pn);
+            if (it != master.sequence_count.end())
+              ++deltas[t][static_cast<std::size_t>(it - mbegin)];
+          }
+          ph = h; pp = key; pn = klen; pv = true;
         }
+      }
+      if (pv) {
+        const auto it = master.sequence_count.find_hashed(ph, pp, pn);
+        if (it != master.sequence_count.end())
+          ++deltas[t][static_cast<std::size_t>(it - mbegin)];
       }
     }
 
