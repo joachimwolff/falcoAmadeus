@@ -2607,58 +2607,15 @@ read_gz_chunked(FalcoConfig &config, FastqStats &master,
     // not BGZF (plain gzip) -> fall through to the streaming bgzf reader below
   }
 #endif
-#ifdef USE_HTS
-  // Decompress the whole file into RAM -- BGZF blocks are inflated in parallel
-  // across nthreads via bgzf_mt, and htslib uses libdeflate (both external
-  // libraries) -- then parse the decompressed bytes with the chunked parallel
-  // parser. Byte-identical to the serial path (same decompressed bytes).
-  BGZF *fp = bgzf_open(std::data(config.filename), "r");
-  if (fp == nullptr)
-    throw std::runtime_error("Cannot open gzip FASTQ file : " + config.filename);
-  bgzf_mt(fp, static_cast<int>(nthreads), 256);
-  // Read decompressed bytes straight into a raw (unzeroed) buffer -- pre-sized
-  // from a typical FASTQ gz ratio and grown only if exceeded. malloc avoids the
-  // ~2 GB zero-fill a sized std::vector would do before we overwrite it.
-  std::size_t cap =
-    static_cast<std::size_t>(get_file_size(config.filename)) * 5 + (1u << 24);
-  char *buf = static_cast<char *>(std::malloc(cap));
-  if (buf == nullptr) {
-    bgzf_close(fp);
-    throw std::runtime_error("Out of memory decompressing : " + config.filename);
-  }
-  // Fault the destination pages in parallel first. Otherwise the single
-  // bgzf_read thread pays every first-touch page fault serially while writing
-  // ~2 GB, which dominates (bgzf_mt decompresses at ~11 GB/s but the serial
-  // fault-in is far slower). Touching one byte per 4 KiB page across the
-  // threads spreads that kernel work out.
-#ifdef _OPENMP
-#pragma omp parallel for num_threads(nthreads) schedule(static)
-#endif
-  for (std::size_t i = 0; i < cap; i += 4096)
-    buf[i] = 0;
-  const std::size_t STEP = (1u << 24);  // 16 MiB reads keep bgzf_mt pipelined
-  std::size_t total = 0;
-  for (;;) {
-    if (total + STEP > cap) {
-      cap = cap + cap / 2 + STEP;
-      buf = static_cast<char *>(std::realloc(buf, cap));
-      if (buf == nullptr) {
-        bgzf_close(fp);
-        throw std::runtime_error("Out of memory decompressing : " +
-                                 config.filename);
-      }
-    }
-    const ssize_t n = bgzf_read(fp, buf + total, STEP);
-    if (n <= 0)
-      break;
-    total += static_cast<std::size_t>(n);
-  }
-  bgzf_close(fp);
-  read_chunked_core(config, master, nthreads, buf, total,
-                    [buf]() { std::free(buf); });
-#else
+  // Plain (non-BGZF) gzip: a single DEFLATE stream cannot be block-parallel
+  // decompressed, so the whole thing must be inflated serially either way.
+  // Rather than materialize the entire ~10x-larger decompressed FASTQ in RAM
+  // (tens of GB for a multi-GB input), STREAM it: BgzfBlockReader (USE_HTS) or
+  // GzBlockDecompressor inflate one bounded block at a time on a background
+  // thread while the dispatcher/worker pool parses reads in parallel. Bounded
+  // memory (a few MiB of decompression ring + one reused parse arena) and
+  // byte-identical to the serial path (same decompressed bytes, same order).
   read_gz_parallel(config, master, nthreads);
-#endif
 }
 
 /*******************************************************/
