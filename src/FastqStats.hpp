@@ -199,6 +199,29 @@ struct FastqStats {
   // Counts of quality in each base position
   std::array<size_t, kNumQualityValues * SHORT_READ_THRESHOLD> position_quality_count;
 
+  // [FalcoAmadeus] Transposed per-base quality tile [quality*THRESHOLD + pos].
+  // The straight `++position_quality_count[(pos << 7) | qv]` scatter walks a
+  // 512 KB size_t array with a 1 KB stride, so nearly every per-base RMW is an
+  // L2 access. The in-buffer quality writers increment this uint16 tile
+  // instead: quality-major rows put the ~4-8 quality levels a lane actually
+  // emits on a handful of L1-resident 1 KB rows. flush_qtile() folds the tile
+  // into position_quality_count by addition; integer adds commute, so the
+  // flushed totals equal the direct-scatter totals exactly (byte-identical),
+  // PROVIDED every read of position_quality_count happens after a flush.
+  // Flush points: every <= kQualTileFlushReads reads (uint16 overflow guard:
+  // a read contributes at most ONE count per (quality,pos) cell, so a cell
+  // holds <= 60000 < 65535 between flushes), per-worker at both
+  // merge-worker-stats sites (next to flush_soa), and once in write_results
+  // before the modules read. The long-read leftover path writes
+  // long_position_quality_count directly and is not tiled. Mixing direct
+  // position_quality_count writers (none remain in-buffer today) with tile
+  // writers would also be safe -- addition commutes -- as long as the tile is
+  // fully flushed before any read.
+  std::array<std::uint16_t, kNumQualityValues * SHORT_READ_THRESHOLD> qual_tile;
+  std::uint32_t qual_tile_reads;  // reads accumulated since the last flush
+  static const std::uint32_t kQualTileFlushReads = 60000;
+  void flush_qtile();  // fold qual_tile into position_quality_count
+
   // Counts of average quality (truncated) per sequence
   std::array<size_t, kNumQualityValues> quality_count;
 

@@ -779,7 +779,12 @@ StreamReader::qual_simd_chunks(FastqStats &stats, const char *&c,
   const __m512i vzero = _mm512_setzero_si512();
   __m512i vmin = v127;
   std::size_t bytesum = 0, nbytes = 0;
-  std::size_t *const pqc = stats.position_quality_count.data();
+  // Quality-major uint16 tile instead of the 1 KB-strided
+  // position_quality_count scatter: the few quality rows a lane emits stay
+  // L1-resident. Flushed into position_quality_count by the caller's
+  // per-read counter (see FastqStats::flush_qtile); adds commute, so totals
+  // are byte-identical.
+  std::uint16_t *const qtile = stats.qual_tile.data();
   const char *const he = hard_end;
   while (rp + 64 <= bsz && c + 64 <= he) {
     const __m512i v = _mm512_loadu_si512(c);
@@ -805,7 +810,7 @@ StreamReader::qual_simd_chunks(FastqStats &stats, const char *&c,
     for (unsigned i = 0; i < mlen; ++i) {
       const std::size_t qv =
           static_cast<std::size_t>(c[i]) - Constants::quality_zero;
-      ++pqc[((rp + i) << Constants::bit_shift_quality) | qv];
+      ++qtile[qv * FastqStats::SHORT_READ_THRESHOLD + (rp + i)];
     }
     c += mlen;
     rp += mlen;
@@ -988,9 +993,11 @@ StreamReader::read_sequence_line(FastqStats &stats) {
 // Process quality value the fast way from buffer
 void
 StreamReader::process_quality_base_from_buffer(FastqStats &stats) {
-  // Average quality in position
-  ++stats.position_quality_count[(read_pos << Constants::bit_shift_quality) |
-                                 quality_value];
+  // Average quality in position: accumulate in the transposed uint16 tile
+  // (flushed into position_quality_count by the per-read counter in the
+  // callers -- adds commute, so totals are byte-identical)
+  ++stats.qual_tile[quality_value * FastqStats::SHORT_READ_THRESHOLD +
+                    read_pos];
 
   // Tile processing (cur_tile_* point into the tile maps, resolved once per
   // read in read_quality_line, so we avoid three hash lookups per base)
@@ -1085,9 +1092,9 @@ StreamReader::read_quality_line(FastqStats &stats) {
       lowest = min8(lowest,
                     ((ch == 9) ? (std::numeric_limits<char>::max()) : ch));
 
-      // Converts quality ascii to zero-based
+      // Converts quality ascii to zero-based; tile write, see flush_qtile
       const std::size_t qv = ch - Constants::quality_zero;
-      ++stats.position_quality_count[(rp << Constants::bit_shift_quality) | qv];
+      ++stats.qual_tile[qv * FastqStats::SHORT_READ_THRESHOLD + rp];
 
       if (do_tile_quality) {
         if (std::size(*cur_tile_quality) == rp) {
@@ -1137,6 +1144,12 @@ StreamReader::read_quality_line(FastqStats &stats) {
   // histogram in the end of the summary.
   if (read_pos != 0)
     ++stats.quality_count[cur_quality / read_pos];  // avg quality histogram
+
+  // uint16 overflow guard for the quality tile: at most ONE increment per
+  // (quality,pos) cell per read, so flushing every <= kQualTileFlushReads
+  // (60000 < 65535) reads keeps every cell in range.
+  if (++stats.qual_tile_reads >= FastqStats::kQualTileFlushReads)
+    stats.flush_qtile();
 }
 
 /*******************************************************/
@@ -1790,6 +1803,7 @@ read_parallel_impl(FalcoConfig &config, FastqStats &master,
   for (std::size_t t = 0; t < nthreads; ++t) {
     FastqStats &ws = wstats[t];
     ws.flush_soa();
+    ws.flush_qtile();  // position_quality_count is read (added) just below
     add_arr(master.base_count, ws.base_count);
     add_arr(master.n_base_count, ws.n_base_count);
     add_arr(master.position_quality_count, ws.position_quality_count);
@@ -2058,6 +2072,7 @@ merge_worker_stats(
   for (std::size_t t = 0; t < nthreads; ++t) {
     FastqStats &ws = *wstats[t];
     ws.flush_soa();
+    ws.flush_qtile();  // position_quality_count is read (added) just below
     add_arr(master.base_count, ws.base_count);
     add_arr(master.n_base_count, ws.n_base_count);
     add_arr(master.position_quality_count, ws.position_quality_count);
@@ -3695,7 +3710,10 @@ BamReader::quality_pass(const char *qptr, std::size_t seq_len,
     for (std::size_t rp = 0; rp < seq_len; ++rp) {
       const std::uint8_t qv = static_cast<std::uint8_t>(q[rp]);
       lowest = min8(lowest, static_cast<char>(qv + 33));
-      ++stats.position_quality_count[(rp << Constants::bit_shift_quality) | qv];
+      // tile write, flushed by the per-read counter below (see flush_qtile)
+      ++stats.qual_tile[static_cast<std::size_t>(qv) *
+                            FastqStats::SHORT_READ_THRESHOLD +
+                        rp];
       cq += qv;
     }
     stats.lowest_char = lowest;
@@ -3744,6 +3762,13 @@ BamReader::quality_pass(const char *qptr, std::size_t seq_len,
   // histogram in the end of the summary.
   if (read_pos != 0)
     ++stats.quality_count[cur_quality / read_pos];  // avg quality histogram
+
+  // Quality-tile flush counter: covers both branches above (the fast loop
+  // writes the tile directly, the walking path via
+  // process_quality_base_from_buffer). One increment per (quality,pos) cell
+  // per read, so <= kQualTileFlushReads reads never overflow a uint16 cell.
+  if (++stats.qual_tile_reads >= FastqStats::kQualTileFlushReads)
+    stats.flush_qtile();
 }
 
 /*******************************************************/
@@ -4103,7 +4128,10 @@ BamReader::process_record_parallel_inplace(const char *rec, FastqStats &stats,
     for (std::size_t rp = 0; rp < seq_len; ++rp) {
       const std::uint8_t qv = static_cast<std::uint8_t>(qp[seq_len - 1 - rp]);
       lowest = min8(lowest, static_cast<char>(qv + 33));
-      ++stats.position_quality_count[(rp << Constants::bit_shift_quality) | qv];
+      // tile write, flushed by the per-read counter below (see flush_qtile)
+      ++stats.qual_tile[static_cast<std::size_t>(qv) *
+                            FastqStats::SHORT_READ_THRESHOLD +
+                        rp];
       cq += qv;
     }
     stats.lowest_char = lowest;
@@ -4111,6 +4139,9 @@ BamReader::process_record_parallel_inplace(const char *rec, FastqStats &stats,
     cur_quality = cq;
     if (read_pos != 0)
       ++stats.quality_count[cur_quality / read_pos];
+    // one tile increment per (quality,pos) cell per read (overflow guard)
+    if (++stats.qual_tile_reads >= FastqStats::kQualTileFlushReads)
+      stats.flush_qtile();
   }
   else {
     // reversed read longer than the static buffer (rare): materialise the

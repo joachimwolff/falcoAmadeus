@@ -144,6 +144,7 @@ write_results(const FalcoConfig &falco_config, FastqStats &stats,
               const std::string &data_filename,
               const std::string &report_filename) {
   stats.flush_soa();  // fold AVX-512 SoA base counts into base_count
+  stats.flush_qtile();  // fold the quality tile before the modules read
 
   // Here we open the short summary ofstream
   std::ofstream summary_txt;

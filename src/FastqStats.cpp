@@ -33,6 +33,7 @@ const size_t FastqStats::kDupReadTruncateSize;
 const size_t FastqStats::kBitShiftNucleotide;
 const size_t FastqStats::kBitShiftQuality;
 const size_t FastqStats::kBitShiftAdapter;
+const std::uint32_t FastqStats::kQualTileFlushReads;
 
 // To make the gc models static const
 static std::array<GCModel, FastqStats::SHORT_READ_THRESHOLD>
@@ -56,6 +57,20 @@ FastqStats::flush_soa() {
       base_count[(p << kBitShiftNucleotide) | n] += src[p];
   }
   soa_base.fill(0);
+}
+
+// Fold the transposed quality tile into position_quality_count (see the
+// FastqStats.hpp comment for the flush-point / overflow invariants). Addition
+// commutes, so the result is byte-identical to the direct scatter.
+void
+FastqStats::flush_qtile() {
+  for (std::size_t q = 0; q < kNumQualityValues; ++q) {
+    const std::uint16_t *src = &qual_tile[q * SHORT_READ_THRESHOLD];
+    for (std::size_t p = 0; p < SHORT_READ_THRESHOLD; ++p)
+      position_quality_count[(p << kBitShiftQuality) | q] += src[p];
+  }
+  qual_tile.fill(0);
+  qual_tile_reads = 0;
 }
 
 FastqStats::FastqStats(bool need_kmer) {
@@ -82,6 +97,8 @@ FastqStats::FastqStats(bool need_kmer) {
   quality_count.fill(0);
   gc_count.fill(0);
   position_quality_count.fill(0);
+  qual_tile.fill(0);
+  qual_tile_reads = 0;
   pos_kmer_count.fill(0);
   pos_adapter_count.fill(0);
   // Only the Kmer Content module touches kmer_count; when it is disabled leave
