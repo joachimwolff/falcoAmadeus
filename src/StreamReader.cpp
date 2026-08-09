@@ -17,6 +17,7 @@
 
 #include "StreamReader.hpp"
 #include <atomic>
+#include <cstdio>
 
 #include <algorithm>
 #include <cstdlib>
@@ -2190,6 +2191,32 @@ open_unlinked_temp(const std::string &input_path, std::size_t bytes) {
   return -1;
 }
 
+// [FalcoAmadeus] Decompress destination policy. Writing utotal bytes to a 4KB-page
+// temp-file mmap costs ~utotal/4KB page faults (BAM 50M: ~1.5 s of the decompress).
+// Anonymous huge pages (2 MB) cut that to a few thousand faults (5.1 s -> 3.5 s at
+// -t16) but are NOT droppable, so they hold utotal of RSS. Use them only when
+// utotal fits comfortably in available RAM; otherwise keep the drop-behind temp
+// file, which bounds RSS at the cost of the fault-heavy write. FA_LOWMEM forces
+// the temp file; FA_HUGE forces huge pages.
+static bool
+choose_huge_buffer(std::size_t bytes) {
+  if (std::getenv("FA_LOWMEM")) return false;
+  if (std::getenv("FA_HUGE")) return true;
+  std::size_t avail = 0;
+  if (FILE *fp = std::fopen("/proc/meminfo", "r")) {
+    char line[256];
+    while (std::fgets(line, sizeof line, fp)) {
+      unsigned long kb = 0;
+      if (std::sscanf(line, "MemAvailable: %lu kB", &kb) == 1) {
+        avail = static_cast<std::size_t>(kb) * 1024;
+        break;
+      }
+    }
+    std::fclose(fp);
+  }
+  return avail != 0 && bytes < avail / 3;
+}
+
 static GzBuffer
 decompress_bgzf_libdeflate(const std::string &path, std::size_t nthreads) {
   GzBuffer result;
@@ -2282,10 +2309,20 @@ decompress_bgzf_libdeflate(const std::string &path, std::size_t nthreads) {
   // Preferred path: decompress into an unlinked temp file (pwrite -> page cache),
   // then mmap it read-only so the parse can drop-behind. Fall back to a malloc'd
   // buffer written in place if a temp file cannot be created.
-  const int tfd = open_unlinked_temp(path, utotal);
+  const bool want_huge = choose_huge_buffer(utotal);
+  const int tfd = want_huge ? -1 : open_unlinked_temp(path, utotal);
   char *out = nullptr;      // the destination the blocks inflate into
   bool mapped = false;      // true when `out` is a file-backed shared mmap
-  if (tfd >= 0) {
+  bool huge = false;        // anonymous huge-page buffer (fast, non-droppable)
+  if (want_huge) {
+    void *m = mmap(nullptr, utotal, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (m != MAP_FAILED) {
+      madvise(m, utotal, MADV_HUGEPAGE);
+      out = static_cast<char *>(m); huge = true;
+    }
+  }
+  if (out == nullptr && tfd >= 0) {
     // Inflate DIRECTLY into a shared writable mmap of the temp file: each thread
     // writes its own (contiguous) page range with no inode lock and no scratch
     // copy, unlike per-block pwrite which serialized on the file's i_rwsem. The
@@ -2357,15 +2394,19 @@ decompress_bgzf_libdeflate(const std::string &path, std::size_t nthreads) {
   }
   munmap(const_cast<unsigned char *>(comp), csize);
   if (!ok) {
-    if (mapped) munmap(out, utotal);
-    if (tfd >= 0) close(tfd);
-    if (!mapped) std::free(out);
+    if (mapped || huge) munmap(out, utotal);
+    if (tfd >= 0 && !huge) close(tfd);
+    if (!mapped && !huge) std::free(out);
     return result;
   }
   out_size = utotal;
   if (mapped) {
     result.data = out; result.maplen = utotal; result.fd = tfd;
     result.can_drop = true;
+  }
+  else if (huge) {
+    result.data = out; result.maplen = utotal; result.fd = -1;
+    result.can_drop = false;  // anonymous: DONTNEED would zero live data
   }
   else {
     if (tfd >= 0) close(tfd);
@@ -2389,11 +2430,13 @@ read_gz_chunked(FalcoConfig &config, FastqStats &master,
       const bool cd = g.can_drop;
       read_chunked_core(
         config, master, nthreads, data, g.size,
-        [data, maplen, gfd, cd]() {
-          if (cd) { munmap(data, maplen); if (gfd >= 0) close(gfd); }
+        [data, maplen, gfd]() {
+          // maplen != 0 for any mmap (temp-file or anonymous huge page) -> munmap;
+          // only the malloc fallback frees.
+          if (maplen) { munmap(data, maplen); if (gfd >= 0) close(gfd); }
           else std::free(data);
         },
-        cd);   // temp-file mmap -> drop-behind; malloc fallback -> no drop
+        cd);   // drop-behind only for the droppable temp-file mmap (cd==can_drop)
       return;
     }
     // not BGZF (plain gzip) -> fall through to the streaming bgzf reader below
@@ -3019,7 +3062,7 @@ read_bam_chunked(FalcoConfig &config, FastqStats &master,
     };
     const std::size_t rec0 = bam_records_start(base, size);
     if (rec0 == SIZE_MAX) {              // not a BAM we can walk -> serial fallback
-      if (g.can_drop) { munmap(g.data, g.maplen); if (g.fd >= 0) close(g.fd); }
+      if (g.maplen) { munmap(g.data, g.maplen); if (g.fd >= 0) close(g.fd); }
       else std::free(g.data);
       bam_read_serial(config, master);
       return;
@@ -3191,7 +3234,7 @@ read_bam_chunked(FalcoConfig &config, FastqStats &master,
       merge_worker_stats(config, master, nthreads, total, wstats, empty_gc,
                          deltas, tilerecs, gstart, count_dup, tile_ignore,
                          /*skip_gc=*/true);
-      if (g.can_drop) { munmap(g.data, g.maplen); if (g.fd >= 0) close(g.fd); }
+      if (g.maplen) { munmap(g.data, g.maplen); if (g.fd >= 0) close(g.fd); }
       else std::free(g.data);
       return;
     }
@@ -3263,7 +3306,7 @@ read_bam_chunked(FalcoConfig &config, FastqStats &master,
     (void)nent; (void)mbegin;
     merge_worker_stats(config, master, nthreads, total, wstats, gcrec, deltas,
                        tilerecs, gstart, count_dup, tile_ignore);
-    if (g.can_drop) { munmap(g.data, g.maplen); if (g.fd >= 0) close(g.fd); }
+    if (g.maplen) { munmap(g.data, g.maplen); if (g.fd >= 0) close(g.fd); }
     else std::free(g.data);
     return;
   }
