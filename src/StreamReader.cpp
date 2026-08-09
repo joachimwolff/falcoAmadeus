@@ -1374,8 +1374,14 @@ read_parallel_impl(FalcoConfig &config, FastqStats &master,
   const bool tile_ignore = disp.tile_ignore;
   const bool do_hash = disp.do_sequence_hash;
 
-  // per-thread workers and accumulators
-  std::vector<FastqStats> wstats(nthreads);
+  // per-thread workers and accumulators. Construct each accumulator with the
+  // real do_kmer flag: FastqStats defaults need_kmer=true, which allocates a
+  // ~65 MB k-mer counting table PER THREAD -- wasted when the K-mer Content
+  // module is off (the default), and the dominant term in multi-thread RSS.
+  std::vector<FastqStats> wstats;
+  wstats.reserve(nthreads);
+  for (std::size_t t = 0; t < nthreads; ++t)
+    wstats.emplace_back(config.do_kmer);
   std::vector<std::unique_ptr<ParallelWorker>> workers;
   workers.reserve(nthreads);
   for (std::size_t t = 0; t < nthreads; ++t)
