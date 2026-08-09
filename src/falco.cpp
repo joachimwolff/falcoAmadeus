@@ -32,7 +32,6 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
-#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <string>

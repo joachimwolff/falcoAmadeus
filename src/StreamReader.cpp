@@ -60,6 +60,8 @@ class RapidgzipSource {
 #include <memory>
 #include <functional>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
 #include <unordered_map>
 #ifdef _OPENMP
 #include <omp.h>
@@ -2521,6 +2523,112 @@ read_bytesplit_core(FalcoConfig &config, FastqStats &master,
     releaser.join();
 }
 
+// [FalcoAmadeus] Background GC replayer for the sliced drivers. GC percentages
+// accumulate in FLOATING POINT, so the per-slice replay must run in exact
+// global read order (slice 0 first, thread 0's records before thread 1's, ...)
+// to stay byte-identical -- but nothing says it must run on the PARSING
+// threads' critical path. This owns two sets of per-thread GCRecord vectors:
+// each slice parses into one set while the dedicated replay thread folds the
+// PREVIOUS slice's set into master.gc_count. Replays execute strictly in
+// submission order, one at a time, on the single replay thread, so the FP
+// accumulation order is exactly the serial order. master.gc_count is touched
+// ONLY by the replay thread until finish() returns (the parse phase touches
+// worker stats, the read-only duplication map and the deltas; the dup-prefix
+// continuation touches master.sequence_count/num_unique_seen/count_at_limit
+// -- all disjoint from gc_count).
+class GCReplayer {
+public:
+  GCReplayer(FastqStats &master, std::size_t nbufs) : master_(master) {
+    for (auto &s : bufs_)
+      s.resize(nbufs);
+  }
+  ~GCReplayer() { finish(); }
+  // The buffer set the NEXT parse phase may write: never the in-flight one
+  // (submit() below only returns once the other set has fully replayed).
+  std::vector<std::vector<GCRecord>> &parse_bufs() { return bufs_[cur_]; }
+  // Hand the first `nused` vectors of the just-parsed set to the replay
+  // thread (vectors past nused may hold a previous slice's records -- they
+  // are NOT replayed). Blocks until the PREVIOUS submission finished
+  // replaying, so on return the other set is reusable. Called from one
+  // thread at a time (an omp single), with barriers ordering the cur_ flip
+  // against the workers' parse_bufs() reads.
+  // `after` (optional) runs on the replay thread once the replay is done --
+  // used to push the slice's madvise(DONTNEED) off the serial path. It must
+  // not touch master.gc_count readers' state or the parse buffers.
+  void submit(std::size_t nused, std::function<void()> after = {}) {
+    std::unique_lock<std::mutex> lk(m_);
+    cv_.wait(lk, [&] { return inflight_ < 0; });
+    inflight_ = cur_;
+    inflight_n_ = nused;
+    after_ = std::move(after);
+    cur_ ^= 1;
+    if (!th_.joinable())
+      th_ = std::thread([this] { run(); });
+    cv_.notify_all();
+  }
+  // Wait until every submitted replay has run (call before merging/reading
+  // master.gc_count), then stop the thread. Idempotent.
+  void finish() {
+    {
+      std::unique_lock<std::mutex> lk(m_);
+      cv_.wait(lk, [&] { return inflight_ < 0; });
+      quit_ = true;
+      cv_.notify_all();
+    }
+    if (th_.joinable())
+      th_.join();
+  }
+
+private:
+  void run() {
+    for (;;) {
+      int slot;
+      std::size_t nused;
+      std::function<void()> after;
+      {
+        std::unique_lock<std::mutex> lk(m_);
+        cv_.wait(lk, [&] { return inflight_ >= 0 || quit_; });
+        if (inflight_ < 0)
+          return;  // quit_ and nothing pending
+        slot = inflight_;
+        nused = inflight_n_;
+        after = std::move(after_);
+      }
+      // exact serial replay order: range 0's records in parse order, then
+      // range 1's, ... (same statements as the previous inline replay)
+      for (std::size_t r = 0; r < nused; ++r) {
+        const std::vector<GCRecord> &gc = bufs_[slot][r];
+        for (const GCRecord &gr : gc) {
+          if (gr.kind == 1) {
+            for (const auto &v : FastqStats::gc_models[gr.a].models[gr.b])
+              master_.gc_count[v.percent] += v.increment;
+          }
+          else if (gr.kind == 2) {
+            ++master_.gc_count[gr.a];
+          }
+        }
+      }
+      if (after)
+        after();  // e.g. drop the slice's pages, off the serial path
+      {
+        std::lock_guard<std::mutex> lk(m_);
+        inflight_ = -1;
+        cv_.notify_all();
+      }
+    }
+  }
+  FastqStats &master_;
+  std::array<std::vector<std::vector<GCRecord>>, 2> bufs_;  // [set][range]
+  int cur_ = 0;        // set the next parse phase writes
+  int inflight_ = -1;  // set queued/being replayed, -1 = none
+  std::size_t inflight_n_ = 0;  // vectors of the in-flight set to replay
+  std::function<void()> after_;  // post-replay hook for the in-flight job
+  bool quit_ = false;
+  std::mutex m_;
+  std::condition_variable cv_;
+  std::thread th_;
+};
+
 // [FalcoAmadeus] Chunked (zero-copy) variant of the byte-split driver for
 // in-memory input. read_bytesplit_core parses each thread's whole range in one
 // pass and must therefore hold ONE GCRecord PER READ until the final ordered
@@ -2565,178 +2673,263 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
   std::vector<std::unique_ptr<typename P::Worker>> workers(nthreads);
   std::vector<std::unique_ptr<FastqStats>> wstats(nthreads);
   std::vector<std::vector<std::size_t>> deltas(nthreads);
-  std::vector<std::vector<GCRecord>> gcr(nthreads);
-#ifdef _OPENMP
-#pragma omp parallel for num_threads(nthreads) schedule(static)
-#endif
-  for (std::size_t t = 0; t < nthreads; ++t) {
-    workers[t].reset(new typename P::Worker(config, BUF));
-    workers[t]->hard_end = base + size;
-    wstats[t].reset(new FastqStats(config.do_kmer));
-  }
+
+  // [FalcoAmadeus] The global read index g is consumed only by k-mer
+  // subsampling (g % num_reads_for_kmer; read_step == 1 here), tile sampling
+  // (off: this driver requires tile_ignore) and the duplication gate. The dup
+  // gate is re-expressed in BYTES below (a record is post-cap exactly when its
+  // start offset is >= the byte where the serial dup prefix stopped, because
+  // the prefix consumes records in order). So when the K-mer module is off
+  // (the default) nothing needs g before parsing: the per-slice record-count
+  // pass -- a full extra sweep over every input byte -- is skipped and the
+  // per-thread counts fall out of the parse itself.
+  const bool need_g = config.do_kmer;
+
+  // [FalcoAmadeus] Work-stealing sub-ranges. A slice is cut into ~1 MB
+  // record-aligned ranges handed out `schedule(dynamic)`: a straggling thread
+  // (loaded shared box, page-fault stalls) delays the slice barrier by at most
+  // one small range instead of a whole nthreads-sized share. Byte-identity is
+  // unaffected by WHICH thread parses a range: per-thread worker stats merge
+  // by commutative integer adds, the dup deltas are integer, and the only FP
+  // accumulation (gc_count) replays from per-RANGE record vectors in strict
+  // range order -- the exact global read order, independent of scheduling.
+  const std::size_t RANGE_BYTES = std::size_t(1) << 19;
+  const std::size_t R_MAX =
+    std::max<std::size_t>(nthreads, (CHUNK + RANGE_BYTES - 1) / RANGE_BYTES);
 
   bool dup_cont = true;
   std::size_t dup_seen = 0, nent = 0, total = 0;
   auto mbegin = master.sequence_count.begin();
-  std::vector<std::size_t> sync(nthreads + 1), counts(nthreads),
-    gstart(nthreads + 1);
+  std::vector<std::size_t> sync(R_MAX + 1), counts(R_MAX), gstart(R_MAX + 1);
   auto nodrop = [](std::size_t, std::size_t) {};
 
+  // Background GC replayer (slice s replays while slice s+1 parses) plus the
+  // shared per-slice state written inside `omp single` blocks; the implicit
+  // barrier ending each single/for publishes the writes to all threads.
+  GCReplayer replayer(master, R_MAX);
   std::size_t off = P::find_start(base, size, 0);
   std::size_t dropped = 0;
-  while (off < size) {
-    const std::size_t end = std::min(off + CHUNK, size);
-    // ---- slice limit: last record boundary <= end (whole tail slice at EOF) --
-    std::size_t plimit;
-    if (end == size) {
-      plimit = size;
-    }
-    else {
-      const std::size_t BACK = std::size_t(8) << 20;
-      std::size_t q = P::find_start(base, end, end > BACK ? end - BACK : 0);
-      if (q >= end || q < off)
-        q = off;  // records longer than the probe window: walk from the front
-      for (;;) {
-        const char *k;
-        std::size_t kl;
-        const std::size_t r = P::dup_key(base, end, q, k, kl);
-        if (r >= end)
-          break;  // record at q straddles end -> next slice starts at q
-        q = r;
-      }
-      plimit = (q > off) ? q : end;  // degenerate giant record: take the slice
-    }
+  std::size_t plimit = 0, dup_stop = 0, nranges = 0;
+  bool count_dup = false, s_done = false, slice_open = false;
 
-    // ---- Phase 0: per-thread record-boundary sync points over [off, plimit) --
-    sync[0] = off;
-    sync[nthreads] = plimit;
+  // [FalcoAmadeus] One persistent parallel region spans worker construction
+  // and the whole slice loop, with only TWO barriers per slice: all serial
+  // steps -- closing out the previous slice (counts fold + GC submit + cursor
+  // advance), the next slice limit, the range sync points and the duplication
+  // prefix -- run back to back in ONE `single` block, then the parse runs in
+  // one `for`. s_done is uniform across threads at the barrier that ends the
+  // single, so all threads exit together and every thread passes every
+  // barrier the same number of times.
 #ifdef _OPENMP
-#pragma omp parallel for num_threads(nthreads) schedule(static)
+#pragma omp parallel num_threads(nthreads)
 #endif
-    for (std::size_t t = 1; t < nthreads; ++t)
-      sync[t] =
-        P::find_start(base, plimit, off + t * ((plimit - off) / nthreads));
-    for (std::size_t t = 1; t <= nthreads; ++t)
-      if (sync[t] < sync[t - 1])
-        sync[t] = sync[t - 1];
-
-    // ---- Phase 1: records per thread ----
+  {
+    // nowait: the first thread through its share of the construction enters
+    // the first single (slice-1 limit walk + dup prefix) while the others
+    // still construct -- the single's END barrier orders everything before
+    // Phase 2, which is what actually needs all workers built.
 #ifdef _OPENMP
-#pragma omp parallel for num_threads(nthreads) schedule(static)
-#endif
-    for (std::size_t t = 0; t < nthreads; ++t)
-      counts[t] = (sync[t] < sync[t + 1])
-        ? P::count_chunk(base, sync[t], sync[t + 1], plimit, nodrop)
-        : 0;
-    gstart[0] = total;
-    for (std::size_t t = 0; t < nthreads; ++t)
-      gstart[t + 1] = gstart[t] + counts[t];
-    const std::size_t nrec = gstart[nthreads] - total;
-
-    // ---- duplication prefix continues across slices (global read order) ----
-    if (do_hash && dup_cont) {
-      std::size_t p = off;
-      while (dup_cont && p < plimit) {
-        const char *key;
-        std::size_t klen;
-        const std::size_t next = P::dup_key(base, plimit, p, key, klen);
-        const auto it = master.sequence_count.find(key, klen);
-        if (it == master.sequence_count.end()) {
-          master.sequence_count.emplace(key, klen, 1);
-          master.count_at_limit = dup_seen;
-          ++master.num_unique_seen;
-          if (master.num_unique_seen == Constants::unique_reads_stop_counting) {
-            dup_cont = false;
-            ++dup_seen;
-            break;
-          }
-        }
-        else {
-          ++it->second;
-          master.count_at_limit += dup_cont;
-        }
-        ++dup_seen;
-        p = next;
-      }
-    }
-    const std::size_t fill_boundary = dup_cont ? SIZE_MAX : dup_seen;
-    const bool count_dup = do_hash && !dup_cont;
-    if (count_dup && nent == 0) {
-      nent = master.sequence_count.size();
-      mbegin = master.sequence_count.begin();
-      for (std::size_t t = 0; t < nthreads; ++t)
-        deltas[t].assign(nent, 0);
-    }
-
-    // ---- Phase 2: parallel parse (deferred dup, per-thread drop-behind) ----
-#ifdef _OPENMP
-#pragma omp parallel for num_threads(nthreads) schedule(static)
+#pragma omp for schedule(static) nowait
 #endif
     for (std::size_t t = 0; t < nthreads; ++t) {
-      const std::size_t n = counts[t];
-      std::vector<GCRecord> &gc = gcr[t];
-      if (gc.size() < n)
-        gc.assign(n, GCRecord{0, 0, 0});
-      typename P::Worker &w = *workers[t];
-      FastqStats &ws = *wstats[t];
-      const std::size_t g0 = gstart[t];
-      const bool tail = (plimit == size) && (sync[t + 1] == plimit);
-      std::size_t p = sync[t];
-      std::size_t tdrop = sync[t];
-      const std::size_t DW = std::size_t(1) << 20;
-      std::uint64_t ph = 0;
-      const char *pp = nullptr;
-      std::size_t pn = 0;
-      bool pv = false;
-      for (std::size_t j = 0; j < n; ++j) {
-        const std::size_t g = g0 + j;
-        std::size_t seqlen = 0, tile_cur = 0;
-        const char *key = nullptr;
-        p = P::parse_one(w, ws, base, plimit, p, g, &gc[j], tile_ignore,
-                         tail && (j + 1 == n), seqlen, tile_cur, key);
-        if (count_dup && g >= fill_boundary) {
-          const std::size_t klen = get_truncate_point(seqlen);
-          const std::uint64_t h = DupHashMap::hash_of(key, klen);
-          master.sequence_count.prefetch(h);
-          if (pv) {
-            const auto it = master.sequence_count.find_hashed(ph, pp, pn);
-            if (it != master.sequence_count.end())
-              ++deltas[t][static_cast<std::size_t>(it - mbegin)];
+      workers[t].reset(new typename P::Worker(config, BUF));
+      workers[t]->hard_end = base + size;
+      wstats[t].reset(new FastqStats(config.do_kmer));
+    }
+    for (;;) {
+#ifdef _OPENMP
+#pragma omp single
+#endif
+      {
+        // ---- close out the previous slice (no-op before the first) ----
+        if (slice_open) {
+          for (std::size_t r = 0; r < nranges; ++r)
+            total += counts[r];
+          // Replay + page drop both run on the replay thread while the next
+          // slice parses: the replay reads only its GCRecords, and the pages
+          // dropped are the fully parsed previous slice (nothing reads them
+          // again), so neither touches state the parse phase uses.
+          const std::size_t d_lo = dropped, d_hi = plimit;
+          replayer.submit(nranges,
+                          [&drop_range, d_lo, d_hi] { drop_range(d_lo, d_hi); });
+          dropped = plimit;
+          off = plimit;
+          slice_open = false;
+        }
+        s_done = (off >= size);
+        if (!s_done) {
+          const std::size_t end = std::min(off + CHUNK, size);
+          // -- slice limit: last record boundary <= end (whole tail at EOF) --
+          if (end == size) {
+            plimit = size;
           }
-          ph = h; pp = key; pn = klen; pv = true;
-        }
-        if (can_drop && p - tdrop >= DW) {
-          drop_range(tdrop, p);
-          tdrop = p;
-        }
-      }
-      if (pv) {
-        const auto it = master.sequence_count.find_hashed(ph, pp, pn);
-        if (it != master.sequence_count.end())
-          ++deltas[t][static_cast<std::size_t>(it - mbegin)];
-      }
-    }
+          else {
+            // Probe backward for a record boundary close to `end`, widening
+            // the window only when none is found (giant records). The forward
+            // walk from ANY true record boundary converges on the same last
+            // complete record, so the window size cannot change the result --
+            // it only bounds how many records the serial walk below touches
+            // (~128 KB instead of the old fixed 8 MB).
+            std::size_t q = off;  // fallback: walk from the slice front
+            for (std::size_t BACK = std::size_t(128) << 10;; BACK <<= 3) {
+              const std::size_t probe = end > BACK ? end - BACK : 0;
+              const std::size_t cand = P::find_start(base, end, probe);
+              if (cand < end && cand >= off) {
+                q = cand;
+                break;
+              }
+              if (probe <= off)
+                break;  // window already covers the whole slice
+            }
+            for (;;) {
+              const char *k;
+              std::size_t kl;
+              const std::size_t r = P::dup_key(base, end, q, k, kl);
+              if (r >= end)
+                break;  // record at q straddles end -> next slice starts at q
+              q = r;
+            }
+            plimit = (q > off) ? q : end;  // degenerate giant record: take it
+          }
+          // -- record-aligned sub-range boundaries (serial: ~1 us per probe) --
+          const std::size_t sbytes = plimit - off;
+          nranges = std::min(
+            R_MAX, std::max<std::size_t>(
+                     1, (sbytes + RANGE_BYTES - 1) / RANGE_BYTES));
+          sync[0] = off;
+          sync[nranges] = plimit;
+          for (std::size_t r = 1; r < nranges; ++r)
+            sync[r] = P::find_start(base, plimit, off + r * (sbytes / nranges));
+          for (std::size_t r = 1; r <= nranges; ++r)
+            if (sync[r] < sync[r - 1])
+              sync[r] = sync[r - 1];
 
-    // ---- ordered GC replay for this slice (global read order) ----
-    for (std::size_t t = 0; t < nthreads; ++t) {
-      const std::vector<GCRecord> &gc = gcr[t];
-      const std::size_t n = counts[t];
-      for (std::size_t j = 0; j < n; ++j) {
-        const GCRecord &gr = gc[j];
-        if (gr.kind == 1) {
-          for (const auto &v : master.gc_models[gr.a].models[gr.b])
-            master.gc_count[v.percent] += v.increment;
+          // -- duplication prefix continues across slices (global read order) -
+          dup_stop = off;  // cap filled earlier: every record here is post-cap
+          if (do_hash && dup_cont) {
+            std::size_t p = off;
+            while (dup_cont && p < plimit) {
+              const char *key;
+              std::size_t klen;
+              const std::size_t next = P::dup_key(base, plimit, p, key, klen);
+              const auto it = master.sequence_count.find(key, klen);
+              if (it == master.sequence_count.end()) {
+                master.sequence_count.emplace(key, klen, 1);
+                master.count_at_limit = dup_seen;
+                ++master.num_unique_seen;
+                if (master.num_unique_seen ==
+                    Constants::unique_reads_stop_counting)
+                  dup_cont = false;  // the cap-filling record IS consumed
+              }
+              else {
+                ++it->second;
+                master.count_at_limit += dup_cont;
+              }
+              ++dup_seen;
+              p = next;  // always step past the consumed record
+            }
+            // First byte the prefix did NOT consume. The prefix eats records
+            // in file order, so "start offset >= dup_stop" holds exactly for
+            // the reads with global index >= dup_seen -- the same set the old
+            // `g >= fill_boundary` gate selected, with no need to know g.
+            dup_stop = p;
+          }
+          count_dup = do_hash && !dup_cont;
+          if (count_dup && nent == 0) {
+            nent = master.sequence_count.size();
+            mbegin = master.sequence_count.begin();
+            for (std::size_t t = 0; t < nthreads; ++t)
+              deltas[t].assign(nent, 0);
+          }
+          slice_open = true;
         }
-        else if (gr.kind == 2) {
-          ++master.gc_count[gr.a];
+      }  // barrier publishes s_done / plimit / sync / dup_stop / count_dup
+      if (s_done)
+        break;
+
+      // -- Phase 1, k-mer runs only: count records to know each range's g0 ----
+      if (need_g) {
+#ifdef _OPENMP
+#pragma omp for schedule(dynamic)
+#endif
+        for (std::size_t r = 0; r < nranges; ++r)
+          counts[r] = (sync[r] < sync[r + 1])
+            ? P::count_chunk(base, sync[r], sync[r + 1], plimit, nodrop)
+            : 0;
+#ifdef _OPENMP
+#pragma omp single
+#endif
+        {
+          gstart[0] = total;
+          for (std::size_t r = 0; r < nranges; ++r)
+            gstart[r + 1] = gstart[r] + counts[r];
         }
       }
+
+      // -- Phase 2: parallel parse (deferred dup, per-range drop-behind) ------
+#ifdef _OPENMP
+#pragma omp for schedule(dynamic)
+#endif
+      for (std::size_t r = 0; r < nranges; ++r) {
+#ifdef _OPENMP
+        const std::size_t tid = static_cast<std::size_t>(omp_get_thread_num());
+#else
+        const std::size_t tid = 0;
+#endif
+        std::vector<GCRecord> &gc = replayer.parse_bufs()[r];
+        gc.clear();  // capacity persists across slices
+        typename P::Worker &w = *workers[tid];
+        FastqStats &ws = *wstats[tid];
+        // can_be_last for EVERY record of the tail range is equivalent to the
+        // old per-record `tail && (j + 1 == n)`: for any record that is not
+        // the file's last, the quality line's own newline makes parse_one's
+        // qual_no_nl probe false -- exactly as if can_be_last were false.
+        const bool tail = (plimit == size) && (sync[r + 1] == plimit);
+        std::size_t p = sync[r];
+        const std::size_t pend = sync[r + 1];
+        std::size_t g = need_g ? gstart[r] : 0;  // g meaningful only for k-mer
+        std::size_t n = 0;
+        std::size_t tdrop = p;
+        const std::size_t DW = std::size_t(1) << 20;
+        std::uint64_t ph = 0;
+        const char *pp = nullptr;
+        std::size_t pn = 0;
+        bool pv = false;
+        while (p < pend) {
+          const std::size_t rec_start = p;
+          std::size_t seqlen = 0, tile_cur = 0;
+          const char *key = nullptr;
+          gc.emplace_back(GCRecord{0, 0, 0});
+          p = P::parse_one(w, ws, base, plimit, p, g, &gc.back(), tile_ignore,
+                           tail, seqlen, tile_cur, key);
+          ++g;
+          ++n;
+          if (count_dup && rec_start >= dup_stop) {
+            const std::size_t klen = get_truncate_point(seqlen);
+            const std::uint64_t h = DupHashMap::hash_of(key, klen);
+            master.sequence_count.prefetch(h);
+            if (pv) {
+              const auto it = master.sequence_count.find_hashed(ph, pp, pn);
+              if (it != master.sequence_count.end())
+                ++deltas[tid][static_cast<std::size_t>(it - mbegin)];
+            }
+            ph = h; pp = key; pn = klen; pv = true;
+          }
+          if (can_drop && p - tdrop >= DW) {
+            drop_range(tdrop, p);
+            tdrop = p;
+          }
+        }
+        if (pv) {
+          const auto it = master.sequence_count.find_hashed(ph, pp, pn);
+          if (it != master.sequence_count.end())
+            ++deltas[tid][static_cast<std::size_t>(it - mbegin)];
+        }
+        counts[r] = n;  // == the count pass's value on well-formed input
+      }  // barrier: counts[] complete -> next iteration's single closes out
     }
-    total += nrec;
-    drop_range(dropped, plimit);
-    dropped = plimit;
-    off = plimit;
   }
+  replayer.finish();  // every slice replayed, in exact slice order
 
   std::thread releaser;
   if (release_input)
@@ -2796,187 +2989,257 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
   std::vector<std::unique_ptr<ParallelWorker>> workers(nthreads);
   std::vector<std::unique_ptr<FastqStats>> wstats(nthreads);
   std::vector<std::vector<std::size_t>> deltas(nthreads);
-  std::vector<std::vector<GCRecord>> gcr(nthreads);
   for (std::size_t t = 0; t < nthreads; ++t) {
     workers[t].reset(new ParallelWorker(config, BUF));
     wstats[t].reset(new FastqStats(config.do_kmer));
   }
 
+  // [FalcoAmadeus] Same three driver-overhead cuts as read_bytes_fused (see the
+  // comments there for the full arguments): (1) when the K-mer module is off,
+  // no phase needs the global read index g, so the per-chunk record-count pass
+  // over every byte is skipped and counts fall out of the parse; the dup gate
+  // compares record start offsets against the byte where the serial dup prefix
+  // stopped (the prefix consumes records in order, so that byte boundary
+  // selects exactly the old `g >= fill_boundary` read set); (2) the ordered GC
+  // replay of chunk s runs on a background thread while chunk s+1 inflates and
+  // parses (double-buffered records, strict submission order -> identical FP
+  // accumulation order); (3) one persistent parallel region replaces the 3-4
+  // team fork/joins per chunk, with the serial inflate in a `single`.
+  const bool need_g = config.do_kmer;
+
+  // Work-stealing sub-ranges, exactly as in read_bytes_fused (see the comment
+  // there for the byte-identity argument).
+  const std::size_t RANGE_BYTES = std::size_t(1) << 19;
+  const std::size_t R_MAX = std::max<std::size_t>(
+    nthreads, (CHUNK + SLACK + RANGE_BYTES - 1) / RANGE_BYTES);
+
   bool dup_cont = true;
   std::size_t dup_seen = 0, nent = 0, total = 0, leftover_len = 0;
   auto mbegin = master.sequence_count.begin();
-  std::vector<std::size_t> sync(nthreads + 1), counts(nthreads),
-    gstart(nthreads + 1);
+  std::vector<std::size_t> sync(R_MAX + 1), counts(R_MAX), gstart(R_MAX + 1);
   auto nodrop = [](std::size_t, std::size_t) {};
 
+  GCReplayer replayer(master, R_MAX);
   bool eof = false;
-  while (!eof) {
-    // ---- inflate one chunk after the carried leftover ----
-    if (bufv.size() < leftover_len + CHUNK) {
-      bufv.resize(leftover_len + CHUNK);  // huge single record: grow to fit
-      buf = bufv.data();
-    }
-    const std::size_t target = leftover_len + CHUNK;
-    std::size_t filled = leftover_len;
-    while (filled < target) {
-      const std::size_t got = src.fill(buf + filled, target - filled);
-      if (got == 0) { eof = true; break; }
-      filled += got;
-    }
-    const std::size_t end = filled;
-    if (end == 0) break;
+  // shared per-chunk state, written in `single` blocks (barriers publish it)
+  std::size_t filled_end = 0, plimit = 0, dup_stop = 0, nranges = 0;
+  bool count_dup = false, s_done = false, s_skip = false, slice_open = false;
 
-    // ---- parse limit: on the last chunk parse to the end, else carry the
-    // straddling tail record. A record whose 4 lines do not all fit before
-    // `end` makes parse_record return `end`, so walk complete records forward
-    // from a small backward probe and cut at the first that straddles. ----
-    std::size_t plimit;
-    if (eof) {
-      plimit = end;
-    }
-    else {
-      const std::size_t BACK = SLACK / 2;
-      std::size_t q = find_record_start(buf, end, end > BACK ? end - BACK : 0);
-      if (q >= end) q = find_record_start(buf, end, 0);  // records > BACK
-      for (;;) {
-        std::size_t so, sl;
-        const std::size_t r = parse_record(buf, end, q, so, sl);
-        if (r >= end) break;  // record at q straddles end -> carry from here
-        q = r;
-      }
-      plimit = q;
-    }
-    if (plimit == 0) {  // no complete record yet (record spans the whole buffer)
-      leftover_len = end;
-      if (eof) break;
-      continue;
-    }
-
-    // ---- Phase 0: per-thread record-boundary sync points over [0, plimit) ----
-    sync[0] = 0;
-    sync[nthreads] = plimit;
+  // Two barriers per chunk: ONE `single` closes out the previous chunk
+  // (counts fold + GC submit + straddle memmove), inflates the next, finds
+  // the parse limit and the range sync points and runs the dup prefix; then
+  // ONE `for` parses. The other threads sleep/spin through the serial inflate
+  // exactly once per chunk instead of once per phase.
 #ifdef _OPENMP
-#pragma omp parallel for num_threads(nthreads) schedule(static)
+#pragma omp parallel num_threads(nthreads)
 #endif
-    for (std::size_t t = 1; t < nthreads; ++t)
-      sync[t] = find_record_start(buf, plimit, t * (plimit / nthreads));
-    for (std::size_t t = 1; t <= nthreads; ++t)
-      if (sync[t] < sync[t - 1]) sync[t] = sync[t - 1];
-
-    // ---- Phase 1: count records per thread (record-aligned ranges) ----
+  {
+    for (;;) {
 #ifdef _OPENMP
-#pragma omp parallel for num_threads(nthreads) schedule(static)
+#pragma omp single
 #endif
-    for (std::size_t t = 0; t < nthreads; ++t)
-      counts[t] = (sync[t] < sync[t + 1])
-        ? FastqPolicy::count_chunk(buf, sync[t], sync[t + 1], plimit, nodrop)
-        : 0;
-    gstart[0] = total;
-    for (std::size_t t = 0; t < nthreads; ++t)
-      gstart[t + 1] = gstart[t] + counts[t];
-    const std::size_t nrec = gstart[nthreads] - total;
+      {
+        // ---- close out the previous chunk (no-op before the first) ----
+        if (slice_open) {
+          for (std::size_t r = 0; r < nranges; ++r)
+            total += counts[r];
+          replayer.submit(nranges);  // replays while the next chunk inflates
+          leftover_len = filled_end - plimit;
+          if (leftover_len) std::memmove(buf, buf + plimit, leftover_len);
+          slice_open = false;
+        }
+        s_done = eof;
+        s_skip = false;
+        if (!s_done) {
+          // ---- inflate one chunk after the carried leftover (serial) ----
+          if (bufv.size() < leftover_len + CHUNK) {
+            bufv.resize(leftover_len + CHUNK);  // huge single record: grow
+            buf = bufv.data();
+          }
+          const std::size_t target = leftover_len + CHUNK;
+          std::size_t filled = leftover_len;
+          while (filled < target) {
+            const std::size_t got = src.fill(buf + filled, target - filled);
+            if (got == 0) { eof = true; break; }
+            filled += got;
+          }
+          filled_end = filled;
+          if (filled_end == 0) {
+            s_done = true;
+          }
+          else {
+            // ---- parse limit: on the last chunk parse to the end, else carry
+            // the straddling tail record. A record whose 4 lines do not all
+            // fit before `filled_end` makes parse_record return `filled_end`,
+            // so walk complete records forward from a small backward probe and
+            // cut at the first that straddles. ----
+            if (eof) {
+              plimit = filled_end;
+            }
+            else {
+              // Backward probe with a widening window (see read_bytes_fused:
+              // any true boundary converges on the same cut).
+              std::size_t q = SIZE_MAX;
+              for (std::size_t BACK = std::size_t(128) << 10;; BACK <<= 3) {
+                const std::size_t probe =
+                  filled_end > BACK ? filled_end - BACK : 0;
+                q = find_record_start(buf, filled_end, probe);
+                if (q < filled_end || probe == 0)
+                  break;
+              }
+              for (;;) {
+                std::size_t so, sl;
+                const std::size_t r = parse_record(buf, filled_end, q, so, sl);
+                if (r >= filled_end)
+                  break;  // record at q straddles the end -> carry from here
+                q = r;
+              }
+              plimit = q;
+            }
+            if (plimit == 0) {  // no complete record yet (spans whole buffer)
+              leftover_len = filled_end;
+              if (eof)
+                s_done = true;
+              else
+                s_skip = true;  // read more input, then retry
+            }
+            else {
+              // -- record-aligned sub-range boundaries (serial, ~1 us each) --
+              nranges = std::min(
+                R_MAX, std::max<std::size_t>(
+                         1, (plimit + RANGE_BYTES - 1) / RANGE_BYTES));
+              sync[0] = 0;
+              sync[nranges] = plimit;
+              for (std::size_t r = 1; r < nranges; ++r)
+                sync[r] = find_record_start(buf, plimit,
+                                            r * (plimit / nranges));
+              for (std::size_t r = 1; r <= nranges; ++r)
+                if (sync[r] < sync[r - 1]) sync[r] = sync[r - 1];
 
-    // ---- duplication prefix (serial, global read index) while below the cap ----
-    if (do_hash && dup_cont) {
-      std::size_t p = 0;
-      while (dup_cont && p < plimit) {
-        const char *key;
-        std::size_t klen;
-        const std::size_t next = FastqPolicy::dup_key(buf, plimit, p, key, klen);
-        const auto it = master.sequence_count.find(key, klen);
-        if (it == master.sequence_count.end()) {
-          master.sequence_count.emplace(key, klen, 1);
-          master.count_at_limit = dup_seen;
-          ++master.num_unique_seen;
-          if (master.num_unique_seen == Constants::unique_reads_stop_counting) {
-            dup_cont = false;
-            ++dup_seen;
-            break;
+              // -- duplication prefix (serial, global order) below the cap --
+              dup_stop = 0;  // cap filled earlier: everything is post-cap
+              if (do_hash && dup_cont) {
+                std::size_t p = 0;
+                while (dup_cont && p < plimit) {
+                  const char *key;
+                  std::size_t klen;
+                  const std::size_t next =
+                    FastqPolicy::dup_key(buf, plimit, p, key, klen);
+                  const auto it = master.sequence_count.find(key, klen);
+                  if (it == master.sequence_count.end()) {
+                    master.sequence_count.emplace(key, klen, 1);
+                    master.count_at_limit = dup_seen;
+                    ++master.num_unique_seen;
+                    if (master.num_unique_seen ==
+                        Constants::unique_reads_stop_counting)
+                      dup_cont = false;  // the cap-filling record IS consumed
+                  }
+                  else {
+                    ++it->second;
+                    master.count_at_limit += dup_cont;
+                  }
+                  ++dup_seen;
+                  p = next;  // always step past the consumed record
+                }
+                dup_stop = p;  // first unconsumed byte == old g-based gate
+              }
+              count_dup = do_hash && !dup_cont;
+              if (count_dup && nent == 0) {  // freeze the map, size deltas
+                nent = master.sequence_count.size();
+                mbegin = master.sequence_count.begin();
+                for (std::size_t t = 0; t < nthreads; ++t)
+                  deltas[t].assign(nent, 0);
+              }
+              slice_open = true;
+            }
           }
         }
-        else {
-          ++it->second;
-          master.count_at_limit += dup_cont;
-        }
-        ++dup_seen;
-        p = next;
-      }
-    }
-    const std::size_t fill_boundary = dup_cont ? SIZE_MAX : dup_seen;
-    const bool count_dup = do_hash && !dup_cont;
-    if (count_dup && nent == 0) {  // freeze the map, size the deltas once
-      nent = master.sequence_count.size();
-      mbegin = master.sequence_count.begin();
-      for (std::size_t t = 0; t < nthreads; ++t) deltas[t].assign(nent, 0);
-    }
+      }  // barrier publishes s_done / s_skip / plimit / buf / filled_end
+      if (s_done)
+        break;
+      if (s_skip)
+        continue;
 
-    // ---- Phase 2: parallel parse + per-base stats + deferred dup counting ----
+      // ---- Phase 1, k-mer runs only: count records for each range's g0 ------
+      if (need_g) {
 #ifdef _OPENMP
-#pragma omp parallel for num_threads(nthreads) schedule(static)
+#pragma omp for schedule(dynamic)
 #endif
-    for (std::size_t t = 0; t < nthreads; ++t) {
-      const std::size_t n = counts[t];
-      std::vector<GCRecord> &gc = gcr[t];
-      if (gc.size() < n) gc.assign(n, GCRecord{0, 0, 0});
-      ParallelWorker &w = *workers[t];
-      w.hard_end = buf + end;  // bounds the SIMD quality loads (buf can move)
-      FastqStats &ws = *wstats[t];
-      const std::size_t g0 = gstart[t];
-      const bool tail = eof && (sync[t + 1] == plimit);
-      std::size_t p = sync[t];
-      // Deferred-by-one dup lookup (see read_bytesplit_core): overlap the slot
-      // load with the next record's parse. Keys point into `buf`, which is
-      // stable until after this parallel region (the straddle memmove runs
-      // later, on the dispatcher thread), and the pending probe is flushed
-      // before this thread leaves the region.
-      std::uint64_t ph = 0; const char *pp = nullptr; std::size_t pn = 0;
-      bool pv = false;
-      for (std::size_t j = 0; j < n; ++j) {
-        const std::size_t g = g0 + j;
-        std::size_t seqlen = 0, tile_cur = 0;
-        const char *key = nullptr;
-        p = FastqPolicy::parse_one(w, ws, buf, plimit, p, g, &gc[j], tile_ignore,
-                                   tail && (j + 1 == n), seqlen, tile_cur, key);
-        if (count_dup && g >= fill_boundary) {
-          const std::size_t klen = get_truncate_point(seqlen);
-          const std::uint64_t h = DupHashMap::hash_of(key, klen);
-          master.sequence_count.prefetch(h);
-          if (pv) {
-            const auto it = master.sequence_count.find_hashed(ph, pp, pn);
-            if (it != master.sequence_count.end())
-              ++deltas[t][static_cast<std::size_t>(it - mbegin)];
+        for (std::size_t r = 0; r < nranges; ++r)
+          counts[r] = (sync[r] < sync[r + 1])
+            ? FastqPolicy::count_chunk(buf, sync[r], sync[r + 1], plimit,
+                                       nodrop)
+            : 0;
+#ifdef _OPENMP
+#pragma omp single
+#endif
+        {
+          gstart[0] = total;
+          for (std::size_t r = 0; r < nranges; ++r)
+            gstart[r + 1] = gstart[r] + counts[r];
+        }
+      }
+
+      // ---- Phase 2: parallel parse + per-base stats + deferred dup counting -
+#ifdef _OPENMP
+#pragma omp for schedule(dynamic)
+#endif
+      for (std::size_t r = 0; r < nranges; ++r) {
+#ifdef _OPENMP
+        const std::size_t tid = static_cast<std::size_t>(omp_get_thread_num());
+#else
+        const std::size_t tid = 0;
+#endif
+        std::vector<GCRecord> &gc = replayer.parse_bufs()[r];
+        gc.clear();  // capacity persists across chunks
+        ParallelWorker &w = *workers[tid];
+        w.hard_end = buf + filled_end;  // bounds SIMD quality loads (buf moves)
+        FastqStats &ws = *wstats[tid];
+        // can_be_last for every record of the tail range: equivalent to the
+        // old per-record form (see read_bytes_fused).
+        const bool tail = eof && (sync[r + 1] == plimit);
+        std::size_t p = sync[r];
+        const std::size_t pend = sync[r + 1];
+        std::size_t g = need_g ? gstart[r] : 0;  // g meaningful only for k-mer
+        std::size_t n = 0;
+        // Deferred-by-one dup lookup (see read_bytesplit_core): overlap the
+        // slot load with the next record's parse. Keys point into `buf`, which
+        // is stable until after this parallel phase (the straddle memmove runs
+        // later, in a `single`), and the pending probe is flushed before this
+        // thread finishes the range.
+        std::uint64_t ph = 0; const char *pp = nullptr; std::size_t pn = 0;
+        bool pv = false;
+        while (p < pend) {
+          const std::size_t rec_start = p;
+          std::size_t seqlen = 0, tile_cur = 0;
+          const char *key = nullptr;
+          gc.emplace_back(GCRecord{0, 0, 0});
+          p = FastqPolicy::parse_one(w, ws, buf, plimit, p, g, &gc.back(),
+                                     tile_ignore, tail, seqlen, tile_cur, key);
+          ++g;
+          ++n;
+          if (count_dup && rec_start >= dup_stop) {
+            const std::size_t klen = get_truncate_point(seqlen);
+            const std::uint64_t h = DupHashMap::hash_of(key, klen);
+            master.sequence_count.prefetch(h);
+            if (pv) {
+              const auto it = master.sequence_count.find_hashed(ph, pp, pn);
+              if (it != master.sequence_count.end())
+                ++deltas[tid][static_cast<std::size_t>(it - mbegin)];
+            }
+            ph = h; pp = key; pn = klen; pv = true;
           }
-          ph = h; pp = key; pn = klen; pv = true;
         }
-      }
-      if (pv) {
-        const auto it = master.sequence_count.find_hashed(ph, pp, pn);
-        if (it != master.sequence_count.end())
-          ++deltas[t][static_cast<std::size_t>(it - mbegin)];
-      }
+        if (pv) {
+          const auto it = master.sequence_count.find_hashed(ph, pp, pn);
+          if (it != master.sequence_count.end())
+            ++deltas[tid][static_cast<std::size_t>(it - mbegin)];
+        }
+        counts[r] = n;  // == the count pass's value on well-formed input
+      }  // barrier: counts[] complete -> next iteration's single closes out
     }
-
-    // ---- GC replay in global read order (thread 0..nth-1, per chunk) ----
-    for (std::size_t t = 0; t < nthreads; ++t) {
-      const std::vector<GCRecord> &gc = gcr[t];
-      const std::size_t n = counts[t];
-      for (std::size_t j = 0; j < n; ++j) {
-        const GCRecord &gr = gc[j];
-        if (gr.kind == 1) {
-          for (const auto &v : master.gc_models[gr.a].models[gr.b])
-            master.gc_count[v.percent] += v.increment;
-        }
-        else if (gr.kind == 2) {
-          ++master.gc_count[gr.a];
-        }
-      }
-    }
-    total += nrec;
-
-    // ---- carry the straddling tail to the next chunk ----
-    leftover_len = end - plimit;
-    if (leftover_len) std::memmove(buf, buf + plimit, leftover_len);
   }
+  replayer.finish();  // every chunk replayed, in exact chunk order
 
   std::vector<std::vector<GCRecord>> empty_gc(nthreads);
   std::vector<std::vector<std::pair<std::uint32_t, std::uint32_t>>> tilerecs(

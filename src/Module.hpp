@@ -344,6 +344,7 @@ struct ModuleSequenceDuplicationLevels : public Module {
   std::unordered_map<std::size_t, std::size_t> counts_by_freq;
 
   AssayProfile assay;  // [FalcoAmadeus] assay-aware grading
+  std::size_t nthreads{1};  // [FalcoAmadeus] parallel corrected-count loop
   ModuleSequenceDuplicationLevels(const FalcoConfig &config);
   ~ModuleSequenceDuplicationLevels() {}
   void
