@@ -37,14 +37,16 @@ public:
   // Sized for the fixed cap of stored unique sequences
   // (FalcoConfig::Constants::unique_reads_stop_counting == 100000). Slots are a
   // power of two comfortably larger than 2x the cap to keep probe chains short.
-  explicit DupHashMap(std::size_t cap = 100000) : cap_(cap) {
-    std::size_t nslots = 1;
-    while (nslots < (cap << 2))
-      nslots <<= 1;  // >= 4x cap -> load factor < 0.25
-    slots_.assign(nslots, 0);
-    mask_ = nslots - 1;
-    entries_.reserve(cap);
-  }
+  //
+  // ALL storage (the 2 MB slot table, the entry reservation and the shadow key
+  // store) is allocated lazily on the first emplace(): every per-worker
+  // FastqStats carries one of these maps, but the parallel drivers only ever
+  // find() against the MASTER's map, so the worker instances would otherwise
+  // pay nthreads x 2 MB of touched RSS for tables that are never written.
+  // find()/find_hashed()/prefetch() on a never-emplaced map are guarded to
+  // return end() / no-op without allocating (an empty map contains nothing, so
+  // "not found" is exactly the pre-lazy result).
+  explicit DupHashMap(std::size_t cap = 100000) : cap_(cap) {}
 
   iterator begin() { return entries_.data(); }
   iterator end() { return entries_.data() + entries_.size(); }
@@ -73,6 +75,8 @@ public:
     return hash_key(p, n);
   }
   void prefetch(std::uint64_t h) const {
+    if (slots_.empty())  // never-emplaced map: nothing to prefetch
+      return;
     __builtin_prefetch(&slots_[h & mask_]);
   }
   // Slot payload: (tag << 24) | (entry index + 1); 0 = empty. The tag is 8
@@ -83,6 +87,8 @@ public:
   // (keys_, fixed 80-byte stride >= the 75-byte max key) instead of chasing
   // each entry's heap std::string: one load chain shorter per probe.
   iterator find_hashed(std::uint64_t hh, const char *p, std::size_t n) {
+    if (slots_.empty())  // never-emplaced map holds nothing: no alloc, no UB
+      return end();
     const std::uint32_t tag = (static_cast<std::uint32_t>(hh >> 56) | 1u) << 24;
     std::size_t h = static_cast<std::size_t>(hh) & mask_;
     for (;;) {
@@ -100,14 +106,15 @@ public:
   }
 
   // Insert a key known not to be present (callers only emplace after a failed
-  // find, exactly as the previous unordered_map code did). The shadow key
-  // store allocates on first insert so the per-worker map instances, which
-  // only ever find() against the master map, never pay for it.
+  // find, exactly as the previous unordered_map code did). All storage
+  // allocates on first insert so the per-worker map instances, which only ever
+  // find() against the master map, never pay for it. Once allocated, the slot
+  // table never rehashes and entries_ (reserved to cap_ before the first
+  // element exists) never reallocates, so pointer/iterator stability -- which
+  // the hot loops rely on -- is exactly as before.
   void emplace(const char *p, std::size_t n, std::size_t value) {
-    if (keys_.empty()) {
-      keys_.assign(cap_ * KSTRIDE, 0);
-      klen_.assign(cap_, 0);
-    }
+    if (slots_.empty())
+      allocate();
     const std::uint64_t hh = hash_key(p, n);
     const std::uint32_t tag = (static_cast<std::uint32_t>(hh >> 56) | 1u) << 24;
     std::size_t h = static_cast<std::size_t>(hh) & mask_;
@@ -124,6 +131,20 @@ public:
   }
 
 private:
+  // Deferred constructor body: build the slot table (with its mask), reserve
+  // the entry storage and zero the shadow key store. Runs at most once, before
+  // the first element is inserted.
+  void allocate() {
+    std::size_t nslots = 1;
+    while (nslots < (cap_ << 2))
+      nslots <<= 1;  // >= 4x cap -> load factor < 0.25
+    slots_.assign(nslots, 0);
+    mask_ = nslots - 1;
+    entries_.reserve(cap_);
+    keys_.assign(cap_ * KSTRIDE, 0);
+    klen_.assign(cap_, 0);
+  }
+
   static inline std::uint64_t mix(std::uint64_t x) {
     x ^= x >> 33;
     x *= 0xff51afd7ed558ccdULL;
@@ -166,10 +187,11 @@ private:
 
   static constexpr std::size_t KSTRIDE = 80;  // > max key (75, see
                                               // get_truncate_point)
+  // All four containers are empty until the first emplace() (see allocate())
   std::vector<value_type> entries_;   // contiguous, reserved to cap (stable)
   std::vector<std::uint32_t> slots_;  // (tag<<24)|(idx+1); 0 = empty
-  std::vector<char> keys_;            // shadow key bytes, KSTRIDE apart (lazy)
-  std::vector<std::uint8_t> klen_;    // shadow key lengths (lazy)
+  std::vector<char> keys_;            // shadow key bytes, KSTRIDE apart
+  std::vector<std::uint8_t> klen_;    // shadow key lengths
   std::size_t mask_ = 0;
   std::size_t cap_ = 0;
 };
