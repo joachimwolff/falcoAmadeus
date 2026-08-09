@@ -694,8 +694,9 @@ analyze_and_write(FalcoConfig &falco_config, const std::string &filename,
     if (!falco_config.quiet)
       log_process("reading file as BAM format");
     if (falco_config.threads >= 2 && falco_config.read_step == 1) {
-      // parallel BAM: byte-identical to the serial path (tile maps reconstructed
-      // inside, mirroring the chunked FASTQ driver -- no adjust_tile_maps_len).
+      // parallel BAM (byte-identical; tile reconstructed inside). -t1 keeps the
+      // streaming serial reader: with no parallelism the extra offset-walk +
+      // temp-file write cost more than they save.
       read_bam_chunked(falco_config, stats, falco_config.threads);
     }
     else {

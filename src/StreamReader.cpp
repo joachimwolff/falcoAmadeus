@@ -2841,7 +2841,7 @@ read_bam_chunked(FalcoConfig &config, FastqStats &master,
       const std::size_t bsz = rd_bsz(p);
       if (p + 4 + bsz > size) break;
       ++total; p += 4 + bsz;
-      if (p - w1drop >= (std::size_t(16) << 20)) { bdrop(w1drop, p); w1drop = p; }
+      if (p - w1drop >= (std::size_t(4) << 20)) { bdrop(w1drop, p); w1drop = p; }
     }
     // Walk 2: per-thread chunk-start byte offsets (record-aligned).
     std::vector<std::size_t> gstart(nthreads + 1, 0);
@@ -2856,7 +2856,7 @@ read_bam_chunked(FalcoConfig &config, FastqStats &master,
         while (tcur < nthreads && idx == gstart[tcur]) choff[tcur++] = q;
         const std::size_t bsz = rd_bsz(q);
         q += 4 + bsz; ++idx;
-        if (q - w2drop >= (std::size_t(16) << 20)) { bdrop(w2drop, q); w2drop = q; }
+        if (q - w2drop >= (std::size_t(4) << 20)) { bdrop(w2drop, q); w2drop = q; }
       }
       while (tcur <= nthreads) choff[tcur++] = q;
     }
@@ -2936,7 +2936,7 @@ read_bam_chunked(FalcoConfig &config, FastqStats &master,
           tilerecs[t].push_back({static_cast<std::uint32_t>(seqlen),
                                  static_cast<std::uint32_t>(tile_cur)});
         q += 4 + bsz;
-        if (q - jdrop >= (std::size_t(8) << 20)) { bdrop(jdrop, q); jdrop = q; }
+        if (q - jdrop >= (std::size_t(2) << 20)) { bdrop(jdrop, q); jdrop = q; }
       }
     }
     (void)nent; (void)mbegin;
