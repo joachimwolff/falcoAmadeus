@@ -1511,7 +1511,8 @@ parse_record(const char *base, std::size_t size, std::size_t p,
 static void
 read_chunked_core(FalcoConfig &config, FastqStats &master,
                   std::size_t nthreads, const char *base, std::size_t size,
-                  std::function<void()> release_input = {}) {
+                  std::function<void()> release_input = {},
+                  bool can_drop = false) {
   const std::size_t BUF = FastqStats::SHORT_READ_THRESHOLD;
   // dispatcher-only reader, used for its parsed configuration flags
   ParallelWorker cfg(config, BUF);
@@ -1526,6 +1527,25 @@ read_chunked_core(FalcoConfig &config, FastqStats &master,
     return;
   }
   const bool do_hash = cfg.do_sequence_hash;
+
+  // [FalcoAmadeus] Drop-behind for the memory-mapped uncompressed path. Both the
+  // Phase-1 count and the Phase-2 parse read each chunk strictly sequentially,
+  // so once a region is consumed its pages are dead. madvise(MADV_DONTNEED) on
+  // the file-backed read-only mapping returns those pages to the kernel (they
+  // re-read from the file on any later access, which never happens), capping the
+  // resident set at a small per-thread window instead of the whole ~file. Only
+  // for can_drop (the mmap path); the gz path hands us a decompressed heap
+  // buffer where DONTNEED would zero live data, so it stays false there.
+  const std::size_t PGSZ = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+  const std::size_t DROP_WINDOW = std::size_t(8) << 20;   // ~8 MiB per thread
+  auto drop_range = [&](std::size_t a, std::size_t b) {
+    if (!can_drop)
+      return;
+    const std::size_t sa = (a + PGSZ - 1) & ~(PGSZ - 1);  // round start up
+    const std::size_t sb = b & ~(PGSZ - 1);               // round end down
+    if (sb > sa)
+      madvise(const_cast<char *>(base) + sa, sb - sa, MADV_DONTNEED);
+  };
 
   // ---- Phase 0: record-boundary sync points, one per thread ----
   std::vector<std::size_t> sync(nthreads + 1);
@@ -1557,8 +1577,14 @@ read_chunked_core(FalcoConfig &config, FastqStats &master,
     const std::size_t lo = sync[t], hi = sync[t + 1];
     if (lo >= hi)
       return;
-    std::size_t nl =
-      static_cast<std::size_t>(std::count(base + lo, base + hi, '\n'));
+    // Count newlines block by block, releasing each block once counted so the
+    // count pass never holds the whole chunk resident.
+    std::size_t nl = 0;
+    for (std::size_t off = lo; off < hi; off += DROP_WINDOW) {
+      const std::size_t end = std::min(off + DROP_WINDOW, hi);
+      nl += static_cast<std::size_t>(std::count(base + off, base + end, '\n'));
+      drop_range(off, end);
+    }
     if (hi == size && base[size - 1] != '\n')
       ++nl;  // final record has no trailing newline
     counts[t] = nl / 4;
@@ -1693,6 +1719,7 @@ read_chunked_core(FalcoConfig &config, FastqStats &master,
     const std::size_t g0 = gstart[t];
     const bool last_chunk = (sync[t + 1] == size);
     std::size_t p = sync[t];
+    std::size_t dropped = sync[t];   // bytes released behind the cursor so far
     for (std::size_t j = 0; j < n; ++j) {
       const std::size_t g = g0 + j;
       // header -> sequence start (+ optional tile field)
@@ -1743,6 +1770,12 @@ read_chunked_core(FalcoConfig &config, FastqStats &master,
       // advance to the next record
       p = qual_no_nl ? size
                      : static_cast<std::size_t>(w.cur_char - base) + 1;
+      // release the pages this thread has already parsed (everything before the
+      // next record start p is consumed); keeps the resident window ~DROP_WINDOW.
+      if (can_drop && p - dropped >= DROP_WINDOW) {
+        drop_range(dropped, p);
+        dropped = p;
+      }
     }
   }
 
@@ -1912,7 +1945,8 @@ read_uncompressed_chunked(FalcoConfig &config, FastqStats &master,
   const char *data = src->data();
   const std::size_t sz = src->size();
   read_chunked_core(config, master, nthreads, data, sz,
-                    [src]() { delete src; });
+                    [src]() { delete src; },
+                    /*can_drop=*/true);   // file-backed mmap: safe to drop-behind
 }
 
 #if defined(USE_HTS) && defined(USE_LIBDEFLATE)
