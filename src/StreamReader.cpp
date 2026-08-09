@@ -2200,8 +2200,12 @@ open_unlinked_temp(const std::string &input_path, std::size_t bytes) {
 // the temp file; FA_HUGE forces huge pages.
 static bool
 choose_huge_buffer(std::size_t bytes) {
-  if (std::getenv("FA_LOWMEM")) return false;
-  if (std::getenv("FA_HUGE")) return true;
+  // Opt-in only: huge pages hold `bytes` of RSS (a 50M BAM is ~8 GB), which
+  // contradicts the lean default, and even then we trail falco2's fused parser.
+  // FA_HUGE turns it on for users who want the speed and have the RAM; we still
+  // refuse if it would not fit comfortably in available memory.
+  if (!std::getenv("FA_HUGE"))
+    return false;
   std::size_t avail = 0;
   if (FILE *fp = std::fopen("/proc/meminfo", "r")) {
     char line[256];
@@ -2214,7 +2218,7 @@ choose_huge_buffer(std::size_t bytes) {
     }
     std::fclose(fp);
   }
-  return avail != 0 && bytes < avail / 3;
+  return avail == 0 || bytes < avail / 3;
 }
 
 static GzBuffer
