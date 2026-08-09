@@ -23,6 +23,7 @@
 
 #include "dup_hash_map.hpp"
 #include <array>
+#include <cstdint>
 #include "FalcoConfig.hpp"
 // log of a power of two, to use in bit shifting for fast index acces
 // returns the log2 of a number if it is a power of two, or zero
@@ -186,6 +187,13 @@ struct FastqStats {
   // counts the number of bases in every read position
   std::array<size_t, kNumNucleotides * SHORT_READ_THRESHOLD> base_count;  // ATGC
   std::array<size_t, kNumNucleotides * SHORT_READ_THRESHOLD> n_base_count;  // N
+
+  // [FalcoAmadeus] SoA base counts [nucleotide*THRESHOLD + position], written by
+  // the AVX-512 sequence loop (contiguous vector accumulation) and folded into
+  // the AoS base_count by flush_soa() before the modules read it. uint32 is ample
+  // per thread (<< 4e9 reads); flushed per worker at merge and once at output.
+  std::array<std::uint32_t, kNumNucleotides * SHORT_READ_THRESHOLD> soa_base;
+  void flush_soa();  // fold soa_base into base_count
 
   /*********** PER QUALITY VALUE METRICS ****************/
   // Counts of quality in each base position

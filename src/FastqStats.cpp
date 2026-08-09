@@ -48,6 +48,16 @@ make_gc_models() {
 /******************** FASTQ STATS FUNCTIONS *********************/
 /****************************************************************/
 // Default constructor
+void
+FastqStats::flush_soa() {
+  for (std::size_t n = 0; n < kNumNucleotides; ++n) {
+    const std::uint32_t *src = &soa_base[n * SHORT_READ_THRESHOLD];
+    for (std::size_t p = 0; p < SHORT_READ_THRESHOLD; ++p)
+      base_count[(p << kBitShiftNucleotide) | n] += src[p];
+  }
+  soa_base.fill(0);
+}
+
 FastqStats::FastqStats(bool need_kmer) {
   lowest_char = std::numeric_limits<char>::max();
   encoding_offset = 0;
@@ -66,6 +76,7 @@ FastqStats::FastqStats(bool need_kmer) {
 
   // Initialize IO arrays
   base_count.fill(0);
+  soa_base.fill(0);
   n_base_count.fill(0);
   read_length_freq.fill(0);
   quality_count.fill(0);

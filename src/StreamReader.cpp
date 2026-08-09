@@ -17,6 +17,7 @@
 
 #include "StreamReader.hpp"
 #include <atomic>
+#include <immintrin.h>
 #include <cstdio>
 
 #include <algorithm>
@@ -473,6 +474,79 @@ StreamReader::postprocess_sequence_line(FastqStats &stats) {
   }
 }
 
+// [FalcoAmadeus] AVX-512 fast path for the sequence composition loop. Processes
+// 64 bases per iteration: vectorised field-separator scan, N detection, buffer
+// copy, GC count, and per-position base composition accumulated CONTIGUOUSLY into
+// the SoA base counts (stats.soa_base, folded into base_count later). The k-mer /
+// adapter sliding window stays scalar (it is a genuine loop-carried dependency and
+// cheap). We bail to the scalar loop on a separator, on any N, or just before a
+// GC-truncation point, so those edge cases keep the exact serial semantics. Only
+// used when do_kmer is off (the default); the caller guards on CPU support.
+__attribute__((target("avx512f,avx512bw,avx512vl")))
+void
+StreamReader::seq_avx512_chunks(FastqStats &stats, const char *&c, std::size_t &rp,
+    std::size_t bsz, char sep, char *buf, std::size_t &gc, std::size_t &nba,
+    std::size_t &kmer, std::size_t &next_trunc) {
+  const __m512i vsep = _mm512_set1_epi8(sep);
+  const __m512i vN = _mm512_set1_epi8('N');
+  const __m512i v3 = _mm512_set1_epi8(3);
+  const __m512i v1 = _mm512_set1_epi8(1);
+  const __m512i vzero = _mm512_setzero_si512();
+  std::uint32_t *const soa = stats.soa_base.data();
+  const std::size_t T = FastqStats::SHORT_READ_THRESHOLD;
+  while (rp + 64 <= bsz) {
+    if (do_gc_sequence && next_trunc < rp + 64)
+      break;  // a truncation point falls in this chunk -> let the scalar loop do it
+    const __m512i v = _mm512_loadu_si512(c);
+    if (_mm512_cmpeq_epi8_mask(v, vsep))
+      break;  // field separator in this chunk -> scalar tail
+    if (_mm512_cmpeq_epi8_mask(v, vN))
+      break;  // an N in this chunk -> scalar (handles n_base_count + k-mer reset)
+    _mm512_storeu_si512(buf + rp, v);                              // buffer copy
+    const __m512i t = _mm512_and_si512(_mm512_srli_epi16(v, 1), v3);  // two-bit code
+    // GC: count bases whose two-bit code has bit 0 set (C=01, G=11)
+    gc += _mm512_reduce_add_epi64(
+        _mm512_sad_epu8(_mm512_and_si512(t, v1), vzero));
+    // Base composition: for each code, add 1 to soa[code][rp..rp+63] where the
+    // 64-lane mask is set. 4 x 16 uint32 lanes per code, contiguous vector adds.
+    for (int code = 0; code < 4; ++code) {
+      const __mmask64 m = _mm512_cmpeq_epi8_mask(t, _mm512_set1_epi8(code));
+      std::uint32_t *const sp = soa + static_cast<std::size_t>(code) * T + rp;
+      for (int k = 0; k < 4; ++k) {
+        const __m512i cur = _mm512_loadu_si512(sp + k * 16);
+        const __m512i add = _mm512_maskz_set1_epi32(
+            static_cast<__mmask16>(m >> (k * 16)), 1);
+        _mm512_storeu_si512(sp + k * 16, _mm512_add_epi32(cur, add));
+      }
+    }
+    // sliding window (k-mer roll + adapter match), scalar and in order
+    if (do_sliding_window) {
+      for (int i = 0; i < 64; ++i) {
+        const std::size_t two_bit = (c[i] >> 1) & 3;
+        kmer = (kmer << Constants::bit_shift_base) | two_bit;
+        if (do_adapter_optimized && nba == adapter_size) {
+          kmer &= adapter_mask;
+          const std::size_t bmb = kmer & adapter_bm_mask;
+          if (adapter_present[bmb >> 6] &
+              (static_cast<std::uint64_t>(1) << (bmb & 63))) {
+            for (std::size_t a = 0; a != num_adapters; ++a) {
+              if (kmer == adapters[a] && !adapters_found[a]) {
+                ++stats.pos_adapter_count[
+                    ((rp + static_cast<std::size_t>(i))
+                     << Constants::bit_shift_adapter) | a];
+                adapters_found[a] = true;
+              }
+            }
+          }
+        }
+        nba += (nba != adapter_size);
+      }
+    }
+    c += 64;
+    rp += 64;
+  }
+}
+
 // Reads the line that has the biological sequence
 void
 StreamReader::read_sequence_line(FastqStats &stats) {
@@ -534,6 +608,9 @@ StreamReader::read_sequence_line(FastqStats &stats) {
   std::size_t kmer = cur_kmer;           // carries over between reads
   std::size_t next_trunc = next_truncation;  // 100 on entry
   const char sep = field_separator;
+  static const bool fa_avx512 = __builtin_cpu_supports("avx512bw");
+  if (fa_avx512 && still_in_buffer && !do_kmer)
+    seq_avx512_chunks(stats, c, rp, bsz, sep, buf, gc, nba, kmer, next_trunc);
   for (; rp < bsz; ++c, ++rp) {
     const char ch = *c;
     if (ch == sep)
@@ -1330,6 +1407,7 @@ read_parallel_impl(FalcoConfig &config, FastqStats &master,
   };
   for (std::size_t t = 0; t < nthreads; ++t) {
     FastqStats &ws = wstats[t];
+    ws.flush_soa();
     add_arr(master.base_count, ws.base_count);
     add_arr(master.n_base_count, ws.n_base_count);
     add_arr(master.position_quality_count, ws.position_quality_count);
@@ -1589,6 +1667,7 @@ merge_worker_stats(
   };
   for (std::size_t t = 0; t < nthreads; ++t) {
     FastqStats &ws = *wstats[t];
+    ws.flush_soa();
     add_arr(master.base_count, ws.base_count);
     add_arr(master.n_base_count, ws.n_base_count);
     add_arr(master.position_quality_count, ws.position_quality_count);
