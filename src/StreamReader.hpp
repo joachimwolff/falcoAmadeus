@@ -231,6 +231,17 @@ class StreamReader{
   void seq_simd_chunks(FastqStats &stats, const char *&c, size_t &rp,
                          size_t bsz, char sep, char *buf, size_t &gc, size_t &nba,
                          size_t &kmer, size_t &next_trunc);
+  // [FalcoAmadeus] SIMD quality-line pass (AVX-512; see .cpp): vector separator
+  // scan / byte-min / byte-sum plus a tight scalar histogram scatter. Only runs
+  // when hard_end is set (it bounds the 64-byte loads); otherwise the scalar
+  // loop below is used unchanged.
+  void qual_simd_chunks(FastqStats &stats, const char *&c, size_t &rp,
+                          size_t bsz, char sepf, char sepl, size_t &cq,
+                          char &lowest);
+  // One past the end of the buffer cur_char points into (mmap / arena / chunk /
+  // line buffer); set by the drivers so SIMD passes can bound wide loads.
+  // nullptr (the default) disables the SIMD quality pass.
+  const char *hard_end = nullptr;
   inline void read_quality_line(FastqStats &stats);  // parse quality
 
   /************ FUNCTIONS FOR PROGRESS BAR ***********/

@@ -693,6 +693,75 @@ StreamReader::seq_simd_chunks(FastqStats &, const char *&, std::size_t &,
     std::size_t &) {}  // no SIMD back end; dispatch guard keeps this uncalled
 #endif
 
+// [FalcoAmadeus] SIMD quality-line pass. The scalar loop pays ~18 instructions
+// per byte (two separator tests, a tab-aware min, subtract, a strided histogram
+// RMW, tile branch, sum). Here the separator scan, the byte-minimum and the
+// byte-sum are vectorised over 64-byte blocks and only the histogram scatter
+// (whose 1 KB-strided indices cannot be vectorised without conflict handling)
+// stays scalar -- about 4 instructions per byte. Identical integer math:
+// cq is accumulated as sum(bytes) - 33*count (equal to summing ch-33 per byte),
+// the min substitutes 127 for tab lanes exactly like the scalar min8 special
+// case, and the scatter performs the same increments in the same order. Blocks
+// are bounded by hard_end so the wide loads never leave the input buffer.
+#if defined(__x86_64__) || defined(__i386__)
+__attribute__((target("avx512f,avx512bw,avx512vl")))
+void
+StreamReader::qual_simd_chunks(FastqStats &stats, const char *&c,
+    std::size_t &rp, std::size_t bsz, char sepf, char sepl, std::size_t &cq,
+    char &lowest) {
+  const __m512i vsepf = _mm512_set1_epi8(sepf);
+  const __m512i vsepl = _mm512_set1_epi8(sepl);
+  const __m512i vtab = _mm512_set1_epi8(9);
+  const __m512i v127 = _mm512_set1_epi8(127);
+  const __m512i vzero = _mm512_setzero_si512();
+  __m512i vmin = v127;
+  std::size_t bytesum = 0, nbytes = 0;
+  std::size_t *const pqc = stats.position_quality_count.data();
+  const char *const he = hard_end;
+  while (rp + 64 <= bsz && c + 64 <= he) {
+    const __m512i v = _mm512_loadu_si512(c);
+    const __mmask64 msep = _mm512_cmpeq_epi8_mask(v, vsepf) |
+                           _mm512_cmpeq_epi8_mask(v, vsepl);
+    const unsigned mlen =
+        msep ? static_cast<unsigned>(__builtin_ctzll(msep)) : 64u;
+    if (mlen == 0)
+      break;
+    const __mmask64 valid =
+        (mlen == 64) ? ~static_cast<__mmask64>(0)
+                     : ((static_cast<__mmask64>(1) << mlen) - 1);
+    // byte minimum: tab lanes -> 127 (the scalar min8 special case), invalid
+    // lanes -> 127 (neutral)
+    const __mmask64 mtab = _mm512_cmpeq_epi8_mask(v, vtab);
+    const __m512i vlane = _mm512_mask_mov_epi8(v127, valid & ~mtab, v);
+    vmin = _mm512_min_epi8(vmin, vlane);
+    // byte sum of the valid lanes
+    bytesum += _mm512_reduce_add_epi64(
+        _mm512_sad_epu8(_mm512_maskz_mov_epi8(valid, v), vzero));
+    nbytes += mlen;
+    // histogram scatter: same increments, same order as the scalar loop
+    for (unsigned i = 0; i < mlen; ++i) {
+      const std::size_t qv =
+          static_cast<std::size_t>(c[i]) - Constants::quality_zero;
+      ++pqc[((rp + i) << Constants::bit_shift_quality) | qv];
+    }
+    c += mlen;
+    rp += mlen;
+    if (mlen < 64)
+      break;  // *c is now a separator; the caller's loop exits immediately
+  }
+  cq += bytesum - Constants::quality_zero * nbytes;
+  // fold the vector minimum into the running scalar minimum
+  alignas(64) char mb[64];
+  _mm512_store_si512(mb, vmin);
+  for (int i = 0; i < 64; ++i)
+    lowest = min8(lowest, mb[i]);
+}
+#else
+void
+StreamReader::qual_simd_chunks(FastqStats &, const char *&, std::size_t &,
+    std::size_t, char, char, std::size_t &, char &) {}
+#endif
+
 // Reads the line that has the biological sequence
 void
 StreamReader::read_sequence_line(FastqStats &stats) {
@@ -933,7 +1002,17 @@ StreamReader::read_quality_line(FastqStats &stats) {
   char lowest = stats.lowest_char;
   const char sepf = field_separator;
   const char sepl = line_separator;
+#if defined(__x86_64__) || defined(__i386__)
+  static const bool fa_simd_q =
+      __builtin_cpu_supports("avx512bw") && !std::getenv("FA_NOSIMD");
+#else
+  static const bool fa_simd_q = false;
+#endif
   if (!line_at_eof) {
+    // SIMD bulk pass (needs a known buffer end for its wide loads; per-tile
+    // reads keep the scalar loop, which also handles the tail after this).
+    if (fa_simd_q && !do_tile_quality && hard_end != nullptr)
+      qual_simd_chunks(stats, c, rp, bsz, sepf, sepl, cq, lowest);
     for (; rp < bsz; ++c, ++rp) {
       const char ch = *c;
       if (ch == sepf || ch == sepl)
@@ -1077,6 +1156,7 @@ FastqReader::FastqReader(FalcoConfig &_config, const std::size_t _buffer_size) :
   StreamReader(_config, _buffer_size, get_line_separator(_config.filename),
                get_line_separator(_config.filename)) {
   filebuf = new char[RESERVE_SIZE];
+  hard_end = filebuf + RESERVE_SIZE;  // bounds the SIMD quality loads
   iobuf = new char[IO_BUFFER_SIZE];
 }
 
@@ -1285,6 +1365,7 @@ GzFastqReader::GzFastqReader(FalcoConfig &_config,
   StreamReader(_config, _buffer_size, '\n', '\n'),
   threaded(_config.threads >= 2) {
   gzbuf = new char[RESERVE_SIZE];
+  hard_end = gzbuf + RESERVE_SIZE;  // bounds the SIMD quality loads
 #ifndef USE_ISAL
   decomp = nullptr;
 #endif
@@ -1581,6 +1662,7 @@ read_parallel_impl(FalcoConfig &config, FastqStats &master,
         const int tid = 0;
 #endif
         ParallelWorker &w = *workers[tid];
+        w.hard_end = base + arena.size();  // bounds the SIMD quality loads
         FastqStats &ws = wstats[tid];
 #ifdef _OPENMP
 #pragma omp for schedule(static)
@@ -2135,7 +2217,12 @@ read_bytesplit_core(FalcoConfig &config, FastqStats &master,
   // for can_drop (the mmap path); the gz path hands us a decompressed heap
   // buffer where DONTNEED would zero live data, so it stays false there.
   const std::size_t PGSZ = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
-  const std::size_t DROP_WINDOW = std::size_t(8) << 20;   // ~8 MiB per thread
+  // Per-thread drop-behind window. 1 MiB (was 8 MiB): the parse got ~2x
+  // faster, so with a large window kernel readahead outran reclaim and peak
+  // RSS on a 38 GB mmap crept to ~800 MB; a tighter window bounds each thread
+  // without measurable madvise overhead (same finding as the BAM path, which
+  // settled on a sub-MiB window for the identical fault-storm reason).
+  const std::size_t DROP_WINDOW = std::size_t(1) << 20;
   auto drop_range = [&](std::size_t a, std::size_t b) {
     if (!can_drop)
       return;
@@ -2162,8 +2249,10 @@ read_bytesplit_core(FalcoConfig &config, FastqStats &master,
   // ---- per-thread parallel workers (parse config + per-base state) ----
   std::vector<std::unique_ptr<typename P::Worker>> workers;
   workers.reserve(nthreads);
-  for (std::size_t t = 0; t < nthreads; ++t)
+  for (std::size_t t = 0; t < nthreads; ++t) {
     workers.emplace_back(new typename P::Worker(config, BUF));
+    workers.back()->hard_end = base + size;  // bounds the SIMD quality loads
+  }
 
   // ---- Phase 1: count records per chunk (parallel newline count) ----
   // Chunks are record-aligned, so each record is exactly 4 newlines; only the
@@ -2511,6 +2600,7 @@ read_gz_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads) {
       std::vector<GCRecord> &gc = gcr[t];
       if (gc.size() < n) gc.assign(n, GCRecord{0, 0, 0});
       ParallelWorker &w = *workers[t];
+      w.hard_end = buf + end;  // bounds the SIMD quality loads (buf can move)
       FastqStats &ws = *wstats[t];
       const std::size_t g0 = gstart[t];
       const bool tail = eof && (sync[t + 1] == plimit);
@@ -3031,6 +3121,7 @@ SamReader::SamReader(FalcoConfig &_config, const std::size_t _buffer_size) :
   StreamReader(_config, _buffer_size, '\t',
                get_line_separator(_config.filename)) {
   filebuf = new char[RESERVE_SIZE];
+  hard_end = filebuf + RESERVE_SIZE;  // bounds the SIMD quality loads
   iobuf = new char[IO_BUFFER_SIZE];
 }
 
@@ -3119,6 +3210,39 @@ BamReader::put_base_in_buffer(const std::size_t pos) {
 }
 
 // Specially made to work directly with bam1_t
+// [FalcoAmadeus] Unpack BAM's 4-bit packed SEQ to ASCII, 2 bases per input
+// byte, using the same seq_nt16_str table as the scalar path. The SSSE3 back
+// end expands 16 packed bytes to 32 bases per iteration with two pshufb table
+// lookups and an interleave -- identical bytes to the scalar loop, so
+// everything downstream is byte-identical. SSSE3 is universal on x86-64
+// hardware from ~2006 on; other architectures take the scalar loop.
+#if defined(__x86_64__) || defined(__i386__)
+__attribute__((target("ssse3"))) static void
+bam_decode_simd(const std::uint8_t *pk, std::size_t half, char *db) {
+  const __m128i tbl = _mm_loadu_si128(
+      reinterpret_cast<const __m128i *>(seq_nt16_str));  // 16-entry LUT
+  const __m128i m15 = _mm_set1_epi8(0x0f);
+  std::size_t j = 0;
+  for (; j + 16 <= half; j += 16) {
+    const __m128i v =
+        _mm_loadu_si128(reinterpret_cast<const __m128i *>(pk + j));
+    const __m128i hi = _mm_and_si128(_mm_srli_epi16(v, 4), m15);
+    const __m128i lo = _mm_and_si128(v, m15);
+    const __m128i hc = _mm_shuffle_epi8(tbl, hi);
+    const __m128i lc = _mm_shuffle_epi8(tbl, lo);
+    _mm_storeu_si128(reinterpret_cast<__m128i *>(db + 2 * j),
+                     _mm_unpacklo_epi8(hc, lc));
+    _mm_storeu_si128(reinterpret_cast<__m128i *>(db + 2 * j + 16),
+                     _mm_unpackhi_epi8(hc, lc));
+  }
+  for (; j < half; ++j) {
+    const std::uint8_t by = pk[j];
+    db[2 * j] = seq_nt16_str[by >> 4];
+    db[2 * j + 1] = seq_nt16_str[by & 0xf];
+  }
+}
+#endif
+
 void
 BamReader::read_sequence_line(FastqStats &stats) {
   if (!do_read)
@@ -3139,10 +3263,20 @@ BamReader::read_sequence_line(FastqStats &stats) {
   const std::uint8_t *pk = reinterpret_cast<const std::uint8_t *>(cur_char);
   char *const db = decode_buf.data();
   const std::size_t half = seq_len >> 1;
-  for (std::size_t j = 0; j < half; ++j) {
-    const std::uint8_t by = pk[j];
-    db[2 * j] = seq_nt16_str[by >> 4];
-    db[2 * j + 1] = seq_nt16_str[by & 0xf];
+#if defined(__x86_64__) || defined(__i386__)
+  static const bool bam_simd =
+      __builtin_cpu_supports("ssse3") && !std::getenv("FA_NOSIMD");
+  if (bam_simd) {
+    bam_decode_simd(pk, half, db);
+  }
+  else
+#endif
+  {
+    for (std::size_t j = 0; j < half; ++j) {
+      const std::uint8_t by = pk[j];
+      db[2 * j] = seq_nt16_str[by >> 4];
+      db[2 * j + 1] = seq_nt16_str[by & 0xf];
+    }
   }
   if (seq_len & 1)
     db[seq_len - 1] = seq_nt16_str[pk[half] >> 4];
