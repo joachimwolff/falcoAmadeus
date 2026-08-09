@@ -2566,6 +2566,13 @@ public:
       th_ = std::thread([this] { run(); });
     cv_.notify_all();
   }
+  // Wait until the in-flight job (replay + its `after` hook) has completed,
+  // without stopping the thread. Used by pipelined callers that need the
+  // results the `after` hook produced (e.g. the BAM walk) before continuing.
+  void wait_idle() {
+    std::unique_lock<std::mutex> lk(m_);
+    cv_.wait(lk, [&] { return inflight_ < 0; });
+  }
   // Wait until every submitted replay has run (call before merging/reading
   // master.gc_count), then stop the thread. Idempotent.
   void finish() {
@@ -4576,8 +4583,12 @@ read_bam_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads) {
     return;
   }
 
-  // ---- group blocks into ~128 MB decompressed chunks ----
-  const std::size_t CHUNK = std::size_t(64) << 20;
+  // ---- group blocks into ~32 MB decompressed chunks (double-buffered) ----
+  // [FalcoAmadeus P4] Half the old 64 MB chunks, TWO chunk buffers: the
+  // combined phase below parses chunk c from one slot while inflating chunk
+  // c+1 into the other, so the buffer pair (32+8 slack each) costs about the
+  // same as the old single 64+16 buffer.
+  const std::size_t CHUNK = std::size_t(32) << 20;
   std::vector<std::size_t> cb;  // block-index boundaries; chunk c = [cb[c], cb[c+1])
   cb.push_back(0);
   { std::size_t acc = 0;
@@ -4594,18 +4605,21 @@ read_bam_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads) {
     chunk_max = std::max(chunk_max,
                          ix.uoff[b1 - 1] + ix.ulen[b1 - 1] - ix.uoff[b0]);
   }
-  const std::size_t SLACK = std::size_t(16) << 20;  // leftover (one straddling record)
+  const std::size_t SLACK = std::size_t(8) << 20;  // leftover (one straddling record)
   const std::size_t bufcap = chunk_max + SLACK;
-  char *buf = static_cast<char *>(mmap(nullptr, bufcap, PROT_READ | PROT_WRITE,
-                                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-  if (buf == MAP_FAILED) {
+  char *bufmem = static_cast<char *>(
+    mmap(nullptr, 2 * bufcap, PROT_READ | PROT_WRITE,
+         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+  if (bufmem == MAP_FAILED) {
     close(ix.fd);
     bam_read_serial(config, master);
     return;
   }
-  madvise(buf, bufcap, MADV_HUGEPAGE);
-  auto rd_bsz = [&](std::size_t q) {
-    int32_t v; std::memcpy(&v, buf + q, 4); return static_cast<std::size_t>(v);
+  madvise(bufmem, 2 * bufcap, MADV_HUGEPAGE);
+  char *const bufs2[2] = { bufmem, bufmem + bufcap };
+  char *buf = bufs2[0];  // the dup-prefix pass below runs single-buffered
+  auto rd_bsz = [&](const char *bp, std::size_t q) {
+    int32_t v; std::memcpy(&v, bp + q, 4); return static_cast<std::size_t>(v);
   };
   // Decompress chunk c into buf+off: pread the chunk's compressed bytes into a
   // reused buffer (so the ~compressed-file never stays resident), inflate the
@@ -4668,7 +4682,7 @@ read_bam_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads) {
       std::size_t q = (c == 0) ? bam_records_start(buf, end) : 0;
       if (q == SIZE_MAX) break;
       while (q + 4 <= end && dup_cont) {
-        const std::size_t bsz = rd_bsz(q);
+        const std::size_t bsz = rd_bsz(buf, q);
         if (q + 4 + bsz > end) break;  // straddles into next chunk
         std::size_t klen = 0;
         keyer.decode_key(buf + q + 4, static_cast<uint32_t>(bsz), keybuf.data(),
@@ -4696,113 +4710,239 @@ read_bam_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads) {
   const std::size_t fill_boundary = dup_cont ? SIZE_MAX : dup_seen;
   const bool count_dup = do_hash && !dup_cont;
 
-  // ---- main pass: fused decompress + parallel parse, chunk by chunk ----
+  // ---- main pass: pipelined decompress + walk + parse + GC replay ----
+  // [FalcoAmadeus P4] Per iteration ONE combined dynamic phase runs the parse
+  // ranges of chunk c AND the inflate tasks of chunk c+1 (into the other
+  // buffer slot); the GC replay of chunk c-1, the pread of chunk c+2 and the
+  // record walk of chunk c+1 all run on the replay thread DURING that phase
+  // (the walk starts when the phase's last inflate task signals). Everything
+  // that was serialized between phases -- walk, replay, pread -- is hidden
+  // under the parse. Byte-identity: the walk produces the same offsets
+  // regardless of who runs it; parse ranges merge by commutative integer
+  // adds; the GC replay runs per-range in range order (global read order) in
+  // strict chunk order on one thread; the dup gate `g >= fill_boundary` uses
+  // the exact global index (the walk gives exact counts).
   std::vector<std::unique_ptr<FastqStats>> wstats(nthreads);
   std::vector<std::unique_ptr<BamReader>> bw(nthreads);
   std::vector<std::vector<std::size_t>> deltas(nthreads);
-  std::vector<std::vector<GCRecord>> gcr(nthreads);
   std::vector<std::vector<std::pair<std::uint32_t, std::uint32_t>>> tilerecs(nthreads);
+  std::vector<libdeflate_decompressor *> decs(nthreads, nullptr);
+  bool decs_ok = true;
   for (std::size_t t = 0; t < nthreads; ++t) {
     wstats[t].reset(new FastqStats(config.do_kmer));
     bw[t].reset(new BamReader(config, BUF));
     bw[t]->bam_worker_init();
     if (count_dup) deltas[t].assign(nent, 0);
+    decs[t] = libdeflate_alloc_decompressor();
+    if (decs[t] == nullptr) decs_ok = false;
   }
-  std::vector<std::size_t> gstart(nthreads + 1, 0);  // tile reconstruction only
-  std::vector<std::size_t> offs;                     // record offsets in the chunk
-  std::vector<std::size_t> tcount(nthreads, 0);
+  std::vector<std::size_t> gstart(nthreads + 1, 0);  // merge signature only
   std::size_t total = 0;
-  leftover.clear();
   const bool fa_times = std::getenv("FA_TIMES") != nullptr;
-  double t_dc = 0, t_walk = 0, t_parse = 0, t_gc = 0;
+  double t_phase = 0, t_aux_wait = 0, t_prologue = 0;
   auto now = [] {
     return std::chrono::duration<double>(
              std::chrono::steady_clock::now().time_since_epoch()).count();
   };
-  for (std::size_t c = 0; c < nchunks; ++c) {
-    const std::size_t off = leftover.size();
-    if (off) std::memcpy(buf, leftover.data(), off);
-    double t0 = fa_times ? now() : 0;
-    const std::size_t un = decompress_chunk(c, off);
-    if (fa_times) { t_dc += now() - t0; t0 = now(); }
-    if (un == SIZE_MAX) break;
-    const std::size_t end = off + un;
-    std::size_t q = (c == 0) ? bam_records_start(buf, end) : 0;
-    if (q == SIZE_MAX) break;
-    // walk this chunk's complete records; the trailing partial one -> leftover.
-    // Each block_size load feeds the next record's address, so the chain is
-    // bound by cache latency, not bandwidth; a streaming prefetch cursor a few
-    // KB ahead hides it (the walk is sequential, so every prefetched line is
-    // used). Prefetch is a hint: harmless past `end`.
+  const std::size_t R_MAX_BAM = std::max<std::size_t>(4 * nthreads, 1);
+  GCReplayer replayer(master, R_MAX_BAM);
+  // pipeline state (aux-thread writes ordered against the main thread by the
+  // replayer's mutex: wait_idle() before any read)
+  std::vector<char> cbufs2[2];        // compressed bytes per buffer slot
+  std::vector<std::size_t> offs2[2];  // record offsets per buffer slot
+  std::vector<char> leftover2;        // straddling tail record, walk-chained
+  std::size_t end2[2] = {0, 0};       // decompressed end per slot
+  std::atomic<std::size_t> infl_left{0};
+  std::atomic<bool> infl_fail{false};
+  std::mutex im;
+  std::condition_variable icv;
+  bool infl_done = false;    // guarded by im
+  bool walk_fail = false;    // aux -> main, read after wait_idle
+  auto pread_chunk = [&](std::size_t c, std::vector<char> &dst) -> bool {
+    const std::size_t b0 = cb[c], b1 = cb[c + 1];
+    const std::size_t base_c = ix.coff[b0];
+    const std::size_t clen_total =
+      ((b1 < nb) ? ix.coff[b1] : ix.csize) - base_c;
+    if (dst.size() < clen_total) dst.resize(clen_total);
+    std::size_t got = 0;
+    while (got < clen_total) {
+      const ssize_t n = pread(ix.fd, dst.data() + got, clen_total - got,
+                              static_cast<off_t>(base_c + got));
+      if (n <= 0) return false;
+      got += static_cast<std::size_t>(n);
+    }
+    return true;
+  };
+  // Walk slot s (chunk c): record offsets + the straddling tail. Identical
+  // walk to the old inline version, prefetch cursor included.
+  auto walk_chunk = [&](std::size_t c) -> bool {
+    const std::size_t s = c % 2;
+    char *const bp = bufs2[s];
+    const std::size_t end = end2[s];
+    std::size_t q = (c == 0) ? bam_records_start(bp, end) : 0;
+    if (q == SIZE_MAX) return false;
+    std::vector<std::size_t> &offs = offs2[s];
     offs.clear();
     std::size_t pf = q;
     while (q + 4 <= end) {
       for (; pf < q + 2048; pf += 64)
-        __builtin_prefetch(buf + pf);
-      const std::size_t bsz = rd_bsz(q);
+        __builtin_prefetch(bp + pf);
+      const std::size_t bsz = rd_bsz(bp, q);
       if (q + 4 + bsz > end) break;
       offs.push_back(q);
       q += 4 + bsz;
     }
-    leftover.assign(buf + q, buf + end);
-    if (fa_times) { t_walk += now() - t0; t0 = now(); }
-    const std::size_t nrec = offs.size();
-    if (nrec == 0) continue;
-    // parallel parse: contiguous record sub-range per thread
-    for (std::size_t t = 0; t <= nthreads; ++t)
-      gstart[t] = nrec * t / nthreads;  // reused as chunk-local split
-#ifdef _OPENMP
-#pragma omp parallel for num_threads(nthreads) schedule(static)
-#endif
-    for (std::size_t t = 0; t < nthreads; ++t) {
-      const std::size_t lo = gstart[t], hi = gstart[t + 1];
-      tcount[t] = hi - lo;
-      if (lo >= hi) continue;
-      FastqStats &ws = *wstats[t];
-      BamReader &w = *bw[t];
-      std::vector<GCRecord> &gc = gcr[t];
-      if (gc.size() < hi - lo) gc.assign(hi - lo, GCRecord{0, 0, 0});
-      for (std::size_t j = lo; j < hi; ++j) {
-        const std::size_t g = total + j;
-        const std::size_t p = offs[j];
-        const std::size_t seqlen = w.process_record_parallel_inplace(
-          buf + p + 4, ws, &gc[j - lo], g);
-        if (count_dup && g >= fill_boundary) {
-          const auto it = master.sequence_count.find(
-            w.buffer, get_truncate_point(seqlen));
-          if (it != master.sequence_count.end())
-            ++deltas[t][static_cast<std::size_t>(it - mbegin)];
-        }
-      }
+    leftover2.assign(bp + q, bp + end);
+    return true;
+  };
+  bool pipeline_ok = decs_ok;
+  std::size_t prev_nranges = 0;  // ranges of the last parsed, unreplayed chunk
+  if (pipeline_ok) {
+    // ---- prologue: chunk 0 decompressed (own team) + walked serially ----
+    const double tp0 = fa_times ? now() : 0;
+    buf = bufs2[0];
+    leftover.clear();
+    const std::size_t un0 = decompress_chunk(0, 0);
+    if (un0 == SIZE_MAX) {
+      pipeline_ok = false;
     }
-    if (fa_times) { t_parse += now() - t0; t0 = now(); }
-    // replay this chunk's GC in global read order (threads 0..nth-1)
-    for (std::size_t t = 0; t < nthreads; ++t) {
-      const std::vector<GCRecord> &gc = gcr[t];
-      const std::size_t n = tcount[t];
-      for (std::size_t j = 0; j < n; ++j) {
-        const GCRecord &gr = gc[j];
-        if (gr.kind == 1) {
-          for (const auto &v : master.gc_models[gr.a].models[gr.b])
-            master.gc_count[v.percent] += v.increment;
-        }
-        else if (gr.kind == 2)
-          ++master.gc_count[gr.a];
-      }
+    else {
+      end2[0] = un0;
+      if (!walk_chunk(0))
+        pipeline_ok = false;
+      else if (nchunks > 1 && !pread_chunk(1, cbufs2[1]))
+        pipeline_ok = false;
     }
-    if (fa_times) t_gc += now() - t0;
-    total += nrec;
+    if (fa_times) t_prologue = now() - tp0;
   }
+  for (std::size_t c = 0; pipeline_ok && c < nchunks; ++c) {
+    const std::size_t s = c % 2, s1 = (c + 1) % 2;
+    const bool have_next = (c + 1 < nchunks);
+    const std::size_t nrec = offs2[s].size();
+    // next chunk inflates after the straddling tail carried from this walk
+    std::size_t off1 = 0;
+    std::size_t ninfl = 0;
+    if (have_next) {
+      off1 = leftover2.size();
+      if (off1) std::memcpy(bufs2[s1], leftover2.data(), off1);
+      ninfl = cb[c + 2] - cb[c + 1];
+      infl_left.store(ninfl, std::memory_order_relaxed);
+      infl_fail.store(false, std::memory_order_relaxed);
+      { std::lock_guard<std::mutex> lk(im); infl_done = false; }
+      end2[s1] = off1 + (ix.uoff[cb[c + 2] - 1] + ix.ulen[cb[c + 2] - 1] -
+                         ix.uoff[cb[c + 1]]);
+    }
+    else {
+      std::lock_guard<std::mutex> lk(im);
+      infl_done = true;  // nothing to inflate: the aux walk hook returns fast
+    }
+    // parse ranges of chunk c (record-aligned; assignment is output-neutral)
+    const std::size_t nranges = (nrec == 0)
+      ? 0
+      : std::min(R_MAX_BAM, std::max<std::size_t>(1, nrec / 4096));
+    // ---- aux job: replay gc(c-1); pread(c+2); walk(c+1) mid-phase ----
+    // Submitted BEFORE the phase so all of it overlaps the phase. The walk
+    // waits for the phase's last inflate task; the flip inside submit() also
+    // hands the OTHER gc buffer set to this phase's parse ranges.
+    const std::size_t c2 = c + 2;
+    replayer.submit(prev_nranges,
+                    [&, s, c2, have_next]() {
+                      if (c2 < nchunks && !pread_chunk(c2, cbufs2[s]))
+                        walk_fail = true;  // stops the pipeline after the phase
+                      if (have_next) {
+                        { std::unique_lock<std::mutex> lk(im);
+                          icv.wait(lk, [&] { return infl_done; }); }
+                        if (infl_fail.load(std::memory_order_relaxed))
+                          return;  // main handles the failure
+                        if (!walk_chunk(c2 - 1))
+                          walk_fail = true;
+                      }
+                    });
+    // ---- combined phase: inflate chunk c+1 + parse chunk c ----
+    const double t0 = fa_times ? now() : 0;
+    const std::size_t base_cc = have_next ? ix.coff[cb[c + 1]] : 0;
+    const std::size_t base_uoff = have_next ? ix.uoff[cb[c + 1]] : 0;
+    const std::size_t ntasks = ninfl + nranges;
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(nthreads) schedule(dynamic)
+#endif
+    for (std::size_t task = 0; task < ntasks; ++task) {
+#ifdef _OPENMP
+      const std::size_t tid = static_cast<std::size_t>(omp_get_thread_num());
+#else
+      const std::size_t tid = 0;
+#endif
+      if (task < ninfl) {
+        // inflate one BGZF block of chunk c+1 (tasks are listed first, so
+        // dynamic scheduling front-loads them and the walk starts early)
+        const std::size_t b = cb[c + 1] + task;
+        std::size_t act = 0;
+        if (libdeflate_gzip_decompress(
+              decs[tid], cbufs2[s1].data() + (ix.coff[b] - base_cc),
+              ix.clen[b], bufs2[s1] + off1 + (ix.uoff[b] - base_uoff),
+              ix.ulen[b], &act) != LIBDEFLATE_SUCCESS ||
+            act != ix.ulen[b])
+          infl_fail.store(true, std::memory_order_relaxed);
+        if (infl_left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+          std::lock_guard<std::mutex> lk(im);
+          infl_done = true;
+          icv.notify_all();
+        }
+      }
+      else {
+        const std::size_t r = task - ninfl;
+        const std::size_t lo = nrec * r / nranges;
+        const std::size_t hi = nrec * (r + 1) / nranges;
+        if (lo >= hi) { replayer.parse_bufs()[r].clear(); }
+        else {
+          FastqStats &ws = *wstats[tid];
+          BamReader &w = *bw[tid];
+          std::vector<GCRecord> &gc = replayer.parse_bufs()[r];
+          gc.clear();
+          const std::vector<std::size_t> &offs = offs2[s];
+          char *const bp = bufs2[s];
+          for (std::size_t j = lo; j < hi; ++j) {
+            const std::size_t g = total + j;
+            const std::size_t p = offs[j];
+            gc.emplace_back(GCRecord{0, 0, 0});
+            const std::size_t seqlen = w.process_record_parallel_inplace(
+              bp + p + 4, ws, &gc.back(), g);
+            if (count_dup && g >= fill_boundary) {
+              const auto it = master.sequence_count.find(
+                w.buffer, get_truncate_point(seqlen));
+              if (it != master.sequence_count.end())
+                ++deltas[tid][static_cast<std::size_t>(it - mbegin)];
+            }
+          }
+        }
+      }
+    }
+    if (fa_times) t_phase += now() - t0;
+    prev_nranges = nranges;
+    total += nrec;
+    // ---- wait for the aux job (replay + pread + walk) and check failures ---
+    const double t1 = fa_times ? now() : 0;
+    replayer.wait_idle();
+    if (fa_times) t_aux_wait += now() - t1;
+    if (have_next &&
+        (infl_fail.load(std::memory_order_relaxed) || walk_fail))
+      pipeline_ok = false;  // same effect as the old mid-loop break
+  }
+  // final replay: the last chunk's ranges are still unsubmitted
+  replayer.submit(prev_nranges, {});
+  replayer.finish();
+  for (std::size_t t = 0; t < nthreads; ++t)
+    if (decs[t]) libdeflate_free_decompressor(decs[t]);
   if (fa_times)
     std::fprintf(stderr,
-                 "[FA_TIMES bam] decompress %.3f walk %.3f parse %.3f gc %.3f "
-                 "(%zu chunks)\n", t_dc, t_walk, t_parse, t_gc, nchunks);
+                 "[FA_TIMES bam] prologue %.3f phase %.3f aux-wait %.3f "
+                 "(%zu chunks)\n", t_prologue, t_phase, t_aux_wait, nchunks);
 
   std::vector<std::vector<GCRecord>> empty_gc(nthreads);
   merge_worker_stats(config, master, nthreads, total, wstats, empty_gc, deltas,
                      tilerecs, gstart, count_dup, /*tile_ignore=*/true,
                      /*skip_gc=*/true);
-  munmap(buf, bufcap);
+  munmap(bufmem, 2 * bufcap);
   close(ix.fd);
   return;
 #else
