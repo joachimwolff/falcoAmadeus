@@ -195,6 +195,27 @@ struct FastqStats {
   std::array<std::uint32_t, kNumNucleotides * SHORT_READ_THRESHOLD> soa_base;
   void flush_soa();  // fold soa_base into base_count
 
+  // [FalcoAmadeus] uint8 base-composition tile, same SoA layout as soa_base
+  // [code*THRESHOLD + pos] (4 x 500 = 2 KB, fully L1-resident). The AVX-512
+  // sequence loop increments it with ONE masked byte-add per code per 64-byte
+  // block (4 vector RMWs) instead of four uint32 sub-vector RMWs per code (16).
+  // Three-level flush chain, each level folded by commutative integer adds so
+  // the final totals are byte-identical to the direct scatter:
+  //   base_tile8 --flush_tile8()--> soa_base --flush_soa()--> base_count.
+  // flush_tile8() runs (a) inside the AVX-512 loop every <= kBaseTileFlushReads
+  // reads -- uint8 overflow guard: a read contributes at most ONE count per
+  // (code,pos) cell (one base per position, matching exactly one code) and
+  // seq_simd_chunks runs at most once per read, so cells stay <= 200 < 255 --
+  // and (b) at the top of flush_soa() itself, so every existing and future
+  // flush_soa site (the only readers of soa_base) folds the tile first by
+  // construction. The scalar tail and NEON paths keep writing base_count /
+  // soa_base directly: different levels of the same chain, commutative adds,
+  // all flushed before any read of base_count.
+  std::array<std::uint8_t, kNumNucleotides * SHORT_READ_THRESHOLD> base_tile8;
+  std::uint32_t base_tile8_reads;  // reads accumulated since the last flush
+  static const std::uint32_t kBaseTileFlushReads = 200;
+  void flush_tile8();  // fold base_tile8 into soa_base
+
   /*********** PER QUALITY VALUE METRICS ****************/
   // Counts of quality in each base position
   std::array<size_t, kNumQualityValues * SHORT_READ_THRESHOLD> position_quality_count;

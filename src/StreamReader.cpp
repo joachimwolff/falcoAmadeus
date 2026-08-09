@@ -540,7 +540,11 @@ StreamReader::seq_simd_chunks(FastqStats &stats, const char *&c, std::size_t &rp
   const __m512i v3 = _mm512_set1_epi8(3);
   const __m512i v1 = _mm512_set1_epi8(1);
   const __m512i vzero = _mm512_setzero_si512();
-  std::uint32_t *const soa = stats.soa_base.data();
+  // Base composition goes into the 2 KB uint8 tile (same SoA layout as
+  // soa_base): one masked byte-add per code per block instead of four uint32
+  // sub-vector RMWs per code. Folded into soa_base by flush_tile8() -- see the
+  // FastqStats.hpp comment for the flush-chain / overflow invariants.
+  std::uint8_t *const t8 = stats.base_tile8.data();
   const std::size_t T = FastqStats::SHORT_READ_THRESHOLD;
   const std::size_t rp0 = rp;  // start of the region this call covers
   while (rp + 64 <= bsz) {
@@ -578,13 +582,10 @@ StreamReader::seq_simd_chunks(FastqStats &stats, const char *&c, std::size_t &rp
     for (int code = 0; code < 4; ++code) {
       const __mmask64 m =
           _mm512_cmpeq_epi8_mask(t, _mm512_set1_epi8(code)) & valid;
-      std::uint32_t *const sp = soa + static_cast<std::size_t>(code) * T + rp;
-      for (int k = 0; k < 4; ++k) {
-        const __m512i cur = _mm512_loadu_si512(sp + k * 16);
-        const __m512i add = _mm512_maskz_set1_epi32(
-            static_cast<__mmask16>(m >> (k * 16)), 1);
-        _mm512_storeu_si512(sp + k * 16, _mm512_add_epi32(cur, add));
-      }
+      // rp + 64 <= bsz <= T keeps the 64-byte access inside this code's row
+      std::uint8_t *const tp = t8 + static_cast<std::size_t>(code) * T + rp;
+      const __m512i cur = _mm512_loadu_si512(tp);
+      _mm512_storeu_si512(tp, _mm512_mask_add_epi8(cur, m, cur, v1));
     }
     c += mlen;
     rp += mlen;
@@ -673,6 +674,13 @@ StreamReader::seq_simd_chunks(FastqStats &stats, const char *&c, std::size_t &rp
     kmer = k;
     nba = nb;
   }
+
+  // uint8 overflow guard for the base tile: at most ONE increment per
+  // (code,pos) cell per read (one base per position, matching exactly one
+  // code) and this function runs at most once per read, so flushing every
+  // <= kBaseTileFlushReads (200 < 255) reads keeps every cell in range.
+  if (++stats.base_tile8_reads >= FastqStats::kBaseTileFlushReads)
+    stats.flush_tile8();
 }
 
 #elif defined(__aarch64__)
