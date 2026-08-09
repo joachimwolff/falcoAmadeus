@@ -2575,12 +2575,19 @@ reverse_quality_scores(bam1_t *aln) {
 BamReader::BamReader(FalcoConfig &_config, const std::size_t _buffer_size) :
   StreamReader(_config, _buffer_size, '\t', '\n') {
   rd_ret = 0;
+  n_threads = static_cast<int>(_config.threads);
 }
 
 std::size_t
 BamReader::load() {
   if (!(hts = hts_open(std::data(filename), "r")))
     throw std::runtime_error("cannot load bam file : " + filename);
+  // [FalcoAmadeus] Offload BGZF block inflation to a thread pool. Record parsing
+  // stays serial (a single sam_read1 consumer), but decompression -- the bulk of
+  // the BAM cost -- now overlaps across cores. Output is byte-identical (only how
+  // blocks are inflated changes). Full parallel BAM parsing is still a TODO.
+  if (n_threads > 1)
+    hts_set_threads(hts, n_threads);
 
   if (!(hdr = sam_hdr_read(hts)))
     throw std::runtime_error("failed to read header from file: " + filename);

@@ -533,6 +533,7 @@ class BamReader : public StreamReader {
   bam_hdr_t *hdr;
   bam1_t *b;
   int rd_ret, fmt_ret;
+  int n_threads = 1;   // htslib decompression thread pool size
   char *last;
  public:
   BamReader(FalcoConfig &fc, const size_t _buffer_size);
