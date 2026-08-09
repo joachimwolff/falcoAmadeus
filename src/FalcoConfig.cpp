@@ -412,8 +412,31 @@ check_if_not_ignored(const T &limits_map, const std::string &limit) {
 
 void
 FalcoConfig::setup() {
+  // [FalcoAmadeus] "-" means stdin; normalize to /dev/stdin so every reader
+  // opens it as an ordinary path (also done in main for the existence check).
+  if (filename == "-")
+    filename = "/dev/stdin";
+
   // Now check for the file format (FASTQ/SAM/BAM, compressed or not)
   define_file_format();
+
+  // [FalcoAmadeus] is the input a seekable regular file? A pipe/stdin/FIFO or
+  // character device cannot be mmap'd or seeked, so the parallel paths must fall
+  // back to the streaming readers (see analyze_and_write routing).
+  {
+    struct stat st;
+    seekable_input =
+      (stat(filename.data(), &st) == 0) && S_ISREG(st.st_mode);
+  }
+
+  // [FalcoAmadeus] a piped/stdin input has no extension to guess from, so if no
+  // format was detected or forced, fail early with an actionable message rather
+  // than silently producing an empty report.
+  if (!(is_sam || is_bam || is_fastq || is_fastq_gz))
+    throw std::runtime_error(
+      "could not determine the format of '" + filename +
+      "'. For piped or stdin input (or an unusual extension), pass "
+      "--format fastq|fastq.gz|sam|bam.");
 
   // Get filename without absolute path (or the explicit --name if provided).
   filename_stripped = sample_name.empty()

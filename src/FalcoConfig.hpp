@@ -164,6 +164,10 @@ struct FalcoConfig {
 
   // IO
   bool is_sam, is_bam, is_fastq, is_fastq_gz;
+  // [FalcoAmadeus] true when the input is a seekable regular file. A pipe/stdin
+  // (S_ISFIFO/char device) is not seekable, so the parallel mmap/temp-file paths
+  // are skipped in favour of the streaming readers. Resolved in setup().
+  bool seekable_input = true;
   std::string filename;
   std::string filename_stripped;
   // [FalcoAmadeus] optional explicit sample name (--name). When set it replaces

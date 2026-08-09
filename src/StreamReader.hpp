@@ -34,6 +34,7 @@
 // Optional Intel ISA-L igzip (fast vectorized gzip inflate)
 #ifdef USE_ISAL
 #include <cstdint>
+#include <cerrno>
 #include <isa-l/igzip_lib.h>
 #endif
 
@@ -358,6 +359,29 @@ class IsalInflater {
 
   size_t compressed_offset() const { return comp_read_.load(); }
 
+  // Read into buf[off, cap) looping over short reads so the returned span is as
+  // large as possible (a pipe delivers only what is buffered per ::read). This
+  // keeps the gzip header/trailer contiguous in `in_buf_`, which ISA-L's wrapper
+  // parser needs -- a header split across tiny pipe reads fails validation.
+  size_t read_full(size_t off, size_t cap) {
+    size_t got = off;
+    while (got < cap) {
+      const ssize_t n = ::read(fd_, in_buf_.data() + got, cap - got);
+      if (n < 0) {
+        if (errno == EINTR)
+          continue;
+        break;  // read error -> treat what we have as the end
+      }
+      if (n == 0)
+        break;  // EOF
+      got += static_cast<size_t>(n);
+    }
+    const size_t new_bytes = got - off;
+    if (new_bytes)
+      comp_read_.fetch_add(new_bytes, std::memory_order_relaxed);
+    return got;
+  }
+
   // Decompress up to `cap` bytes into `out`; returns bytes produced, 0 only at
   // true end of stream. Refills compressed input as needed and steps across
   // concatenated gzip members. Throws on a genuine inflate error.
@@ -366,13 +390,12 @@ class IsalInflater {
     state_.avail_out = static_cast<uint32_t>(cap);
     while (state_.avail_out > 0) {
       if (state_.avail_in == 0 && !input_eof_) {
-        const ssize_t n = ::read(fd_, in_buf_.data(), in_buf_.size());
-        if (n <= 0)
+        const size_t got = read_full(0, in_buf_.size());
+        if (got == 0)
           input_eof_ = true;
         else {
           state_.next_in = in_buf_.data();
-          state_.avail_in = static_cast<uint32_t>(n);
-          comp_read_.fetch_add(static_cast<size_t>(n), std::memory_order_relaxed);
+          state_.avail_in = static_cast<uint32_t>(got);
         }
       }
       if (state_.avail_in == 0 && input_eof_)
@@ -387,13 +410,11 @@ class IsalInflater {
         if (state_.avail_in < 2 && !input_eof_) {
           size_t off = 0;
           if (state_.avail_in == 1) { in_buf_[0] = state_.next_in[0]; off = 1; }
-          const ssize_t n = ::read(fd_, in_buf_.data() + off, in_buf_.size() - off);
-          if (n <= 0)
+          const size_t got = read_full(off, in_buf_.size());
+          if (got == off)
             input_eof_ = true;
-          else
-            comp_read_.fetch_add(static_cast<size_t>(n), std::memory_order_relaxed);
           state_.next_in = in_buf_.data();
-          state_.avail_in = static_cast<uint32_t>(off + (n > 0 ? (size_t)n : 0));
+          state_.avail_in = static_cast<uint32_t>(got);
         }
         if (state_.avail_in >= 2 && state_.next_in[0] == 0x1f &&
             state_.next_in[1] == 0x8b) {

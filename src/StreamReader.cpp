@@ -55,6 +55,14 @@ std::size_t
 get_tile_split_position(FalcoConfig &config) {
   const std::string &filename = config.filename;
   // Count colons to know the formatting pattern
+
+  // [FalcoAmadeus] This pre-scan opens the input and reads its first record to
+  // locate the tile field. A pipe/stdin cannot be pre-scanned without consuming
+  // the bytes the actual reader needs, so for non-seekable input skip it and
+  // return 0 (per-tile quality analysis off). Every other module is unaffected.
+  if (!config.seekable_input)
+    return 0;
+
   std::size_t num_colon{};
 
   if (config.is_sam) {
@@ -979,6 +987,13 @@ StreamReader::check_bytes_read(const std::size_t read_num) {
 /*******************************************************/
 char
 get_line_separator(const std::string &filename) {
+  // [FalcoAmadeus] This peeks the first line to detect the line ending. A
+  // pipe/stdin cannot be peeked without consuming bytes the reader needs, so
+  // assume the standard LF ('\n') separator for non-regular input.
+  struct stat sep_st;
+  if (!(stat(std::data(filename), &sep_st) == 0 && S_ISREG(sep_st.st_mode)))
+    return '\n';
+
   FILE *fp = fopen(std::data(filename), "r");
   if (fp == NULL)
     throw std::runtime_error("bad input file: " + filename);
@@ -1004,15 +1019,13 @@ FastqReader::FastqReader(FalcoConfig &_config, const std::size_t _buffer_size) :
 
 std::size_t
 get_file_size(const std::string &filename) {
-  FILE *fp = fopen(std::data(filename), "r");
-  if (fp == NULL)
-    throw std::runtime_error("bad input file: " + filename);
-
-  fseek(fp, 0L, SEEK_END);
-  const std::size_t ret = static_cast<std::size_t>(ftell(fp));
-  fclose(fp);
-
-  return ret;
+  // stat is exact and cheap for a regular file, and -- unlike fopen+fseek --
+  // never opens a second handle to the input. That matters for a pipe/stdin:
+  // there is no size (and no seeking), so report 0 (progress just shows 0%).
+  struct stat st;
+  if (stat(std::data(filename), &st) == 0 && S_ISREG(st.st_mode))
+    return static_cast<std::size_t>(st.st_size);
+  return 0;
 }
 
 // Load fastq with zlib

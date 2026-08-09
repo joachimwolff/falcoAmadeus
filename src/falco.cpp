@@ -682,11 +682,18 @@ analyze_and_write(FalcoConfig &falco_config, const std::string &filename,
     log_process("Started reading file " + falco_config.filename);
   FastqStats stats(falco_config.do_kmer);  // allocate all space to summarize data
 
-  // Initializes a reader given the file format
+  // Initializes a reader given the file format. The parallel mmap/temp-file/
+  // fused paths need a seekable regular file; a pipe/stdin (seekable_input ==
+  // false) uses the streaming readers instead. The gz path is special: its
+  // streaming parallel driver (read_gz_parallel) works on a pipe, so piped gz
+  // still gets a parallel parse; only the seekable-only BGZF fast path is
+  // skipped.
+  const bool par = falco_config.threads >= 2 && falco_config.read_step == 1;
+  const bool par_seek = par && falco_config.seekable_input;
   if (falco_config.is_sam) {
     if (!falco_config.quiet)
       log_process("reading file as SAM format");
-    if (falco_config.threads >= 2 && falco_config.read_step == 1) {
+    if (par_seek) {
       // parallel SAM on the shared byte-split driver (tile reconstructed inside).
       read_sam_chunked(falco_config, stats, falco_config.threads);
     }
@@ -700,7 +707,7 @@ analyze_and_write(FalcoConfig &falco_config, const std::string &filename,
   else if (falco_config.is_bam) {
     if (!falco_config.quiet)
       log_process("reading file as BAM format");
-    if (falco_config.threads >= 2 && falco_config.read_step == 1) {
+    if (par_seek) {
       // parallel BAM (byte-identical; tile reconstructed inside). -t1 keeps the
       // streaming serial reader: with no parallelism the extra offset-walk +
       // temp-file write cost more than they save.
@@ -721,8 +728,13 @@ analyze_and_write(FalcoConfig &falco_config, const std::string &filename,
     // chunked parallel parse, byte-identical to single-threaded. Only for
     // read_step == 1; the subsampling counter logic is left to the serial path
     // otherwise.
-    if (falco_config.threads >= 2 && falco_config.read_step == 1) {
+    if (par && falco_config.seekable_input) {
       read_gz_chunked(falco_config, stats, falco_config.threads);
+    }
+    else if (par) {
+      // piped/stdin gz: skip the seek-dependent BGZF fast path and stream the
+      // single DEFLATE stream (ISA-L) into the parallel dispatcher.
+      read_gz_parallel(falco_config, stats, falco_config.threads);
     }
     else {
       GzFastqReader in(falco_config, stats.SHORT_READ_THRESHOLD);
@@ -735,7 +747,7 @@ analyze_and_write(FalcoConfig &falco_config, const std::string &filename,
     // multi-threaded parser: memory-mapped dispatch + parallel per-read stats,
     // byte-identical to single-threaded. Only for read_step == 1 (same reason
     // as the gzipped path).
-    if (falco_config.threads >= 2 && falco_config.read_step == 1) {
+    if (par_seek) {
       read_uncompressed_chunked(falco_config, stats, falco_config.threads);
     }
     else {
@@ -1144,6 +1156,13 @@ main(int argc, char *argv[]) {
 
     std::vector<std::string> leftover_args;
     opt_parse.parse(argc, argv, leftover_args);
+    // [FalcoAmadeus] "-" is the conventional alias for stdin; normalize it to
+    // /dev/stdin at the source so every downstream check and reader treats it as
+    // an ordinary path. Piped input carries no extension and so requires
+    // --format (enforced in FalcoConfig::setup).
+    for (auto &fn : leftover_args)
+      if (fn == "-")
+        fn = "/dev/stdin";
     if (argc == 1 || opt_parse.help_requested()) {
       std::cerr << opt_parse.help_message() << '\n'
                 << opt_parse.about_message() << '\n';
@@ -1210,6 +1229,10 @@ main(int argc, char *argv[]) {
     if (!allow_empty_input) {
       for (const auto &fn : leftover_args) {
         std::error_code ec;
+        // [FalcoAmadeus] only a regular file has a checkable size; a pipe/stdin
+        // (or device) cannot be probed for emptiness, so skip the check for it.
+        if (!std::filesystem::is_regular_file(fn, ec))
+          continue;
         const bool empty_file = std::filesystem::is_empty(fn, ec);
         if (ec) {
           std::cerr << "Error reading file: " << fn << " (" << ec.message()
@@ -1257,7 +1280,7 @@ main(int argc, char *argv[]) {
     }
     const std::vector<std::string> all_seq_filenames(leftover_args);
 
-    // check if all filenames exist
+    // check if all filenames exist (leftover_args already has "-" -> /dev/stdin)
     bool all_files_exist = true;
     for (std::size_t i = 0; i < std::size(all_seq_filenames); ++i) {
       if (!std::filesystem::exists(all_seq_filenames[i])) {
