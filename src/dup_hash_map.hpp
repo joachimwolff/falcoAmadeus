@@ -37,11 +37,11 @@ public:
   // Sized for the fixed cap of stored unique sequences
   // (FalcoConfig::Constants::unique_reads_stop_counting == 100000). Slots are a
   // power of two comfortably larger than 2x the cap to keep probe chains short.
-  explicit DupHashMap(std::size_t cap = 100000) {
+  explicit DupHashMap(std::size_t cap = 100000) : cap_(cap) {
     std::size_t nslots = 1;
     while (nslots < (cap << 2))
       nslots <<= 1;  // >= 4x cap -> load factor < 0.25
-    slots_.assign(nslots, -1);
+    slots_.assign(nslots, 0);
     mask_ = nslots - 1;
     entries_.reserve(cap);
   }
@@ -75,26 +75,48 @@ public:
   void prefetch(std::uint64_t h) const {
     __builtin_prefetch(&slots_[h & mask_]);
   }
+  // Slot payload: (tag << 24) | (entry index + 1); 0 = empty. The tag is 8
+  // hash bits (forced odd, so a payload is never 0) checked before touching
+  // the entry: equal keys hash equally, so a tag mismatch proves a key
+  // mismatch and skips the compare -- identical find results, fewer dependent
+  // cache misses. Key bytes for the compare come from a flat shadow array
+  // (keys_, fixed 80-byte stride >= the 75-byte max key) instead of chasing
+  // each entry's heap std::string: one load chain shorter per probe.
   iterator find_hashed(std::uint64_t hh, const char *p, std::size_t n) {
+    const std::uint32_t tag = (static_cast<std::uint32_t>(hh >> 56) | 1u) << 24;
     std::size_t h = static_cast<std::size_t>(hh) & mask_;
     for (;;) {
-      const std::int32_t idx = slots_[h];
-      if (idx < 0)
+      const std::uint32_t s = slots_[h];
+      if (s == 0)
         return end();
-      const std::string &k = entries_[static_cast<std::size_t>(idx)].first;
-      if (k.size() == n && std::memcmp(k.data(), p, n) == 0)
-        return entries_.data() + idx;
+      if ((s & 0xff000000u) == tag) {
+        const std::size_t idx = (s & 0x00ffffffu) - 1;
+        if (klen_[idx] == n &&
+            std::memcmp(keys_.data() + idx * KSTRIDE, p, n) == 0)
+          return entries_.data() + idx;
+      }
       h = (h + 1) & mask_;
     }
   }
 
   // Insert a key known not to be present (callers only emplace after a failed
-  // find, exactly as the previous unordered_map code did).
+  // find, exactly as the previous unordered_map code did). The shadow key
+  // store allocates on first insert so the per-worker map instances, which
+  // only ever find() against the master map, never pay for it.
   void emplace(const char *p, std::size_t n, std::size_t value) {
-    std::size_t h = hash_key(p, n) & mask_;
-    while (slots_[h] >= 0)
+    if (keys_.empty()) {
+      keys_.assign(cap_ * KSTRIDE, 0);
+      klen_.assign(cap_, 0);
+    }
+    const std::uint64_t hh = hash_key(p, n);
+    const std::uint32_t tag = (static_cast<std::uint32_t>(hh >> 56) | 1u) << 24;
+    std::size_t h = static_cast<std::size_t>(hh) & mask_;
+    while (slots_[h] != 0)
       h = (h + 1) & mask_;
-    slots_[h] = static_cast<std::int32_t>(entries_.size());
+    const std::size_t idx = entries_.size();
+    slots_[h] = tag | static_cast<std::uint32_t>(idx + 1);
+    std::memcpy(keys_.data() + idx * KSTRIDE, p, n);
+    klen_[idx] = static_cast<std::uint8_t>(n);
     entries_.emplace_back(std::string(p, n), value);
   }
   void emplace(const std::string &key, std::size_t value) {
@@ -142,9 +164,14 @@ private:
     return mix(a ^ b);
   }
 
-  std::vector<value_type> entries_;  // contiguous, reserved to cap (stable)
-  std::vector<std::int32_t> slots_;  // open-addressing index table (-1 = empty)
+  static constexpr std::size_t KSTRIDE = 80;  // > max key (75, see
+                                              // get_truncate_point)
+  std::vector<value_type> entries_;   // contiguous, reserved to cap (stable)
+  std::vector<std::uint32_t> slots_;  // (tag<<24)|(idx+1); 0 = empty
+  std::vector<char> keys_;            // shadow key bytes, KSTRIDE apart (lazy)
+  std::vector<std::uint8_t> klen_;    // shadow key lengths (lazy)
   std::size_t mask_ = 0;
+  std::size_t cap_ = 0;
 };
 
 #endif
