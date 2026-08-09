@@ -80,6 +80,22 @@ AC_CHECK_HEADER([isa-l/igzip_lib.h],
      LIBS="-lisal $LIBS"], [])], [])
 AM_CONDITIONAL([HAVE_ISAL], [test "x$have_isal" = "xyes"])
 
+dnl Optional rapidgzip (header-only, MIT): parallel decompression of arbitrary
+dnl single-stream gzip. Point --with-rapidgzip at the librapidarchive/src
+dnl directory of a rapidgzip checkout. Requires zlib (already mandatory).
+AC_ARG_WITH([rapidgzip],
+  [AS_HELP_STRING([--with-rapidgzip=DIR],
+     [rapidgzip source dir (librapidarchive/src) for parallel gzip inflate])],
+  [rapidgzip_dir=$withval], [rapidgzip_dir=no])
+have_rapidgzip=no
+AS_IF([test "x$rapidgzip_dir" != "xno"],
+  [AS_IF([test -f "$rapidgzip_dir/rapidgzip/ParallelGzipReader.hpp"],
+     [have_rapidgzip=yes
+      RAPIDGZIP_CPPFLAGS="-I$rapidgzip_dir -I$rapidgzip_dir/core -I$rapidgzip_dir/huffman -I$rapidgzip_dir/indexed_bzip2"
+      AC_SUBST([RAPIDGZIP_CPPFLAGS])],
+     [AC_MSG_FAILURE([rapidgzip/ParallelGzipReader.hpp not found under $rapidgzip_dir])])])
+AM_CONDITIONAL([HAVE_RAPIDGZIP], [test "x$have_rapidgzip" = "xyes"])
+
 AC_CONFIG_FILES([Makefile])
 dnl make the test data files available in the build tree
 AC_CONFIG_LINKS([

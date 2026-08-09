@@ -107,6 +107,7 @@ POST_UNINSTALL = :
 am__append_1 = -DUSE_HTS
 am__append_2 = -DUSE_LIBDEFLATE
 am__append_3 = -DUSE_ISAL
+am__append_4 = -DUSE_RAPIDGZIP -I/home/mh-hannover.local/wolffjoa/src/rapidgzip/librapidarchive/src -I/home/mh-hannover.local/wolffjoa/src/rapidgzip/librapidarchive/src/core -I/home/mh-hannover.local/wolffjoa/src/rapidgzip/librapidarchive/src/huffman -I/home/mh-hannover.local/wolffjoa/src/rapidgzip/librapidarchive/src/indexed_bzip2
 bin_PROGRAMS = falcoAmadeus$(EXEEXT)
 subdir = .
 ACLOCAL_M4 = $(top_srcdir)/aclocal.m4
@@ -441,7 +442,8 @@ AUTOCONF = ${SHELL} '/home/mh-hannover.local/wolffjoa/src/falco/missing' autocon
 AUTOHEADER = ${SHELL} '/home/mh-hannover.local/wolffjoa/src/falco/missing' autoheader
 AUTOMAKE = ${SHELL} '/home/mh-hannover.local/wolffjoa/src/falco/missing' automake-1.17
 AWK = mawk
-CPPFLAGS = -I/home/mh-hannover.local/wolffjoa/miniconda3/envs/acc/include $(am__append_1) $(am__append_2) $(am__append_3)
+CPPFLAGS = -I/home/mh-hannover.local/wolffjoa/miniconda3/envs/acc/include $(am__append_1) $(am__append_2) $(am__append_3) \
+	$(am__append_4)
 CSCOPE = cscope
 CTAGS = ctags
 CXX = g++ -std=c++17
@@ -477,6 +479,7 @@ PACKAGE_TARNAME = falcoAmadeus
 PACKAGE_URL = https://github.com/joachimwolff/falco
 PACKAGE_VERSION = 1
 PATH_SEPARATOR = :
+RAPIDGZIP_CPPFLAGS = -I/home/mh-hannover.local/wolffjoa/src/rapidgzip/librapidarchive/src -I/home/mh-hannover.local/wolffjoa/src/rapidgzip/librapidarchive/src/core -I/home/mh-hannover.local/wolffjoa/src/rapidgzip/librapidarchive/src/huffman -I/home/mh-hannover.local/wolffjoa/src/rapidgzip/librapidarchive/src/indexed_bzip2
 SET_MAKE = 
 SHELL = /bin/bash
 STRIP = 

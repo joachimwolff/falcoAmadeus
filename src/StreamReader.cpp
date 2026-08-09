@@ -16,6 +16,33 @@
  */
 
 #include "StreamReader.hpp"
+
+#ifdef USE_RAPIDGZIP
+// [FalcoAmadeus] rapidgzip (MIT, github.com/mxmlnkn/rapidgzip): parallel
+// decompression of arbitrary single-stream gzip via speculative two-stage
+// decoding. A plain gzip's DEFLATE stream is otherwise a serial floor no
+// thread count can cross; with this, decompression scales with cores. Used as
+// an alternative byte source for the fused chunk parser: same decompressed
+// bytes in the same order, so output is byte-identical to the ISA-L path.
+#include <rapidgzip/ParallelGzipReader.hpp>
+
+class RapidgzipSource {
+ private:
+  rapidgzip::ParallelGzipReader<> reader_;
+
+ public:
+  RapidgzipSource(const std::string &path, std::size_t nthreads)
+    : reader_(std::make_unique<rapidgzip::StandardFileReader>(path), nthreads,
+              // 1 MiB compressed chunks (default 4 MiB): the prefetch cache
+              // holds ~2x parallelization decompressed chunks, so smaller
+              // chunks bound its footprint (~4.5 GB -> ~1 GB at 16 threads)
+              // at little speed cost per rapidgzip's own chunk-size sweep.
+              std::size_t(1) << 20) {}
+  std::size_t fill(char *out, std::size_t cap) {
+    return reader_.read(out, cap);
+  }
+};
+#endif  // USE_RAPIDGZIP
 #include <atomic>
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
@@ -2678,7 +2705,7 @@ read_chunked_core(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
                                 std::move(release_input), can_drop);
 }
 
-#ifdef USE_ISAL
+#if defined(USE_ISAL) || defined(USE_RAPIDGZIP)
 // [FalcoAmadeus] Fused streaming gz driver. Profiling showed plain-gz throughput
 // is bounded not by ISA-L inflate (fast) but by the single-threaded dispatcher,
 // which touches every byte to split lines. This inflates a bounded chunk with
@@ -2689,8 +2716,10 @@ read_chunked_core(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
 // per chunk, with the "first 100k unique" cap discovered mid-stream exactly as
 // read_bytesplit_core does. Tile-less only; tiled input falls back to the
 // dispatcher (per-tile needs a pre-scan a stream cannot provide).
+template <class Source>
 static void
-read_gz_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads) {
+read_stream_fused(FalcoConfig &config, FastqStats &master,
+                  std::size_t nthreads, Source &src) {
   const std::size_t BUF = FastqStats::SHORT_READ_THRESHOLD;
   ParallelWorker cfg(config, BUF);
   const bool tile_ignore = cfg.tile_ignore;
@@ -2699,8 +2728,6 @@ read_gz_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads) {
     read_gz_parallel(config, master, nthreads);
     return;
   }
-
-  IsalInflater inf(config.filename);
 
   const std::size_t CHUNK = std::size_t(64) << 20;
   const std::size_t SLACK = std::size_t(16) << 20;  // headroom for small leftovers
@@ -2733,7 +2760,7 @@ read_gz_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads) {
     const std::size_t target = leftover_len + CHUNK;
     std::size_t filled = leftover_len;
     while (filled < target) {
-      const std::size_t got = inf.fill(buf + filled, target - filled);
+      const std::size_t got = src.fill(buf + filled, target - filled);
       if (got == 0) { eof = true; break; }
       filled += got;
     }
@@ -2900,7 +2927,7 @@ read_gz_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads) {
                      tilerecs, gstart, count_dup_final,
                      /*tile_ignore=*/true, /*skip_gc=*/true);
 }
-#endif  // USE_ISAL
+#endif  // USE_ISAL || USE_RAPIDGZIP
 
 // [FalcoAmadeus] SAM worker: tab-delimited fields, newline records. Same per-base
 // machinery as the FASTQ worker, only the separators differ.
@@ -3333,13 +3360,32 @@ read_gz_chunked(FalcoConfig &config, FastqStats &master,
     // not BGZF (plain gzip) -> fall through to the streaming bgzf reader below
   }
 #endif
-  // Plain (non-BGZF) gzip: one DEFLATE stream, so inflation is serial either way.
-  // Stream it in bounded chunks rather than materialize the ~10x-larger FASTQ.
+  // Plain (non-BGZF) gzip. Stream it in bounded chunks rather than materialize
+  // the ~10x-larger FASTQ. The DEFLATE stream itself decodes either serially
+  // (ISA-L igzip, the fastest serial inflate) or in parallel (rapidgzip's
+  // speculative two-stage scheme, when built with it and the input is a
+  // seekable file), feeding the same fused chunk parser either way -- the
+  // decompressed bytes and their order are identical, so output is too.
+#if defined(USE_RAPIDGZIP)
+  // Opt-in (FA_RAPIDGZIP=1): parallel decompression breaks the serial-inflate
+  // floor on large inputs (163M reads: 20.9s -> 18.5s even on a fully loaded
+  // machine; much larger headroom on idle many-core hosts), but its
+  // speculative prefetch windows hold ~0.9-1.3 GB of decompressed chunks vs
+  // ~140-170 MB for the ISA-L path -- so the lean serial inflate stays the
+  // default and users with RAM and idle cores can switch this on.
+  if (config.seekable_input && nthreads >= 2 &&
+      get_file_size(config.filename) >= (std::size_t(1) << 30) &&
+      std::getenv("FA_RAPIDGZIP")) {
+    RapidgzipSource src(config.filename, nthreads);
+    read_stream_fused(config, master, nthreads, src);
+    return;
+  }
+#endif
 #if defined(USE_ISAL)
-  // Fused: ISA-L inflate a chunk, then parse it with the parallel byte-split
-  // driver (no single-thread dispatcher touching every byte). Bounded memory,
-  // byte-identical, and overlaps inflate with a parallel parse.
-  read_gz_fused(config, master, nthreads);
+  {
+    IsalInflater src(config.filename);
+    read_stream_fused(config, master, nthreads, src);
+  }
 #else
   // Fallback: background block decompressor feeding the serial dispatcher.
   read_gz_parallel(config, master, nthreads);
