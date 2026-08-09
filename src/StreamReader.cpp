@@ -1207,13 +1207,24 @@ GzBlockDecompressor::getline(char *dst, std::size_t maxlen) {
 GzFastqReader::GzFastqReader(FalcoConfig &_config,
                              const std::size_t _buffer_size) :
   StreamReader(_config, _buffer_size, '\n', '\n'),
-  threaded(_config.threads >= 2), decomp(nullptr) {
+  threaded(_config.threads >= 2) {
   gzbuf = new char[RESERVE_SIZE];
+#ifndef USE_ISAL
+  decomp = nullptr;
+#endif
 }
 
-// Load fastq with zlib
+// Load fastq. With ISA-L, inflate with igzip (faster than zlib on the single
+// DEFLATE stream); otherwise fall back to zlib. In both cases a background
+// thread overlaps decompression with parsing when threaded (>= 2 threads).
 std::size_t
 GzFastqReader::load() {
+#ifdef USE_ISAL
+  if (threaded)
+    idecomp = new IsalBlockReader(filename, GZ_BLOCK_SIZE, GZ_NUM_BLOCKS);
+  else
+    iserial = new IsalLineReader(filename);
+#else
   fileobj = gzopen(std::data(filename), "r");
   if (fileobj == Z_NULL)
     throw std::runtime_error("Cannot open gzip FASTQ file : " + filename);
@@ -1226,6 +1237,7 @@ GzFastqReader::load() {
   // decompression. The consumer never touches the gzFile after this point.
   if (threaded)
     decomp = new GzBlockDecompressor(fileobj, GZ_BLOCK_SIZE, GZ_NUM_BLOCKS);
+#endif
 
   return get_file_size(filename);
 }
@@ -1233,14 +1245,24 @@ GzFastqReader::load() {
 // straightforward
 inline bool
 GzFastqReader::is_eof() {
+#ifdef USE_ISAL
+  return threaded ? idecomp->eof() : iserial->eof();
+#else
   return threaded ? decomp->eof() : gzeof(fileobj);
+#endif
 }
 
 GzFastqReader::~GzFastqReader() {
-  // join the background thread (if any) before closing the gzFile it reads
+  // join any background decompression thread before releasing its input
+#ifdef USE_ISAL
+  delete idecomp;
+  delete iserial;
+  delete[] gzbuf;
+#else
   delete decomp;
   delete[] gzbuf;
   gzclose_r(fileobj);
+#endif
 }
 
 // Parses fastq gz by reading line by line into the gzbuf
@@ -1249,12 +1271,20 @@ GzFastqReader::read_entry(FastqStats &stats, std::size_t &num_bytes_read) {
   // fetch the next line into gzbuf, from the background decompressor when
   // threaded, otherwise straight from zlib
   auto next_line = [&] {
+#ifdef USE_ISAL
+    if (threaded)
+      idecomp->getline(gzbuf, RESERVE_SIZE);
+    else
+      iserial->getline(gzbuf, RESERVE_SIZE);
+    cur_char = gzbuf;  // getline always NUL-terminates; EOF caught by is_eof()
+#else
     if (threaded) {
       decomp->getline(gzbuf, RESERVE_SIZE);
       cur_char = gzbuf;
     } else {
       cur_char = gzgets(fileobj, gzbuf, RESERVE_SIZE);
     }
+#endif
   };
 
   next_line();
@@ -1290,7 +1320,12 @@ GzFastqReader::read_entry(FastqStats &stats, std::size_t &num_bytes_read) {
 
   // Returns if file should keep being checked
   if (check_bytes_read(stats.num_reads))
+#ifdef USE_ISAL
+    num_bytes_read =
+      threaded ? idecomp->compressed_offset() : iserial->compressed_offset();
+#else
     num_bytes_read = threaded ? decomp->compressed_offset() : gzoffset(fileobj);
+#endif
   return !is_eof();
 }
 

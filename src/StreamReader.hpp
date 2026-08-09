@@ -320,39 +320,48 @@ class GzBlockDecompressor {
 /*******************************************************/
 /*************** ISA-L GZ DECOMPRESSOR *****************/
 /*******************************************************/
-// Streaming gzip decompressor backed by Intel ISA-L igzip. Same consumer
-// interface as GzBlockDecompressor / BgzfBlockReader (getline + eof), but it
-// inflates on a background thread with ISA-L's vectorized inflate, which is
-// markedly faster than zlib on a single (non-BGZF) DEFLATE stream (the one
-// stream cannot be parallel-decompressed, so serial inflate speed is the cap).
-// Bounded memory: a small compressed input buffer plus a fixed pool of
-// decompressed blocks. Transparently steps across concatenated gzip members.
-class IsalBlockReader {
+// Shared ISA-L igzip inflate engine: pulls compressed bytes from a file
+// descriptor and produces decompressed bytes on demand with ISA-L's vectorized
+// inflate (markedly faster than zlib on a single DEFLATE stream). The fd may be
+// a regular file or a pipe/stdin (only ::read is used, never a seek), so it
+// drives both the block reader and the line reader below. Transparently steps
+// across concatenated multi-member gzip. Not thread-safe: one owner at a time.
+class IsalInflater {
  private:
   int fd_ = -1;
+  bool own_fd_ = true;
   std::string path_;
-  const size_t block_size_;
   std::vector<uint8_t> in_buf_;      // compressed input staging
   struct inflate_state state_;
-  bool input_eof_ = false;           // no more compressed bytes from the file
+  bool input_eof_ = false;           // no more compressed bytes from the fd
+  std::atomic<size_t> comp_read_{0};  // total compressed bytes read (progress)
 
-  std::vector<std::vector<char>> blocks_;  // fixed pool of decompressed blocks
-  std::vector<size_t> lens_;
-  std::queue<int> free_q_, filled_q_;
-  std::mutex mtx_;
-  std::condition_variable free_cv_, filled_cv_;
-  std::thread worker_;
-  bool producer_done_ = false, stop_requested_ = false;
-  std::string err_;                  // set if the background inflate failed
+ public:
+  // Open `path` (use "/dev/stdin" for a pipe); or adopt an already-open fd.
+  explicit IsalInflater(const std::string &path, int fd = -1)
+      : path_(path), in_buf_(1u << 20) {
+    if (fd >= 0) { fd_ = fd; own_fd_ = false; }
+    else {
+      fd_ = ::open(path.c_str(), O_RDONLY);
+      if (fd_ < 0)
+        throw std::runtime_error("Cannot open gzip FASTQ file : " + path);
+#ifdef POSIX_FADV_SEQUENTIAL
+      posix_fadvise(fd_, 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
+    }
+    isal_inflate_init(&state_);
+    state_.crc_flag = ISAL_GZIP;  // parse the gzip header/trailer, verify crc
+  }
+  ~IsalInflater() { if (own_fd_ && fd_ >= 0) ::close(fd_); }
+  IsalInflater(const IsalInflater &) = delete;
+  IsalInflater &operator=(const IsalInflater &) = delete;
 
-  int cur_idx_ = -1;
-  size_t cur_pos_ = 0, cur_len_ = 0;
-  bool consumed_eof_ = false;
+  size_t compressed_offset() const { return comp_read_.load(); }
 
-  // Fill `out` (cap bytes) with decompressed data; returns bytes produced,
-  // 0 only at true end of stream. Refills compressed input as needed and steps
-  // across concatenated gzip members.
-  size_t inflate_fill(char *out, size_t cap) {
+  // Decompress up to `cap` bytes into `out`; returns bytes produced, 0 only at
+  // true end of stream. Refills compressed input as needed and steps across
+  // concatenated gzip members. Throws on a genuine inflate error.
+  size_t fill(char *out, size_t cap) {
     state_.next_out = reinterpret_cast<uint8_t *>(out);
     state_.avail_out = static_cast<uint32_t>(cap);
     while (state_.avail_out > 0) {
@@ -363,6 +372,7 @@ class IsalBlockReader {
         else {
           state_.next_in = in_buf_.data();
           state_.avail_in = static_cast<uint32_t>(n);
+          comp_read_.fetch_add(static_cast<size_t>(n), std::memory_order_relaxed);
         }
       }
       if (state_.avail_in == 0 && input_eof_)
@@ -380,6 +390,8 @@ class IsalBlockReader {
           const ssize_t n = ::read(fd_, in_buf_.data() + off, in_buf_.size() - off);
           if (n <= 0)
             input_eof_ = true;
+          else
+            comp_read_.fetch_add(static_cast<size_t>(n), std::memory_order_relaxed);
           state_.next_in = in_buf_.data();
           state_.avail_in = static_cast<uint32_t>(off + (n > 0 ? (size_t)n : 0));
         }
@@ -399,6 +411,27 @@ class IsalBlockReader {
     }
     return cap - state_.avail_out;
   }
+};
+
+// Streaming gzip reader for the PARALLEL path: a background thread inflates
+// fixed-size blocks (bounded pool) while the dispatcher consumes them via
+// getline. Same interface as GzBlockDecompressor / BgzfBlockReader.
+class IsalBlockReader {
+ private:
+  IsalInflater inf_;
+  const size_t block_size_;
+  std::vector<std::vector<char>> blocks_;  // fixed pool of decompressed blocks
+  std::vector<size_t> lens_;
+  std::queue<int> free_q_, filled_q_;
+  std::mutex mtx_;
+  std::condition_variable free_cv_, filled_cv_;
+  std::thread worker_;
+  bool producer_done_ = false, stop_requested_ = false;
+  std::string err_;                  // set if the background inflate failed
+
+  int cur_idx_ = -1;
+  size_t cur_pos_ = 0, cur_len_ = 0;
+  bool consumed_eof_ = false;
 
   void producer_loop() {
     while (true) {
@@ -414,7 +447,7 @@ class IsalBlockReader {
       size_t n = 0;
       std::string e;
       try {
-        n = inflate_fill(blocks_[idx].data(), block_size_);
+        n = inf_.fill(blocks_[idx].data(), block_size_);
       } catch (const std::exception &ex) {
         e = ex.what();
       }
@@ -465,15 +498,7 @@ class IsalBlockReader {
 
  public:
   IsalBlockReader(const std::string &path, size_t bs, int npool)
-      : path_(path), block_size_(bs), in_buf_(1u << 20) {
-    fd_ = ::open(path.c_str(), O_RDONLY);
-    if (fd_ < 0)
-      throw std::runtime_error("Cannot open gzip FASTQ file : " + path);
-#ifdef POSIX_FADV_SEQUENTIAL
-    posix_fadvise(fd_, 0, 0, POSIX_FADV_SEQUENTIAL);
-#endif
-    isal_inflate_init(&state_);
-    state_.crc_flag = ISAL_GZIP;  // parse the gzip header/trailer, verify crc
+      : inf_(path), block_size_(bs) {
     blocks_.resize(npool);
     lens_.assign(npool, 0);
     for (int i = 0; i < npool; ++i) {
@@ -491,8 +516,6 @@ class IsalBlockReader {
     filled_cv_.notify_all();
     if (worker_.joinable())
       worker_.join();
-    if (fd_ >= 0)
-      ::close(fd_);
   }
   IsalBlockReader(const IsalBlockReader &) = delete;
   IsalBlockReader &operator=(const IsalBlockReader &) = delete;
@@ -520,6 +543,51 @@ class IsalBlockReader {
   }
 
   bool eof() const { return consumed_eof_; }
+  size_t compressed_offset() const { return inf_.compressed_offset(); }
+};
+
+// Synchronous ISA-L gzip line reader for the SERIAL (-t1) path: no background
+// thread, inflates one buffer at a time inline in getline. Same getline/eof
+// interface as gzgets, so GzFastqReader can drive it in place of zlib.
+class IsalLineReader {
+ private:
+  IsalInflater inf_;
+  std::vector<char> buf_;   // one decompressed staging buffer
+  size_t pos_ = 0, len_ = 0;
+  bool eof_ = false;
+
+  bool refill() {
+    len_ = inf_.fill(buf_.data(), buf_.size());
+    pos_ = 0;
+    if (len_ == 0) { eof_ = true; return false; }
+    return true;
+  }
+
+ public:
+  explicit IsalLineReader(const std::string &path, size_t bufsize = (1u << 22))
+      : inf_(path), buf_(bufsize) {}
+
+  size_t getline(char *dst, size_t maxlen) {
+    size_t i = 0;
+    const size_t lim = maxlen - 1;
+    while (i < lim) {
+      if (pos_ >= len_ && !refill())
+        break;
+      while (pos_ < len_ && i < lim) {
+        const char c = buf_[pos_++];
+        dst[i++] = c;
+        if (c == '\n') {
+          dst[i] = '\0';
+          return i;
+        }
+      }
+    }
+    dst[i] = '\0';
+    return i;
+  }
+
+  bool eof() const { return eof_ && pos_ >= len_; }
+  size_t compressed_offset() const { return inf_.compressed_offset(); }
 };
 #endif  // USE_ISAL
 
@@ -662,9 +730,16 @@ class GzFastqReader : public StreamReader {
   static const size_t GZ_BLOCK_SIZE = (1<<22);  // 4 MiB decompressed blocks
   static const int GZ_NUM_BLOCKS = 6;           // bounded prefetch (~24 MiB)
   char *gzbuf;
-  gzFile fileobj;
   const bool threaded;              // overlap decompression on a bg thread
+#ifdef USE_ISAL
+  // ISA-L igzip backends: a background block reader when threaded, otherwise a
+  // synchronous single-thread line reader. Exactly one is non-null after load.
+  IsalBlockReader *idecomp = nullptr;
+  IsalLineReader *iserial = nullptr;
+#else
+  gzFile fileobj;
   GzBlockDecompressor *decomp;      // non-null only when threaded
+#endif
 
  public:
   GzFastqReader(FalcoConfig &fc, const size_t _buffer_size);
