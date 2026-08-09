@@ -861,6 +861,9 @@ class BamReader : public StreamReader {
   int rd_ret, fmt_ret;
   int n_threads = 1;   // htslib decompression thread pool size
   char *last;
+  // [FalcoAmadeus] reused scratch for the ASCII-decoded SEQ (nibbles unpacked
+  // once, then fed through the shared base-class sequence engine)
+  std::vector<char> decode_buf;
  public:
   BamReader(FalcoConfig &fc, const size_t _buffer_size);
   size_t load();
