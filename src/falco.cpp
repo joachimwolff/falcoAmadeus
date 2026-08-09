@@ -685,9 +685,15 @@ analyze_and_write(FalcoConfig &falco_config, const std::string &filename,
   if (falco_config.is_sam) {
     if (!falco_config.quiet)
       log_process("reading file as SAM format");
-    SamReader in(falco_config, stats.SHORT_READ_THRESHOLD);
-    read_stream_into_stats(in, stats, falco_config);
-    stats.adjust_tile_maps_len();
+    if (falco_config.threads >= 2 && falco_config.read_step == 1) {
+      // parallel SAM on the shared byte-split driver (tile reconstructed inside).
+      read_sam_chunked(falco_config, stats, falco_config.threads);
+    }
+    else {
+      SamReader in(falco_config, stats.SHORT_READ_THRESHOLD);
+      read_stream_into_stats(in, stats, falco_config);
+      stats.adjust_tile_maps_len();
+    }
   }
 #ifdef USE_HTS
   else if (falco_config.is_bam) {

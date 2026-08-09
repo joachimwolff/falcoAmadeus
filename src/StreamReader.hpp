@@ -496,6 +496,10 @@ void read_uncompressed_parallel(FalcoConfig &config, FastqStats &master,
 void read_uncompressed_chunked(FalcoConfig &config, FastqStats &master,
                                size_t nthreads);
 
+// [FalcoAmadeus] Parallel SAM driver: mmap the text, byte-split into per-thread
+// line ranges, parse in place. Byte-identical to the serial SamReader.
+void read_sam_chunked(FalcoConfig &config, FastqStats &master, size_t nthreads);
+
 // Gzip/BGZF driver: decompress the whole file to RAM (BGZF blocks inflated in
 // parallel via htslib bgzf_mt + libdeflate), then parse it with the chunked
 // parallel parser. Byte-identical; read_step == 1 only. Falls back to

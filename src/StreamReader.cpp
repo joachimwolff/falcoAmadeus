@@ -1785,7 +1785,7 @@ read_bytesplit_core(FalcoConfig &config, FastqStats &master,
 
   // ---- Phase 0: record-boundary sync points, one per thread ----
   std::vector<std::size_t> sync(nthreads + 1);
-  sync[0] = 0;
+  sync[0] = P::find_start(base, size, 0);  // 0 for FASTQ; skips @ header for SAM
   sync[nthreads] = size;
 #ifdef _OPENMP
 #pragma omp parallel for num_threads(nthreads) schedule(static)
@@ -1834,7 +1834,7 @@ read_bytesplit_core(FalcoConfig &config, FastqStats &master,
       return;
     bool continue_storing = true;
     std::size_t seen = 0;
-    std::size_t p = 0;
+    std::size_t p = sync[0];  // first record (0 for FASTQ; past @ header for SAM)
     while (p < size && continue_storing) {
       const char *key; std::size_t klen;
       const std::size_t next = P::dup_key(base, size, p, key, klen);
@@ -1994,6 +1994,125 @@ read_chunked_core(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
                   bool can_drop = false) {
   read_bytesplit_core<FastqPolicy>(config, master, nthreads, base, size,
                                    std::move(release_input), can_drop);
+}
+
+// [FalcoAmadeus] SAM worker: tab-delimited fields, newline records. Same per-base
+// machinery as the FASTQ worker, only the separators differ.
+class SamParallelWorker : public StreamReader {
+ public:
+  SamParallelWorker(FalcoConfig &fc, const std::size_t bs)
+    : StreamReader(fc, bs, '\t', get_line_separator(fc.filename)) {
+    parallel_mode = true;
+  }
+  std::size_t load() { return 0; }
+  bool read_entry(FastqStats &, std::size_t &) { return false; }
+  bool is_eof() { return force_eof; }
+  ~SamParallelWorker() {}
+};
+
+// SAM record policy for the byte-split driver: a record is one line; SEQ is
+// field 10 and QUAL field 11 (1-based); the read name (field 1) carries the tile.
+// @ header lines are skipped by find_start. Subsampling keys off the global read
+// index g exactly like FastqPolicy, so no postprocess counter bookkeeping.
+struct SamPolicy {
+  using Worker = SamParallelWorker;
+  // Byte offset of the QNAME field of field `f0` (0-based) within the line at p.
+  static std::size_t field_at(const char *base, std::size_t size, std::size_t p,
+                              int f0) {
+    std::size_t q = p;
+    for (int i = 0; i < f0; ++i) {
+      while (q < size && base[q] != '\t' && base[q] != '\n') ++q;
+      if (q < size && base[q] == '\t') ++q;
+    }
+    return q;
+  }
+  static std::size_t next_line(const char *base, std::size_t size,
+                               std::size_t from) {
+    const char *nl =
+      static_cast<const char *>(memchr(base + from, '\n', size - from));
+    return nl ? static_cast<std::size_t>(nl - base) + 1 : size;
+  }
+  static std::size_t find_start(const char *base, std::size_t size,
+                                std::size_t from) {
+    std::size_t p = (from == 0) ? 0 : next_line(base, size, from);
+    while (p < size && base[p] == '@')      // skip the @HD/@SQ/@PG... header
+      p = next_line(base, size, p);
+    return p;
+  }
+  template <class Drop>
+  static std::size_t count_chunk(const char *base, std::size_t lo,
+                                 std::size_t hi, std::size_t size, Drop drop) {
+    const std::size_t DW = std::size_t(8) << 20;
+    std::size_t nl = 0;
+    for (std::size_t off = lo; off < hi; off += DW) {
+      const std::size_t end = std::min(off + DW, hi);
+      nl += static_cast<std::size_t>(std::count(base + off, base + end, '\n'));
+      drop(off, end);
+    }
+    if (hi == size && size > lo && base[size - 1] != '\n')
+      ++nl;  // final record without a trailing newline
+    return nl;  // one record per line
+  }
+  static std::size_t dup_key(const char *base, std::size_t size, std::size_t p,
+                             const char *&key, std::size_t &klen) {
+    const std::size_t s = field_at(base, size, p, 9);  // field 10 (SEQ)
+    std::size_t sl = 0;
+    while (s + sl < size && base[s + sl] != '\t' && base[s + sl] != '\n') ++sl;
+    key = base + s;
+    klen = get_truncate_point(sl);
+    return next_line(base, size, s + sl);
+  }
+  static std::size_t parse_one(Worker &w, FastqStats &ws, const char *base,
+                               std::size_t size, std::size_t p, std::size_t g,
+                               GCRecord *gc, bool tile_ignore, bool can_be_last,
+                               std::size_t &seqlen_out, std::size_t &tile_out,
+                               const char *&key_out) {
+    (void)can_be_last;
+    w.do_read = true;
+    w.force_eof = false;
+    // field 1 (QNAME) -> tile; leaves cur_char at the '\t' after the name
+    w.cur_char = const_cast<char *>(base + p);
+    std::size_t tile_cur = 0;
+    if (!tile_ignore) {
+      w.get_tile_value();
+      tile_cur = w.tile_cur;
+    }
+    else {
+      w.read_fast_forward_line();
+    }
+    w.skip_separator();
+    // fields 2..9 (FLAG..TLEN): skip
+    for (int i = 0; i < 8; ++i) {
+      w.read_fast_forward_line();
+      w.skip_separator();
+    }
+    // field 10 (SEQ)
+    const char *seqstart = w.cur_char;
+    w.do_kmer_read = (g % StreamReader::num_reads_for_kmer == 0);
+    w.cur_gc_record = gc;
+    w.read_sequence_line(ws);
+    const std::size_t seqlen = w.read_pos;
+    w.skip_separator();
+    // field 11 (QUAL)
+    w.do_tile_read =
+      !tile_ignore && (g % StreamReader::num_reads_for_tile == 0);
+    w.tile_cur = tile_cur;
+    w.read_quality_line(ws);
+    seqlen_out = seqlen;
+    tile_out = tile_cur;
+    key_out = seqstart;
+    return next_line(base, size, static_cast<std::size_t>(w.cur_char - base));
+  }
+};
+
+// SAM instantiation of the byte-split driver (mmap the text file, parse in place).
+void
+read_sam_chunked(FalcoConfig &config, FastqStats &master, std::size_t nthreads) {
+  PlainBlockReader *src = new PlainBlockReader(config.filename);
+  const char *data = src->data();
+  const std::size_t sz = src->size();
+  read_bytesplit_core<SamPolicy>(config, master, nthreads, data, sz,
+                                 [src]() { delete src; }, /*can_drop=*/true);
 }
 
 void
