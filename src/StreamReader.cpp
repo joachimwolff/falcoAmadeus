@@ -2276,6 +2276,212 @@ read_chunked_core(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
                                    std::move(release_input), can_drop);
 }
 
+#ifdef USE_ISAL
+// [FalcoAmadeus] Fused streaming gz driver. Profiling showed plain-gz throughput
+// is bounded not by ISA-L inflate (fast) but by the single-threaded dispatcher,
+// which touches every byte to split lines. This inflates a bounded chunk with
+// ISA-L, then byte-split parses it in parallel (FastqPolicy), carrying the one
+// straddling tail record to the next chunk -- so the parallel parse overlaps the
+// serial inflate and no thread touches every byte. Single-pass (a gz stream
+// cannot be re-inflated): the duplication prefix and the parse share one visit
+// per chunk, with the "first 100k unique" cap discovered mid-stream exactly as
+// read_bytesplit_core does. Tile-less only; tiled input falls back to the
+// dispatcher (per-tile needs a pre-scan a stream cannot provide).
+static void
+read_gz_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads) {
+  const std::size_t BUF = FastqStats::SHORT_READ_THRESHOLD;
+  ParallelWorker cfg(config, BUF);
+  const bool tile_ignore = cfg.tile_ignore;
+  const bool do_hash = cfg.do_sequence_hash;
+  if (!tile_ignore) {  // tiled: cannot pre-scan a stream -> dispatcher
+    read_gz_parallel(config, master, nthreads);
+    return;
+  }
+
+  IsalInflater inf(config.filename);
+
+  const std::size_t CHUNK = std::size_t(64) << 20;
+  const std::size_t SLACK = std::size_t(16) << 20;  // headroom for small leftovers
+  std::vector<char> bufv(CHUNK + SLACK);
+  char *buf = bufv.data();
+
+  std::vector<std::unique_ptr<ParallelWorker>> workers(nthreads);
+  std::vector<std::unique_ptr<FastqStats>> wstats(nthreads);
+  std::vector<std::vector<std::size_t>> deltas(nthreads);
+  std::vector<std::vector<GCRecord>> gcr(nthreads);
+  for (std::size_t t = 0; t < nthreads; ++t) {
+    workers[t].reset(new ParallelWorker(config, BUF));
+    wstats[t].reset(new FastqStats(config.do_kmer));
+  }
+
+  bool dup_cont = true;
+  std::size_t dup_seen = 0, nent = 0, total = 0, leftover_len = 0;
+  auto mbegin = master.sequence_count.begin();
+  std::vector<std::size_t> sync(nthreads + 1), counts(nthreads),
+    gstart(nthreads + 1);
+  auto nodrop = [](std::size_t, std::size_t) {};
+
+  bool eof = false;
+  while (!eof) {
+    // ---- inflate one chunk after the carried leftover ----
+    if (bufv.size() < leftover_len + CHUNK) {
+      bufv.resize(leftover_len + CHUNK);  // huge single record: grow to fit
+      buf = bufv.data();
+    }
+    const std::size_t target = leftover_len + CHUNK;
+    std::size_t filled = leftover_len;
+    while (filled < target) {
+      const std::size_t got = inf.fill(buf + filled, target - filled);
+      if (got == 0) { eof = true; break; }
+      filled += got;
+    }
+    const std::size_t end = filled;
+    if (end == 0) break;
+
+    // ---- parse limit: on the last chunk parse to the end, else carry the
+    // straddling tail record. A record whose 4 lines do not all fit before
+    // `end` makes parse_record return `end`, so walk complete records forward
+    // from a small backward probe and cut at the first that straddles. ----
+    std::size_t plimit;
+    if (eof) {
+      plimit = end;
+    }
+    else {
+      const std::size_t BACK = SLACK / 2;
+      std::size_t q = find_record_start(buf, end, end > BACK ? end - BACK : 0);
+      if (q >= end) q = find_record_start(buf, end, 0);  // records > BACK
+      for (;;) {
+        std::size_t so, sl;
+        const std::size_t r = parse_record(buf, end, q, so, sl);
+        if (r >= end) break;  // record at q straddles end -> carry from here
+        q = r;
+      }
+      plimit = q;
+    }
+    if (plimit == 0) {  // no complete record yet (record spans the whole buffer)
+      leftover_len = end;
+      if (eof) break;
+      continue;
+    }
+
+    // ---- Phase 0: per-thread record-boundary sync points over [0, plimit) ----
+    sync[0] = 0;
+    sync[nthreads] = plimit;
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(nthreads) schedule(static)
+#endif
+    for (std::size_t t = 1; t < nthreads; ++t)
+      sync[t] = find_record_start(buf, plimit, t * (plimit / nthreads));
+    for (std::size_t t = 1; t <= nthreads; ++t)
+      if (sync[t] < sync[t - 1]) sync[t] = sync[t - 1];
+
+    // ---- Phase 1: count records per thread (record-aligned ranges) ----
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(nthreads) schedule(static)
+#endif
+    for (std::size_t t = 0; t < nthreads; ++t)
+      counts[t] = (sync[t] < sync[t + 1])
+        ? FastqPolicy::count_chunk(buf, sync[t], sync[t + 1], plimit, nodrop)
+        : 0;
+    gstart[0] = total;
+    for (std::size_t t = 0; t < nthreads; ++t)
+      gstart[t + 1] = gstart[t] + counts[t];
+    const std::size_t nrec = gstart[nthreads] - total;
+
+    // ---- duplication prefix (serial, global read index) while below the cap ----
+    if (do_hash && dup_cont) {
+      std::size_t p = 0;
+      while (dup_cont && p < plimit) {
+        const char *key;
+        std::size_t klen;
+        const std::size_t next = FastqPolicy::dup_key(buf, plimit, p, key, klen);
+        const auto it = master.sequence_count.find(key, klen);
+        if (it == master.sequence_count.end()) {
+          master.sequence_count.emplace(key, klen, 1);
+          master.count_at_limit = dup_seen;
+          ++master.num_unique_seen;
+          if (master.num_unique_seen == Constants::unique_reads_stop_counting) {
+            dup_cont = false;
+            ++dup_seen;
+            break;
+          }
+        }
+        else {
+          ++it->second;
+          master.count_at_limit += dup_cont;
+        }
+        ++dup_seen;
+        p = next;
+      }
+    }
+    const std::size_t fill_boundary = dup_cont ? SIZE_MAX : dup_seen;
+    const bool count_dup = do_hash && !dup_cont;
+    if (count_dup && nent == 0) {  // freeze the map, size the deltas once
+      nent = master.sequence_count.size();
+      mbegin = master.sequence_count.begin();
+      for (std::size_t t = 0; t < nthreads; ++t) deltas[t].assign(nent, 0);
+    }
+
+    // ---- Phase 2: parallel parse + per-base stats + deferred dup counting ----
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(nthreads) schedule(static)
+#endif
+    for (std::size_t t = 0; t < nthreads; ++t) {
+      const std::size_t n = counts[t];
+      std::vector<GCRecord> &gc = gcr[t];
+      if (gc.size() < n) gc.assign(n, GCRecord{0, 0, 0});
+      ParallelWorker &w = *workers[t];
+      FastqStats &ws = *wstats[t];
+      const std::size_t g0 = gstart[t];
+      const bool tail = eof && (sync[t + 1] == plimit);
+      std::size_t p = sync[t];
+      for (std::size_t j = 0; j < n; ++j) {
+        const std::size_t g = g0 + j;
+        std::size_t seqlen = 0, tile_cur = 0;
+        const char *key = nullptr;
+        p = FastqPolicy::parse_one(w, ws, buf, plimit, p, g, &gc[j], tile_ignore,
+                                   tail && (j + 1 == n), seqlen, tile_cur, key);
+        if (count_dup && g >= fill_boundary) {
+          const auto it =
+            master.sequence_count.find(key, get_truncate_point(seqlen));
+          if (it != master.sequence_count.end())
+            ++deltas[t][static_cast<std::size_t>(it - mbegin)];
+        }
+      }
+    }
+
+    // ---- GC replay in global read order (thread 0..nth-1, per chunk) ----
+    for (std::size_t t = 0; t < nthreads; ++t) {
+      const std::vector<GCRecord> &gc = gcr[t];
+      const std::size_t n = counts[t];
+      for (std::size_t j = 0; j < n; ++j) {
+        const GCRecord &gr = gc[j];
+        if (gr.kind == 1) {
+          for (const auto &v : master.gc_models[gr.a].models[gr.b])
+            master.gc_count[v.percent] += v.increment;
+        }
+        else if (gr.kind == 2) {
+          ++master.gc_count[gr.a];
+        }
+      }
+    }
+    total += nrec;
+
+    // ---- carry the straddling tail to the next chunk ----
+    leftover_len = end - plimit;
+    if (leftover_len) std::memmove(buf, buf + plimit, leftover_len);
+  }
+
+  std::vector<std::vector<GCRecord>> empty_gc(nthreads);
+  std::vector<std::vector<std::pair<std::uint32_t, std::uint32_t>>> tilerecs(
+    nthreads);
+  const bool count_dup_final = do_hash && !dup_cont;
+  merge_worker_stats(config, master, nthreads, total, wstats, empty_gc, deltas,
+                     tilerecs, gstart, count_dup_final,
+                     /*tile_ignore=*/true, /*skip_gc=*/true);
+}
+#endif  // USE_ISAL
+
 // [FalcoAmadeus] SAM worker: tab-delimited fields, newline records. Same per-base
 // machinery as the FASTQ worker, only the separators differ.
 class SamParallelWorker : public StreamReader {
@@ -2707,15 +2913,17 @@ read_gz_chunked(FalcoConfig &config, FastqStats &master,
     // not BGZF (plain gzip) -> fall through to the streaming bgzf reader below
   }
 #endif
-  // Plain (non-BGZF) gzip: a single DEFLATE stream cannot be block-parallel
-  // decompressed, so the whole thing must be inflated serially either way.
-  // Rather than materialize the entire ~10x-larger decompressed FASTQ in RAM
-  // (tens of GB for a multi-GB input), STREAM it: BgzfBlockReader (USE_HTS) or
-  // GzBlockDecompressor inflate one bounded block at a time on a background
-  // thread while the dispatcher/worker pool parses reads in parallel. Bounded
-  // memory (a few MiB of decompression ring + one reused parse arena) and
-  // byte-identical to the serial path (same decompressed bytes, same order).
+  // Plain (non-BGZF) gzip: one DEFLATE stream, so inflation is serial either way.
+  // Stream it in bounded chunks rather than materialize the ~10x-larger FASTQ.
+#if defined(USE_ISAL)
+  // Fused: ISA-L inflate a chunk, then parse it with the parallel byte-split
+  // driver (no single-thread dispatcher touching every byte). Bounded memory,
+  // byte-identical, and overlaps inflate with a parallel parse.
+  read_gz_fused(config, master, nthreads);
+#else
+  // Fallback: background block decompressor feeding the serial dispatcher.
   read_gz_parallel(config, master, nthreads);
+#endif
 }
 
 /*******************************************************/
