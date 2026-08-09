@@ -502,6 +502,11 @@ void read_uncompressed_chunked(FalcoConfig &config, FastqStats &master,
 // read_gz_parallel when built without htslib.
 void read_gz_chunked(FalcoConfig &config, FastqStats &master, size_t nthreads);
 
+// [FalcoAmadeus] Fully parallel BAM driver: decompress the BGZF to a temp file
+// (drop-behind), walk the record offsets serially (cheap), then parse records in
+// parallel across nthreads, byte-identical to the serial BamReader path.
+void read_bam_chunked(FalcoConfig &config, FastqStats &master, size_t nthreads);
+
 /*******************************************************/
 /*************** READ SAM RECORD ***********************/
 /*******************************************************/
@@ -545,6 +550,17 @@ class BamReader : public StreamReader {
   inline void read_sequence_line(FastqStats &stats);
   inline void read_quality_line(FastqStats &stats);  // parse quality
   inline void put_base_in_buffer(const size_t pos);  // puts base in buffer or leftover
+
+  // [FalcoAmadeus] parallel-BAM support: a worker owns a reusable bam1_t and is
+  // handed raw on-disk records (pointer past the 4-byte block_size, length bs).
+  void bam_worker_init();                       // allocate b, enter parallel mode
+  void bam_load_raw(const char *rec, uint32_t bs);   // fill b from raw bytes + revcomp
+  // full per-record processing into `stats` for global read index g; returns the
+  // sequence length and reports the parsed tile in tile_cur_out.
+  size_t process_record_parallel(const char *rec, uint32_t bs, FastqStats &stats,
+                                 GCRecord *gcr, size_t g, size_t &tile_cur_out);
+  // decode just the duplication key (truncated, reverse-complemented) into dst.
+  void decode_key(const char *rec, uint32_t bs, char *dst, size_t &keylen);
   ~BamReader();
 };
 #endif

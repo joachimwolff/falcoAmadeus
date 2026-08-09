@@ -693,9 +693,16 @@ analyze_and_write(FalcoConfig &falco_config, const std::string &filename,
   else if (falco_config.is_bam) {
     if (!falco_config.quiet)
       log_process("reading file as BAM format");
-    BamReader in(falco_config, stats.SHORT_READ_THRESHOLD);
-    read_stream_into_stats(in, stats, falco_config);
-    stats.adjust_tile_maps_len();
+    if (falco_config.threads >= 2 && falco_config.read_step == 1) {
+      // parallel BAM: byte-identical to the serial path (tile maps reconstructed
+      // inside, mirroring the chunked FASTQ driver -- no adjust_tile_maps_len).
+      read_bam_chunked(falco_config, stats, falco_config.threads);
+    }
+    else {
+      BamReader in(falco_config, stats.SHORT_READ_THRESHOLD);
+      read_stream_into_stats(in, stats, falco_config);
+      stats.adjust_tile_maps_len();
+    }
   }
 #endif
 

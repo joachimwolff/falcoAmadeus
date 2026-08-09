@@ -2369,7 +2369,10 @@ BamReader::read_sequence_line(FastqStats &stats) {
   num_bases_after_n = 1;
   still_in_buffer = true;
   next_truncation = 100;
-  do_kmer_read = (stats.num_reads == next_kmer_read);
+  // parallel workers set do_kmer_read from the global read index; only the serial
+  // path derives it from the local counter.
+  if (!parallel_mode)
+    do_kmer_read = (stats.num_reads == next_kmer_read);
   adapters_found.reset();
 
   const std::size_t seq_len = b->core.l_qseq;
@@ -2591,6 +2594,7 @@ BamReader::BamReader(FalcoConfig &_config, const std::size_t _buffer_size) :
   StreamReader(_config, _buffer_size, '\t', '\n') {
   rd_ret = 0;
   n_threads = static_cast<int>(_config.threads);
+  hts = nullptr; hdr = nullptr; b = nullptr; last = nullptr;  // safe for workers
 }
 
 std::size_t
@@ -2679,5 +2683,271 @@ BamReader::~BamReader() {
     hts_close(hts);
     hts = 0;
   }
+}
+
+/*******************************************************/
+/*********** PARALLEL BAM (FalcoAmadeus) ***************/
+/*******************************************************/
+void
+BamReader::bam_worker_init() {
+  b = bam_init1();
+  parallel_mode = true;
+}
+
+// Populate the reusable b from an on-disk record (rec points just past the
+// 4-byte block_size; bs is that block_size). We deliberately set l_extranul = 0
+// and copy the on-disk variable block verbatim, so bam_get_qname/seq/qual line
+// up exactly on it. Reverse-strand reads are reverse-complemented in place, as
+// the serial read_entry does.
+void
+BamReader::bam_load_raw(const char *rec, uint32_t bs) {
+  const unsigned char *r = reinterpret_cast<const unsigned char *>(rec);
+  auto rd16 = [&](int o) {
+    return static_cast<uint16_t>(r[o] | (r[o + 1] << 8));
+  };
+  auto rd32 = [&](int o) {
+    int32_t v;
+    std::memcpy(&v, r + o, 4);
+    return v;
+  };
+  b->core.tid = rd32(0);
+  b->core.pos = rd32(4);
+  b->core.l_qname = r[8];
+  b->core.qual = r[9];
+  b->core.l_extranul = 0;
+  b->core.bin = rd16(10);
+  b->core.n_cigar = rd16(12);
+  b->core.flag = rd16(14);
+  b->core.l_qseq = rd32(16);
+  b->core.mtid = rd32(20);
+  b->core.mpos = rd32(24);
+  b->core.isize = rd32(28);
+  const uint32_t vlen = bs - 32;
+  if (b->m_data < vlen + 8) {           // +8 slack for the qual '\n' terminator
+    b->m_data = vlen + 8;
+    b->data = static_cast<uint8_t *>(std::realloc(b->data, b->m_data));
+  }
+  std::memcpy(b->data, r + 32, vlen);
+  b->l_data = vlen;
+  if (b->core.flag & BAM_FREVERSE) {
+    revcomp_seq_by_byte(b);
+    reverse_quality_scores(b);
+    b->core.flag &= ~static_cast<uint16_t>(BAM_FREVERSE);
+  }
+}
+
+std::size_t
+BamReader::process_record_parallel(const char *rec, uint32_t bs,
+                                   FastqStats &stats, GCRecord *gcr,
+                                   std::size_t g, std::size_t &tile_cur_out) {
+  bam_load_raw(rec, bs);
+  do_read = true;                       // read_bam_chunked guarantees read_step==1
+  cur_gc_record = gcr;
+  do_kmer_read = (g % num_reads_for_kmer == 0);
+  tile_cur_out = 0;
+  if (!tile_ignore) {
+    cur_char = bam_get_qname(b);
+    last = cur_char + b->m_data;
+    const std::size_t first_padding_null =
+      b->core.l_qname - b->core.l_extranul - 1;
+    cur_char[first_padding_null] = field_separator;
+    get_tile_value();
+    tile_cur_out = tile_cur;
+  }
+  const std::size_t seq_len = b->core.l_qseq;
+  cur_char = reinterpret_cast<char *>(bam_get_seq(b));
+  read_sequence_line(stats);
+  do_tile_read = !tile_ignore && (g % num_reads_for_tile == 0);
+  tile_cur = tile_cur_out;
+  cur_char = reinterpret_cast<char *>(bam_get_qual(b));
+  cur_char[seq_len] = line_separator;
+  read_quality_line(stats);
+  return seq_len;
+}
+
+void
+BamReader::decode_key(const char *rec, uint32_t bs, char *dst,
+                      std::size_t &keylen) {
+  bam_load_raw(rec, bs);
+  keylen = get_truncate_point(b->core.l_qseq);
+  const uint8_t *seq = bam_get_seq(b);
+  for (std::size_t i = 0; i < keylen; ++i)
+    dst[i] = seq_nt16_str[bam_seqi(seq, i)];
+}
+
+// Walk the BAM records: parse the header to find the first record, then follow
+// the block_size prefixes. Returns records_start, or SIZE_MAX on malformed input.
+static std::size_t
+bam_records_start(const char *base, std::size_t size) {
+  if (size < 12 || std::memcmp(base, "BAM\1", 4) != 0)
+    return SIZE_MAX;
+  auto rd32 = [&](std::size_t o) {
+    int32_t v;
+    std::memcpy(&v, base + o, 4);
+    return static_cast<std::size_t>(static_cast<uint32_t>(v));
+  };
+  std::size_t o = 4;
+  const std::size_t l_text = rd32(o); o += 4 + l_text;
+  if (o + 4 > size) return SIZE_MAX;
+  const std::size_t n_ref = rd32(o); o += 4;
+  for (std::size_t r = 0; r < n_ref; ++r) {
+    if (o + 4 > size) return SIZE_MAX;
+    const std::size_t l_name = rd32(o);
+    o += 4 + l_name + 4;                // l_name + name + l_ref
+    if (o > size) return SIZE_MAX;
+  }
+  return o;
+}
+
+// Serial BAM fallback (used when the input is not BGZF-walkable).
+static void
+bam_read_serial(FalcoConfig &config, FastqStats &master) {
+  BamReader in(config, FastqStats::SHORT_READ_THRESHOLD);
+  in.load();
+  std::size_t nb = 0;
+  while (in.read_entry(master, nb)) {}
+  if (in.tile_ignore)
+    config.do_tile = false;
+}
+
+void
+read_bam_chunked(FalcoConfig &config, FastqStats &master,
+                 std::size_t nthreads) {
+  const std::size_t BUF = FastqStats::SHORT_READ_THRESHOLD;
+#if defined(USE_HTS) && defined(USE_LIBDEFLATE)
+  GzBuffer g = decompress_bgzf_libdeflate(config.filename, nthreads);
+  if (g.data != nullptr) {
+    const char *base = g.data;
+    const std::size_t size = g.size;
+    const std::size_t PGSZ = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+    auto bdrop = [&](std::size_t a, std::size_t b) {  // drop-behind the decompressed mmap
+      if (!g.can_drop) return;
+      const std::size_t sa = (a + PGSZ - 1) & ~(PGSZ - 1), sb = b & ~(PGSZ - 1);
+      if (sb > sa) madvise(const_cast<char *>(base) + sa, sb - sa, MADV_DONTNEED);
+    };
+    const std::size_t rec0 = bam_records_start(base, size);
+    if (rec0 == SIZE_MAX) {              // not a BAM we can walk -> serial fallback
+      if (g.can_drop) { munmap(g.data, g.maplen); if (g.fd >= 0) close(g.fd); }
+      else std::free(g.data);
+      bam_read_serial(config, master);
+      return;
+    }
+    auto rd_bsz = [&](std::size_t p) {
+      int32_t v; std::memcpy(&v, base + p, 4); return static_cast<std::size_t>(v);
+    };
+    // Walk 1: count records.
+    std::size_t total = 0, p = rec0, w1drop = rec0;
+    while (p + 4 <= size) {
+      const std::size_t bsz = rd_bsz(p);
+      if (p + 4 + bsz > size) break;
+      ++total; p += 4 + bsz;
+      if (p - w1drop >= (std::size_t(16) << 20)) { bdrop(w1drop, p); w1drop = p; }
+    }
+    // Walk 2: per-thread chunk-start byte offsets (record-aligned).
+    std::vector<std::size_t> gstart(nthreads + 1, 0);
+    std::vector<std::size_t> choff(nthreads + 1, rec0);
+    std::vector<std::size_t> counts(nthreads, 0);
+    for (std::size_t t = 0; t <= nthreads; ++t)
+      gstart[t] = total * t / nthreads;
+    {
+      std::size_t idx = 0, q = rec0, tcur = 0, w2drop = rec0;
+      choff[0] = rec0;
+      while (q + 4 <= size && idx < total) {
+        while (tcur < nthreads && idx == gstart[tcur]) choff[tcur++] = q;
+        const std::size_t bsz = rd_bsz(q);
+        q += 4 + bsz; ++idx;
+        if (q - w2drop >= (std::size_t(16) << 20)) { bdrop(w2drop, q); w2drop = q; }
+      }
+      while (tcur <= nthreads) choff[tcur++] = q;
+    }
+    choff[nthreads] = (total > 0) ? choff[nthreads] : rec0;
+    for (std::size_t t = 0; t < nthreads; ++t)
+      counts[t] = gstart[t + 1] - gstart[t];
+
+    // dispatcher-only reader for config flags
+    ParallelWorker cfg(config, BUF);
+    const bool tile_ignore = cfg.tile_ignore;
+    const bool do_hash = cfg.do_sequence_hash;
+
+    // ---- duplication prefix (serial): fix the "first 100k unique" set ----
+    std::size_t fill_boundary = 0;
+    if (do_hash) {
+      BamReader keyer(config, BUF); keyer.bam_worker_init();
+      std::vector<char> key(BUF + 8);
+      bool cont = true; std::size_t seen = 0, pp = rec0;
+      while (pp + 4 <= size && cont) {
+        const std::size_t bsz = rd_bsz(pp);
+        if (pp + 4 + bsz > size) break;
+        std::size_t klen = 0;
+        keyer.decode_key(base + pp + 4, static_cast<uint32_t>(bsz),
+                         key.data(), klen);
+        const auto it = master.sequence_count.find(key.data(), klen);
+        if (it == master.sequence_count.end()) {
+          master.sequence_count.emplace(key.data(), klen, 1);
+          master.count_at_limit = seen;
+          ++master.num_unique_seen;
+          if (master.num_unique_seen == Constants::unique_reads_stop_counting) {
+            cont = false; ++seen; break;
+          }
+        }
+        else {
+          ++it->second;
+          master.count_at_limit += cont;
+        }
+        ++seen; pp += 4 + bsz;
+      }
+      fill_boundary = cont ? total : seen;
+    }
+    const std::size_t nent = do_hash ? master.sequence_count.size() : 0;
+    const auto mbegin = master.sequence_count.begin();
+    const bool count_dup = do_hash && (fill_boundary < total);
+
+    // ---- parallel parse ----
+    std::vector<std::unique_ptr<FastqStats>> wstats(nthreads);
+    std::vector<std::vector<GCRecord>> gcrec(nthreads);
+    std::vector<std::vector<std::size_t>> deltas(nthreads);
+    std::vector<std::vector<std::pair<std::uint32_t, std::uint32_t>>>
+      tilerecs(nthreads);
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(nthreads) schedule(static)
+#endif
+    for (std::size_t t = 0; t < nthreads; ++t) {
+      wstats[t].reset(new FastqStats(config.do_kmer));
+      FastqStats &ws = *wstats[t];
+      BamReader w(config, BUF); w.bam_worker_init();
+      const std::size_t n = counts[t], g0 = gstart[t];
+      gcrec[t].assign(n, GCRecord{0, 0, 0});
+      if (count_dup) deltas[t].assign(nent, 0);
+      if (!tile_ignore) tilerecs[t].reserve(n);
+      std::size_t q = choff[t], jdrop = choff[t];
+      for (std::size_t j = 0; j < n; ++j) {
+        const std::size_t bsz = rd_bsz(q);
+        std::size_t tile_cur = 0;
+        const std::size_t seqlen = w.process_record_parallel(
+          base + q + 4, static_cast<uint32_t>(bsz), ws, &gcrec[t][j],
+          g0 + j, tile_cur);
+        if (count_dup && g0 + j >= fill_boundary) {
+          const auto it = master.sequence_count.find(
+            w.buffer, get_truncate_point(seqlen));
+          if (it != master.sequence_count.end())
+            ++deltas[t][static_cast<std::size_t>(it - mbegin)];
+        }
+        if (!tile_ignore)
+          tilerecs[t].push_back({static_cast<std::uint32_t>(seqlen),
+                                 static_cast<std::uint32_t>(tile_cur)});
+        q += 4 + bsz;
+        if (q - jdrop >= (std::size_t(8) << 20)) { bdrop(jdrop, q); jdrop = q; }
+      }
+    }
+    (void)nent; (void)mbegin;
+    merge_worker_stats(config, master, nthreads, total, wstats, gcrec, deltas,
+                       tilerecs, gstart, count_dup, tile_ignore);
+    if (g.can_drop) { munmap(g.data, g.maplen); if (g.fd >= 0) close(g.fd); }
+    else std::free(g.data);
+    return;
+  }
+#endif
+  // Fallback: serial BAM reader.
+  bam_read_serial(config, master);
 }
 #endif
