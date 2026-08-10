@@ -34,3 +34,4 @@ test/*.log
 test/*.trs
 test_output/
 test_build/
+test-suite.log
