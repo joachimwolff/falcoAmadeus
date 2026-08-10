@@ -927,7 +927,7 @@ main(int argc, char *argv[]) {
 
   try {
     static const std::string FALCO_VERSION =
-      "falco " + std::string{VERSION};
+      "falcoAmadeus " + std::string{VERSION};
     bool help = false;
     bool version = false;
 

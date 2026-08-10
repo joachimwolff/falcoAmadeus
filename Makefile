@@ -474,16 +474,16 @@ OPENMP_CXXFLAGS = -fopenmp
 PACKAGE = falcoAmadeus
 PACKAGE_BUGREPORT = 
 PACKAGE_NAME = FalcoAmadeus
-PACKAGE_STRING = FalcoAmadeus 1
+PACKAGE_STRING = FalcoAmadeus 2
 PACKAGE_TARNAME = falcoAmadeus
-PACKAGE_URL = https://github.com/joachimwolff/falco
-PACKAGE_VERSION = 1
+PACKAGE_URL = https://github.com/joachimwolff/falcoAmadeus
+PACKAGE_VERSION = 2
 PATH_SEPARATOR = :
 RAPIDGZIP_CPPFLAGS = -I/home/mh-hannover.local/wolffjoa/src/rapidgzip/librapidarchive/src -I/home/mh-hannover.local/wolffjoa/src/rapidgzip/librapidarchive/src/core -I/home/mh-hannover.local/wolffjoa/src/rapidgzip/librapidarchive/src/huffman -I/home/mh-hannover.local/wolffjoa/src/rapidgzip/librapidarchive/src/indexed_bzip2
 SET_MAKE = 
 SHELL = /bin/bash
 STRIP = 
-VERSION = 1
+VERSION = 2
 abs_builddir = /home/mh-hannover.local/wolffjoa/src/falco
 abs_srcdir = /home/mh-hannover.local/wolffjoa/src/falco
 abs_top_builddir = /home/mh-hannover.local/wolffjoa/src/falco
@@ -555,6 +555,7 @@ falcoAmadeus_SOURCES = \
 	src/html_template.hpp \
 	src/OptionParser.hpp \
 	src/smithlab_utils.hpp \
+	src/dup_hash_map.hpp \
 	src/aux.hpp
 
 TESTS = test/falco.test
@@ -993,6 +994,9 @@ distdir-am: $(DISTFILES)
 	    || exit 1; \
 	  fi; \
 	done
+	$(MAKE) $(AM_MAKEFLAGS) \
+	  top_distdir="$(top_distdir)" distdir="$(distdir)" \
+	  dist-hook
 	-test -n "$(am__skip_mode_fix)" \
 	|| find "$(distdir)" -type d ! -perm -755 \
 		-exec chmod u+rwx,go+rx {} \; -o \
@@ -1265,8 +1269,8 @@ uninstall-am: uninstall-binPROGRAMS
 .PHONY: CTAGS GTAGS TAGS all all-am am--depfiles am--refresh check \
 	check-TESTS check-am clean clean-binPROGRAMS clean-cscope \
 	clean-generic cscope cscopelist-am ctags ctags-am dist \
-	dist-all dist-bzip2 dist-gzip dist-lzip dist-shar dist-tarZ \
-	dist-xz dist-zip dist-zstd distcheck distclean \
+	dist-all dist-bzip2 dist-gzip dist-hook dist-lzip dist-shar \
+	dist-tarZ dist-xz dist-zip dist-zstd distcheck distclean \
 	distclean-compile distclean-generic distclean-hdr \
 	distclean-tags distcleancheck distdir distuninstallcheck dvi \
 	dvi-am html html-am info info-am install install-am \
@@ -1282,6 +1286,12 @@ uninstall-am: uninstall-binPROGRAMS
 
 .PRECIOUS: Makefile
 
+
+# EXTRA_DIST packs the whole test/ directory; keep stray in-tree test-suite
+# artifacts out of release tarballs (a shipped falco.log breaks the VPATH
+# test harness of make distcheck).
+dist-hook:
+	rm -f $(distdir)/test/*.log $(distdir)/test/*.trs
 
 # Tell versions [3.59,3.63) of GNU make to not export all variables.
 # Otherwise a system limit (for SysV at least) may be exceeded.
