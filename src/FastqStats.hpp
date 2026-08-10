@@ -20,7 +20,10 @@
 #include <vector>
 #include <iostream>
 #include <unordered_map>
+
+#include "dup_hash_map.hpp"
 #include <array>
+#include <cstdint>
 #include "FalcoConfig.hpp"
 // log of a power of two, to use in bit shifting for fast index acces
 // returns the log2 of a number if it is a power of two, or zero
@@ -185,9 +188,60 @@ struct FastqStats {
   std::array<size_t, kNumNucleotides * SHORT_READ_THRESHOLD> base_count;  // ATGC
   std::array<size_t, kNumNucleotides * SHORT_READ_THRESHOLD> n_base_count;  // N
 
+  // [FalcoAmadeus] SoA base counts [nucleotide*THRESHOLD + position], written by
+  // the AVX-512 sequence loop (contiguous vector accumulation) and folded into
+  // the AoS base_count by flush_soa() before the modules read it. uint32 is ample
+  // per thread (<< 4e9 reads); flushed per worker at merge and once at output.
+  std::array<std::uint32_t, kNumNucleotides * SHORT_READ_THRESHOLD> soa_base;
+  void flush_soa();  // fold soa_base into base_count
+
+  // [FalcoAmadeus] uint8 base-composition tile, same SoA layout as soa_base
+  // [code*THRESHOLD + pos] (4 x 500 = 2 KB, fully L1-resident). The AVX-512
+  // sequence loop increments it with ONE masked byte-add per code per 64-byte
+  // block (4 vector RMWs) instead of four uint32 sub-vector RMWs per code (16).
+  // Three-level flush chain, each level folded by commutative integer adds so
+  // the final totals are byte-identical to the direct scatter:
+  //   base_tile8 --flush_tile8()--> soa_base --flush_soa()--> base_count.
+  // flush_tile8() runs (a) inside the AVX-512 loop every <= kBaseTileFlushReads
+  // reads -- uint8 overflow guard: a read contributes at most ONE count per
+  // (code,pos) cell (one base per position, matching exactly one code) and
+  // seq_simd_chunks runs at most once per read, so cells stay <= 200 < 255 --
+  // and (b) at the top of flush_soa() itself, so every existing and future
+  // flush_soa site (the only readers of soa_base) folds the tile first by
+  // construction. The scalar tail and NEON paths keep writing base_count /
+  // soa_base directly: different levels of the same chain, commutative adds,
+  // all flushed before any read of base_count.
+  std::array<std::uint8_t, kNumNucleotides * SHORT_READ_THRESHOLD> base_tile8;
+  std::uint32_t base_tile8_reads;  // reads accumulated since the last flush
+  static const std::uint32_t kBaseTileFlushReads = 200;
+  void flush_tile8();  // fold base_tile8 into soa_base
+
   /*********** PER QUALITY VALUE METRICS ****************/
   // Counts of quality in each base position
   std::array<size_t, kNumQualityValues * SHORT_READ_THRESHOLD> position_quality_count;
+
+  // [FalcoAmadeus] Transposed per-base quality tile [quality*THRESHOLD + pos].
+  // The straight `++position_quality_count[(pos << 7) | qv]` scatter walks a
+  // 512 KB size_t array with a 1 KB stride, so nearly every per-base RMW is an
+  // L2 access. The in-buffer quality writers increment this uint16 tile
+  // instead: quality-major rows put the ~4-8 quality levels a lane actually
+  // emits on a handful of L1-resident 1 KB rows. flush_qtile() folds the tile
+  // into position_quality_count by addition; integer adds commute, so the
+  // flushed totals equal the direct-scatter totals exactly (byte-identical),
+  // PROVIDED every read of position_quality_count happens after a flush.
+  // Flush points: every <= kQualTileFlushReads reads (uint16 overflow guard:
+  // a read contributes at most ONE count per (quality,pos) cell, so a cell
+  // holds <= 60000 < 65535 between flushes), per-worker at both
+  // merge-worker-stats sites (next to flush_soa), and once in write_results
+  // before the modules read. The long-read leftover path writes
+  // long_position_quality_count directly and is not tiled. Mixing direct
+  // position_quality_count writers (none remain in-buffer today) with tile
+  // writers would also be safe -- addition commutes -- as long as the tile is
+  // fully flushed before any read.
+  std::array<std::uint16_t, kNumQualityValues * SHORT_READ_THRESHOLD> qual_tile;
+  std::uint32_t qual_tile_reads;  // reads accumulated since the last flush
+  static const std::uint32_t kQualTileFlushReads = 60000;
+  void flush_qtile();  // fold qual_tile into position_quality_count
 
   // Counts of average quality (truncated) per sequence
   std::array<size_t, kNumQualityValues> quality_count;
@@ -224,12 +278,19 @@ struct FastqStats {
   std::array<size_t, Constants::max_adapters * SHORT_READ_THRESHOLD> pos_adapter_count;
 
   /*********** DUPLICATION ******************/
-  // First 100k unique sequences and how often they were seen
-  std::unordered_map <std::string, size_t> sequence_count;
+  // First 100k unique sequences and how often they were seen. Open-addressing
+  // map (dup_hash_map.hpp) instead of std::unordered_map: its node-chasing
+  // lookup was ~36% of a run's CPU. Same counting semantics -> identical QC.
+  DupHashMap sequence_count;
 
   /**************** FUNCTIONS ****************************/
-  // Default constructor that zeros everything
-  FastqStats();
+  // Default constructor that zeros everything. need_kmer controls whether the
+  // large (~65 MB) kmer_count table is allocated: the Kmer Content module is
+  // ignored by default (limits.txt), and when it is off kmer_count is never
+  // written, merged or read, so allocating/zeroing/freeing it -- once per master
+  // plus once per worker thread -- is pure overhead. Left true by default so any
+  // caller that does not thread do_kmer through still gets a safe full table.
+  explicit FastqStats(bool need_kmer = true);
 
   // Allocation of more read positions
   void allocate_new_base(const bool ignore_tile);

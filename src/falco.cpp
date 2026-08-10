@@ -32,7 +32,6 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
-#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -143,6 +142,8 @@ write_results(const FalcoConfig &falco_config, FastqStats &stats,
               const std::string &summary_filename,
               const std::string &data_filename,
               const std::string &report_filename) {
+  stats.flush_soa();  // fold AVX-512 SoA base counts into base_count
+  stats.flush_qtile();  // fold the quality tile before the modules read
 
   // Here we open the short summary ofstream
   std::ofstream summary_txt;
@@ -679,33 +680,70 @@ analyze_and_write(FalcoConfig &falco_config, const std::string &filename,
   /****************** END PROCESSING CONFIG *******************/
   if (!falco_config.quiet)
     log_process("Started reading file " + falco_config.filename);
-  FastqStats stats;  // allocate all space to summarize data
+  FastqStats stats(falco_config.do_kmer);  // allocate all space to summarize data
 
-  // Initializes a reader given the file format
+  // Initializes a reader given the file format. The parallel mmap/temp-file/
+  // fused paths need a seekable regular file; a pipe/stdin (seekable_input ==
+  // false) uses the streaming readers instead. The gz path is special: its
+  // streaming parallel driver (read_gz_parallel) works on a pipe, so piped gz
+  // still gets a parallel parse; only the seekable-only BGZF fast path is
+  // skipped.
+  const bool par = falco_config.threads >= 2 && falco_config.read_step == 1;
+  const bool par_seek = par && falco_config.seekable_input;
+  // [FalcoAmadeus] Seekable FASTQ/SAM with read_step == 1 routes through the
+  // byte-split drivers at EVERY thread count, including -t1: the drivers are
+  // byte-identical to the serial readers at any nthreads (the standing t1==tN
+  // invariance), and the in-place mmap parse skips the serial readers'
+  // per-line fgets copies. Pipes/stdin and read_step > 1 keep the streaming
+  // serial readers.
+  const bool bytesplit_seek =
+    falco_config.read_step == 1 && falco_config.seekable_input;
   if (falco_config.is_sam) {
     if (!falco_config.quiet)
       log_process("reading file as SAM format");
-    SamReader in(falco_config, stats.SHORT_READ_THRESHOLD);
-    read_stream_into_stats(in, stats, falco_config);
-    stats.adjust_tile_maps_len();
+    if (bytesplit_seek) {
+      // byte-split SAM driver (tile reconstructed inside), any thread count
+      read_sam_chunked(falco_config, stats, falco_config.threads);
+    }
+    else {
+      SamReader in(falco_config, stats.SHORT_READ_THRESHOLD);
+      read_stream_into_stats(in, stats, falco_config);
+      stats.adjust_tile_maps_len();
+    }
   }
 #ifdef USE_HTS
   else if (falco_config.is_bam) {
     if (!falco_config.quiet)
       log_process("reading file as BAM format");
-    BamReader in(falco_config, stats.SHORT_READ_THRESHOLD);
-    read_stream_into_stats(in, stats, falco_config);
-    stats.adjust_tile_maps_len();
+    if (par_seek) {
+      // parallel BAM (byte-identical; tile reconstructed inside). -t1 keeps the
+      // streaming serial reader: with no parallelism the extra offset-walk +
+      // temp-file write cost more than they save.
+      read_bam_fused(falco_config, stats, falco_config.threads);
+    }
+    else {
+      BamReader in(falco_config, stats.SHORT_READ_THRESHOLD);
+      read_stream_into_stats(in, stats, falco_config);
+      stats.adjust_tile_maps_len();
+    }
   }
 #endif
 
   else if (falco_config.is_fastq_gz) {
     if (!falco_config.quiet)
       log_process("reading file as gzipped FASTQ format");
-    // multi-threaded parser: background inflate + parallel per-read stats,
-    // byte-identical to single-threaded. Only for read_step == 1; the
-    // subsampling counter logic is left to the serial path otherwise.
-    if (falco_config.threads >= 2 && falco_config.read_step == 1) {
+    // multi-threaded parser: parallel (libdeflate/BGZF) decompression to RAM +
+    // chunked parallel parse, byte-identical to single-threaded. Only for
+    // read_step == 1; the subsampling counter logic is left to the serial path
+    // otherwise.
+    if (bytesplit_seek) {
+      // fused gz driver at every thread count: -t1 also gains the in-place
+      // chunk parse over the serial reader's per-line getline copies
+      read_gz_chunked(falco_config, stats, falco_config.threads);
+    }
+    else if (par) {
+      // piped/stdin gz: skip the seek-dependent BGZF fast path and stream the
+      // single DEFLATE stream (ISA-L) into the parallel dispatcher.
       read_gz_parallel(falco_config, stats, falco_config.threads);
     }
     else {
@@ -716,8 +754,16 @@ analyze_and_write(FalcoConfig &falco_config, const std::string &filename,
   else if (falco_config.is_fastq) {
     if (!falco_config.quiet)
       log_process("reading file as uncompressed FASTQ format");
-    FastqReader in(falco_config, stats.SHORT_READ_THRESHOLD);
-    read_stream_into_stats(in, stats, falco_config);
+    // multi-threaded parser: memory-mapped dispatch + parallel per-read stats,
+    // byte-identical to single-threaded. Only for read_step == 1 (same reason
+    // as the gzipped path).
+    if (bytesplit_seek) {
+      read_uncompressed_chunked(falco_config, stats, falco_config.threads);
+    }
+    else {
+      FastqReader in(falco_config, stats.SHORT_READ_THRESHOLD);
+      read_stream_into_stats(in, stats, falco_config);
+    }
   }
   else {
     throw std::runtime_error("Cannot recognize file format for file " +
@@ -819,7 +865,9 @@ write_combined_paired_report(const std::string &out_file,
     ".stage iframe{position:absolute;inset:0;width:100%;height:100%;border:0;visibility:hidden;}"
     ".stage iframe.show{visibility:visible;}"
     "</style></head><body>"
-    "<div class=\"pbar\"><div class=\"ptitle\">FalcoAmadeus</div>"
+    "<div class=\"pbar\">"
+    "<button id=\"onav\" class=\"tgl\" title=\"Show / hide the summary sidebar\">&#9776;</button>"
+    "<div class=\"ptitle\">FalcoAmadeus</div>"
     "<div class=\"ptabs\">"
     "<button data-v=\"c\" class=\"active\">Combined (R1+R2)</button>"
     "<button data-v=\"f\">Forward (R1)</button>"
@@ -837,16 +885,19 @@ write_combined_paired_report(const std::string &out_file,
     "</div>"
     "<script>(function(){var root=document.documentElement,"
     "btns=document.querySelectorAll('.ptabs button'),frames=document.querySelectorAll('.stage iframe'),"
-    "tgl=document.getElementById('otgl'),psel=document.getElementById('opal');"
-    "var theme=root.getAttribute('data-theme')||'dark',pal='ocean';"
+    "tgl=document.getElementById('otgl'),psel=document.getElementById('opal'),"
+    "nav=document.getElementById('onav');"
+    "var theme=root.getAttribute('data-theme')||'dark',pal='ocean',navc=false;"
     "try{var sp=localStorage.getItem('falco-palette');if(sp)pal=sp;}catch(e){}"
+    "try{navc=localStorage.getItem('falco-nav')==='1';}catch(e){}"
     "psel.value=pal;tgl.innerHTML=(theme==='dark')?'&#9728;':'&#9790;';"
     // strip each inner report's own header and sync it to the shared controls
     "function prep(f){try{var d=f.contentDocument,w=f.contentWindow;"
     "var h=d.querySelector('.header');if(h)h.style.display='none';"
     "var sb=d.querySelector('.summary');if(sb){sb.style.top='1em';sb.style.height='calc(100vh - 2.5em)';}"
     "var mn=d.querySelector('.main');if(mn)mn.style.paddingTop='1em';"
-    "if(w.falcoSetTheme)w.falcoSetTheme(theme);if(w.falcoSetPalette)w.falcoSetPalette(pal);}catch(e){}}"
+    "if(w.falcoSetTheme)w.falcoSetTheme(theme);if(w.falcoSetPalette)w.falcoSetPalette(pal);"
+    "if(w.falcoSetNav)w.falcoSetNav(navc);}catch(e){}}"
     "frames.forEach(function(f){if(f.contentDocument&&f.contentDocument.readyState==='complete')prep(f);"
     "f.addEventListener('load',function(){prep(f);});});"
     // shared controls broadcast to every mate view
@@ -855,6 +906,8 @@ write_combined_paired_report(const std::string &out_file,
     "frames.forEach(function(f){try{if(f.contentWindow.falcoSetTheme)f.contentWindow.falcoSetTheme(theme);}catch(e){}});};"
     "psel.onchange=function(){pal=psel.value;try{localStorage.setItem('falco-palette',pal);}catch(e){}"
     "frames.forEach(function(f){try{if(f.contentWindow.falcoSetPalette)f.contentWindow.falcoSetPalette(pal);}catch(e){}});};"
+    "nav.onclick=function(){navc=!navc;try{localStorage.setItem('falco-nav',navc?'1':'0');}catch(e){}"
+    "frames.forEach(function(f){try{if(f.contentWindow.falcoSetNav)f.contentWindow.falcoSetNav(navc);}catch(e){}});};"
     "function sy(f){try{return f.contentWindow.pageYOffset||f.contentWindow.document.documentElement.scrollTop||0;}catch(e){return 0;}}"
     "function show(v){var cur=null,i;for(i=0;i<frames.length;i++){if(frames[i].classList.contains('show'))cur=frames[i];}"
     "var y=cur?sy(cur):0,next=null;"
@@ -1113,6 +1166,13 @@ main(int argc, char *argv[]) {
 
     std::vector<std::string> leftover_args;
     opt_parse.parse(argc, argv, leftover_args);
+    // [FalcoAmadeus] "-" is the conventional alias for stdin; normalize it to
+    // /dev/stdin at the source so every downstream check and reader treats it as
+    // an ordinary path. Piped input carries no extension and so requires
+    // --format (enforced in FalcoConfig::setup).
+    for (auto &fn : leftover_args)
+      if (fn == "-")
+        fn = "/dev/stdin";
     if (argc == 1 || opt_parse.help_requested()) {
       std::cerr << opt_parse.help_message() << '\n'
                 << opt_parse.about_message() << '\n';
@@ -1179,6 +1239,10 @@ main(int argc, char *argv[]) {
     if (!allow_empty_input) {
       for (const auto &fn : leftover_args) {
         std::error_code ec;
+        // [FalcoAmadeus] only a regular file has a checkable size; a pipe/stdin
+        // (or device) cannot be probed for emptiness, so skip the check for it.
+        if (!std::filesystem::is_regular_file(fn, ec))
+          continue;
         const bool empty_file = std::filesystem::is_empty(fn, ec);
         if (ec) {
           std::cerr << "Error reading file: " << fn << " (" << ec.message()
@@ -1226,7 +1290,7 @@ main(int argc, char *argv[]) {
     }
     const std::vector<std::string> all_seq_filenames(leftover_args);
 
-    // check if all filenames exist
+    // check if all filenames exist (leftover_args already has "-" -> /dev/stdin)
     bool all_files_exist = true;
     for (std::size_t i = 0; i < std::size(all_seq_filenames); ++i) {
       if (!std::filesystem::exists(all_seq_filenames[i])) {

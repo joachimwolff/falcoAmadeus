@@ -53,9 +53,10 @@ original.
   `--paired-data mates|combined|both` chooses whether MultiQC gets the two mates
   separately or a single pooled sample per pair.
 
-- **Multi-threaded gzip parsing** (`-t N`). Gzip decompression runs on a
-  background thread overlapped with parsing; output is byte-identical to the
-  single-threaded default.
+- **Multi-threaded parsing of every input format** (`-t N`). FASTQ, gzipped
+  FASTQ, SAM and BAM all parse in parallel, and the same fast drivers serve
+  single-threaded runs too. Output is byte-identical to upstream falco at
+  every thread count.
 
 A Galaxy tool wrapper exposing these features is maintained separately as
 `tools-iuc/tools/falcoAmadeus`.
@@ -75,30 +76,65 @@ read-pair summary at the top):
 
 ## Speed improvements
 
-Optimizations are confined to the input parser (`src/StreamReader.*`), which
-profiling showed to be the dominant cost:
+FalcoAmadeus replaces falco's serial input path with parallel, format-aware
+drivers, while keeping the output byte-identical (verified against the
+upstream checksum suite and against single-threaded output at every thread
+count, for every change):
 
-- Hoist the (virtual) `is_eof()` check out of the per-base loops, where it was
-  being called tens of millions of times.
-- Cache the per-tile quality/count vectors once per read instead of doing
-  three hash-map lookups on every quality base.
-- Use a large explicit `setvbuf` buffer for FASTQ/SAM reading, cutting
-  `read()` syscalls from ~51,700 to ~220 on a 200&nbsp;MB file; enlarge zlib's
-  inflate buffer via `gzbuffer` for gzipped input.
-- Single-lookup duplication hashing with buffer reuse instead of a double
-  lookup plus a fresh string allocation per read.
+- **Parallel parsing for every input format.** Uncompressed FASTQ and SAM are
+  memory-mapped and parsed in place across record-aligned byte ranges. BAM is
+  decompressed and parsed in overlapped, double-buffered chunks (BGZF blocks
+  inflate in parallel with libdeflate). Plain gzip inflates with ISA-L into
+  bounded chunks that are parsed in parallel while the next chunk
+  decompresses. Single-core runs use the same drivers, so `-t 1` is fast too.
+- **SIMD statistics kernels** (AVX-512 on x86, NEON on ARM, scalar fallback):
+  the sequence pass (separator scan, N detection, GC, per-position base
+  composition into small cache-resident accumulator tiles), the quality pass,
+  chain-free adapter window probes, and BAM's packed-base decode including
+  reverse-complement.
+- **Order-exact parallel bookkeeping.** Everything order-dependent (the
+  duplication tracker's first-100k-unique semantics, the floating-point GC
+  model, read subsampling) reproduces the serial trajectory exactly; that is
+  what keeps the output byte-identical rather than approximately equal.
+- **Bounded memory.** Inputs stream through reused chunk buffers with
+  drop-behind page management, so peak memory stays flat (roughly 35 to
+  250&nbsp;MB depending on format and thread count) no matter how large the
+  input is.
 
-Measured best-of-N wall-clock on commodity hardware (page cache warm):
+### Benchmark: 163 million reads, three tools, four formats
 
-| Input                                   | falco   | FalcoAmadeus | Speedup |
-| --------------------------------------- | ------: | -----------: | ------: |
-| Uncompressed FASTQ (200&nbsp;MB)        | 0.83&nbsp;s | 0.62&nbsp;s | ~1.34x |
-| Diverse FASTQ (118&nbsp;MB, 500k reads) | 1.04&nbsp;s | 0.72&nbsp;s | ~1.44x |
-| Gzipped FASTQ (64&nbsp;MB)              | 1.28&nbsp;s | 0.99&nbsp;s | ~1.29x |
-| SAM (46&nbsp;MB)                        | 0.22&nbsp;s | 0.18&nbsp;s | ~1.22x |
+Wall time on 163,264,569 reads (SRR10315318), AMD Ryzen 9 7950X (16
+cores/32 threads), 125&nbsp;GB RAM, NVMe storage, warm page cache; medians of
+two interleaved runs (falco 1.3.1 is single-threaded and was run once per
+format):
 
-Peak memory is unchanged: falco already streams input, so resident memory is
-constant regardless of file size.
+| Input | falco 1.3.1 | falco2 `-t 8` | FalcoAmadeus `-t 8` | falco2 `-t 16` | FalcoAmadeus `-t 16` |
+| ----- | ----------: | ------------: | ------------------: | -------------: | -------------------: |
+| FASTQ (38.8&nbsp;GB)    | 192.5&nbsp;s | 6.5&nbsp;s  | **5.4&nbsp;s**  | 4.2&nbsp;s  | **3.6&nbsp;s**  |
+| FASTQ.gz (4.4&nbsp;GB)  | 231.6&nbsp;s | 47.3&nbsp;s | **18.6&nbsp;s** | 45.0&nbsp;s | **17.3&nbsp;s** |
+| SAM (39.1&nbsp;GB)      | 203.7&nbsp;s | n/a*        | **5.6&nbsp;s**  | n/a*        | **5.7&nbsp;s**  |
+| BAM (4.0&nbsp;GB)       | 191.5&nbsp;s | 8.7&nbsp;s  | **7.8&nbsp;s**  | 6.8&nbsp;s  | **6.1&nbsp;s**  |
+
+Peak resident memory for the same runs:
+
+| Input | falco 1.3.1 | falco2 `-t 8` | FalcoAmadeus `-t 8` | falco2 `-t 16` | FalcoAmadeus `-t 16` |
+| ----- | ----------: | ------------: | ------------------: | -------------: | -------------------: |
+| FASTQ    | 90&nbsp;MB | 276&nbsp;MB | **205&nbsp;MB** | 290&nbsp;MB | **223&nbsp;MB** |
+| FASTQ.gz | 89&nbsp;MB | 284&nbsp;MB | **133&nbsp;MB** | 308&nbsp;MB | **147&nbsp;MB** |
+| SAM      | 90&nbsp;MB | n/a*        | 224&nbsp;MB     | n/a*        | 239&nbsp;MB     |
+| BAM      | 90&nbsp;MB | 211&nbsp;MB | **169&nbsp;MB** | 216&nbsp;MB | **185&nbsp;MB** |
+
+\* falco2 reads 0 of the 163.3M records from this samtools-generated SAM
+file, so its SAM cells are not comparable. FalcoAmadeus and falco 1.3.1 both
+process all reads.
+
+FalcoAmadeus is faster than falco2 in every valid cell while using less
+memory, and 12x (gzip) to 53x (FASTQ) faster than single-threaded falco
+1.3.1. At `-t 1` it also beats falco2's single-core runs on every format
+(measured on a 30M-read set: FASTQ 4.1&nbsp;s vs 5.7&nbsp;s, gzip 5.2&nbsp;s
+vs 9.7&nbsp;s, BAM 5.9&nbsp;s vs 7.9&nbsp;s, at 4 to 8 times less memory).
+
+[![Three-tool benchmark, 163M reads](img/benchmark_3tool_163M.png)](img/benchmark_3tool_163M.png)
 
 The binary is installed and invoked as `falcoAmadeus`. Apart from the program
 name and the added options above, all usage is identical to upstream falco.
@@ -223,7 +259,7 @@ FalcoAmadeus-specific options:
 | `--assay TYPE` | Assay-aware pass/warn/fail grading (`rnaseq`, `amplicon`, `wgbs`/`emseq`/`rrbs`, `chipseq`, `atac`, `smallrna`, `wgs`, …; default `generic` is byte-identical to falco). |
 | `--conversion-residual F` | For bisulfite assays, the residual unmethylated-base fraction (0–1) above which a possible incomplete-conversion warning is emitted. |
 | `--name NAME` | Sample name for the report `Filename` / MultiQC, instead of the input basename. |
-| `-t, --threads N` | Overlap gzip decompression with parsing on a background thread (byte-identical output). |
+| `-t, --threads N` | Parse with N threads; works for FASTQ, gzipped FASTQ, SAM and BAM (byte-identical output at every thread count). |
 
 The FastQC-compatible options carried over from falco — `-o/--outdir`,
 `-f/--format`, `-c/--contaminants`, `-a/--adapters`, `-l/--limits`, `--nogroup`,

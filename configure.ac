@@ -59,6 +59,43 @@ AS_IF([test "x$enable_hts" = "xyes"],
 )
 AM_CONDITIONAL([ENABLE_HTS], [test "x$enable_hts" = "xyes"])
 
+dnl With HTSLib enabled, optionally use libdeflate directly for parallel BGZF
+dnl block decompression (both are external libraries). Falls back gracefully.
+have_libdeflate=no
+AS_IF([test "x$enable_hts" = "xyes"],
+  [AC_CHECK_HEADER([libdeflate.h],
+    [AC_CHECK_LIB([deflate], [libdeflate_gzip_decompress],
+      [have_libdeflate=yes
+       LIBS="-ldeflate $LIBS"], [])], [])]
+)
+AM_CONDITIONAL([HAVE_LIBDEFLATE], [test "x$have_libdeflate" = "xyes"])
+
+dnl Optionally use Intel ISA-L igzip for fast streaming gzip inflate. Independent
+dnl of HTSLib -- it accelerates the plain (non-BGZF) gzip path, whose single
+dnl DEFLATE stream cannot be parallel-decompressed. Falls back to zlib/htslib.
+have_isal=no
+AC_CHECK_HEADER([isa-l/igzip_lib.h],
+  [AC_CHECK_LIB([isal], [isal_inflate],
+    [have_isal=yes
+     LIBS="-lisal $LIBS"], [])], [])
+AM_CONDITIONAL([HAVE_ISAL], [test "x$have_isal" = "xyes"])
+
+dnl Optional rapidgzip (header-only, MIT): parallel decompression of arbitrary
+dnl single-stream gzip. Point --with-rapidgzip at the librapidarchive/src
+dnl directory of a rapidgzip checkout. Requires zlib (already mandatory).
+AC_ARG_WITH([rapidgzip],
+  [AS_HELP_STRING([--with-rapidgzip=DIR],
+     [rapidgzip source dir (librapidarchive/src) for parallel gzip inflate])],
+  [rapidgzip_dir=$withval], [rapidgzip_dir=no])
+have_rapidgzip=no
+AS_IF([test "x$rapidgzip_dir" != "xno"],
+  [AS_IF([test -f "$rapidgzip_dir/rapidgzip/ParallelGzipReader.hpp"],
+     [have_rapidgzip=yes
+      RAPIDGZIP_CPPFLAGS="-I$rapidgzip_dir -I$rapidgzip_dir/core -I$rapidgzip_dir/huffman -I$rapidgzip_dir/indexed_bzip2"
+      AC_SUBST([RAPIDGZIP_CPPFLAGS])],
+     [AC_MSG_FAILURE([rapidgzip/ParallelGzipReader.hpp not found under $rapidgzip_dir])])])
+AM_CONDITIONAL([HAVE_RAPIDGZIP], [test "x$have_rapidgzip" = "xyes"])
+
 AC_CONFIG_FILES([Makefile])
 dnl make the test data files available in the build tree
 AC_CONFIG_LINKS([

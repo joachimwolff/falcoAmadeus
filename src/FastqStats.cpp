@@ -33,6 +33,8 @@ const size_t FastqStats::kDupReadTruncateSize;
 const size_t FastqStats::kBitShiftNucleotide;
 const size_t FastqStats::kBitShiftQuality;
 const size_t FastqStats::kBitShiftAdapter;
+const std::uint32_t FastqStats::kQualTileFlushReads;
+const std::uint32_t FastqStats::kBaseTileFlushReads;
 
 // To make the gc models static const
 static std::array<GCModel, FastqStats::SHORT_READ_THRESHOLD>
@@ -48,7 +50,46 @@ make_gc_models() {
 /******************** FASTQ STATS FUNCTIONS *********************/
 /****************************************************************/
 // Default constructor
-FastqStats::FastqStats() {
+void
+FastqStats::flush_soa() {
+  // The byte tile feeds soa_base: fold it first so every flush_soa call site
+  // (the only readers of soa_base) sees the full totals by construction.
+  flush_tile8();
+  for (std::size_t n = 0; n < kNumNucleotides; ++n) {
+    const std::uint32_t *src = &soa_base[n * SHORT_READ_THRESHOLD];
+    for (std::size_t p = 0; p < SHORT_READ_THRESHOLD; ++p)
+      base_count[(p << kBitShiftNucleotide) | n] += src[p];
+  }
+  soa_base.fill(0);
+}
+
+// Fold the uint8 base-composition tile into soa_base (see the FastqStats.hpp
+// comment for the flush-chain / overflow invariants). Both arrays share the
+// SoA [code*THRESHOLD + pos] layout, so this is a straight elementwise add;
+// addition commutes, so the totals are byte-identical to the direct scatter.
+void
+FastqStats::flush_tile8() {
+  for (std::size_t i = 0; i < base_tile8.size(); ++i)
+    soa_base[i] += base_tile8[i];
+  base_tile8.fill(0);
+  base_tile8_reads = 0;
+}
+
+// Fold the transposed quality tile into position_quality_count (see the
+// FastqStats.hpp comment for the flush-point / overflow invariants). Addition
+// commutes, so the result is byte-identical to the direct scatter.
+void
+FastqStats::flush_qtile() {
+  for (std::size_t q = 0; q < kNumQualityValues; ++q) {
+    const std::uint16_t *src = &qual_tile[q * SHORT_READ_THRESHOLD];
+    for (std::size_t p = 0; p < SHORT_READ_THRESHOLD; ++p)
+      position_quality_count[(p << kBitShiftQuality) | q] += src[p];
+  }
+  qual_tile.fill(0);
+  qual_tile_reads = 0;
+}
+
+FastqStats::FastqStats(bool need_kmer) {
   lowest_char = std::numeric_limits<char>::max();
   encoding_offset = 0;
 
@@ -66,15 +107,25 @@ FastqStats::FastqStats() {
 
   // Initialize IO arrays
   base_count.fill(0);
+  soa_base.fill(0);
+  base_tile8.fill(0);
+  base_tile8_reads = 0;
   n_base_count.fill(0);
   read_length_freq.fill(0);
   quality_count.fill(0);
   gc_count.fill(0);
   position_quality_count.fill(0);
+  qual_tile.fill(0);
+  qual_tile_reads = 0;
   pos_kmer_count.fill(0);
   pos_adapter_count.fill(0);
-  kmer_count =
-    std::vector<size_t>(SHORT_READ_THRESHOLD * (Constants::kmer_mask + 1), 0);
+  // Only the Kmer Content module touches kmer_count; when it is disabled leave
+  // the table empty (the write sites are guarded by do_kmer, the merge bounds
+  // itself to master.kmer_count.size(), and the module -- hence every read of
+  // kmer_count -- is skipped, so nothing indexes it).
+  if (need_kmer)
+    kmer_count =
+      std::vector<size_t>(SHORT_READ_THRESHOLD * (Constants::kmer_mask + 1), 0);
 }
 
 // Initialize as many gc models as fast bases

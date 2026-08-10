@@ -31,6 +31,13 @@
 // Optional zlib usage
 #include <zlib.h>
 
+// Optional Intel ISA-L igzip (fast vectorized gzip inflate)
+#ifdef USE_ISAL
+#include <cstdint>
+#include <cerrno>
+#include <isa-l/igzip_lib.h>
+#endif
+
 // Memory map
 #include <unistd.h>
 #include <fcntl.h>
@@ -63,13 +70,18 @@ get_truncate_point(const std::size_t read_pos) {
 // addition is not associative, so a reordered sum would not be byte-identical);
 // instead each worker stores one of these and a single serial pass replays them
 // in global read order, reproducing the exact sequential floating-point result.
+// Packed into 4 bytes (bitfields) so the per-read array stays small at scale:
+// at 50M reads a 12-byte record was ~600 MB; this is ~200 MB. The stored values
+// are tiny -- kind 1: a=trunc_length, b=trunc_gc, both <= SHORT_READ_THRESHOLD
+// (500); kind 2: a = the GC percentage bin (0..100), which is all the discrete
+// path needs (it just does ++gc_count[a]); so 15 bits each is ample.
 struct GCRecord {
   // 0 = no contribution (empty read or GC module off)
-  // 1 = short read, use the cached gc model with (a=trunc_length, b=trunc_gc)
-  // 2 = long read, discrete bin with (a=read_pos, b=cur_gc_count)
-  uint8_t kind;
-  uint32_t a;
-  uint32_t b;
+  // 1 = short read, cached gc model at (a=trunc_length, b=trunc_gc)
+  // 2 = long read, discrete bin a = 100*gc/read_pos (the percent), b unused
+  uint32_t b : 15;
+  uint32_t a : 15;
+  uint32_t kind : 2;
 };
 
 // Generic class that does as much as possible without assuming file format
@@ -122,6 +134,11 @@ class StreamReader{
   const size_t adapter_mask;
   const std::array<size_t, Constants::max_adapters> adapters;
   std::bitset<Constants::max_adapters> adapters_found{};
+
+  // [FalcoAmadeus] Presence bitmap over the low bits of the packed adapter
+  // k-mer, for a one-bit fast reject before the per-base per-adapter scan.
+  std::vector<std::uint64_t> adapter_present;
+  size_t adapter_bm_mask = 0;
 
   const std::string filename;
 
@@ -210,6 +227,21 @@ class StreamReader{
   inline void skip_separator();  // keep going forward while = separator
   inline void read_tile_line(FastqStats &stats);  // get tile from read name
   inline void read_sequence_line(FastqStats &stats);  // parse sequence
+  // [FalcoAmadeus] Portable SIMD fast path (AVX-512 / NEON; see .cpp).
+  void seq_simd_chunks(FastqStats &stats, const char *&c, size_t &rp,
+                         size_t bsz, char sep, char *buf, size_t &gc, size_t &nba,
+                         size_t &kmer, size_t &next_trunc);
+  // [FalcoAmadeus] SIMD quality-line pass (AVX-512; see .cpp): vector separator
+  // scan / byte-min / byte-sum plus a tight scalar histogram scatter. Only runs
+  // when hard_end is set (it bounds the 64-byte loads); otherwise the scalar
+  // loop below is used unchanged.
+  void qual_simd_chunks(FastqStats &stats, const char *&c, size_t &rp,
+                          size_t bsz, char sepf, char sepl, size_t &cq,
+                          char &lowest);
+  // One past the end of the buffer cur_char points into (mmap / arena / chunk /
+  // line buffer); set by the drivers so SIMD passes can bound wide loads.
+  // nullptr (the default) disables the SIMD quality pass.
+  const char *hard_end = nullptr;
   inline void read_quality_line(FastqStats &stats);  // parse quality
 
   /************ FUNCTIONS FOR PROGRESS BAR ***********/
@@ -296,6 +328,430 @@ class GzBlockDecompressor {
   size_t compressed_offset() const { return comp_offset.load(); }
 };
 
+#ifdef USE_ISAL
+/*******************************************************/
+/*************** ISA-L GZ DECOMPRESSOR *****************/
+/*******************************************************/
+// Shared ISA-L igzip inflate engine: pulls compressed bytes from a file
+// descriptor and produces decompressed bytes on demand with ISA-L's vectorized
+// inflate (markedly faster than zlib on a single DEFLATE stream). The fd may be
+// a regular file or a pipe/stdin (only ::read is used, never a seek), so it
+// drives both the block reader and the line reader below. Transparently steps
+// across concatenated multi-member gzip. Not thread-safe: one owner at a time.
+class IsalInflater {
+ private:
+  int fd_ = -1;
+  bool own_fd_ = true;
+  std::string path_;
+  std::vector<uint8_t> in_buf_;      // compressed input staging
+  struct inflate_state state_;
+  bool input_eof_ = false;           // no more compressed bytes from the fd
+  std::atomic<size_t> comp_read_{0};  // total compressed bytes read (progress)
+
+ public:
+  // Open `path` (use "/dev/stdin" for a pipe); or adopt an already-open fd.
+  explicit IsalInflater(const std::string &path, int fd = -1)
+      : path_(path), in_buf_(1u << 20) {
+    if (fd >= 0) { fd_ = fd; own_fd_ = false; }
+    else {
+      fd_ = ::open(path.c_str(), O_RDONLY);
+      if (fd_ < 0)
+        throw std::runtime_error("Cannot open gzip FASTQ file : " + path);
+#ifdef POSIX_FADV_SEQUENTIAL
+      posix_fadvise(fd_, 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
+    }
+    isal_inflate_init(&state_);
+    state_.crc_flag = ISAL_GZIP;  // parse the gzip header/trailer, verify crc
+  }
+  ~IsalInflater() { if (own_fd_ && fd_ >= 0) ::close(fd_); }
+  IsalInflater(const IsalInflater &) = delete;
+  IsalInflater &operator=(const IsalInflater &) = delete;
+
+  size_t compressed_offset() const { return comp_read_.load(); }
+
+  // Read into buf[off, cap) looping over short reads so the returned span is as
+  // large as possible (a pipe delivers only what is buffered per ::read). This
+  // keeps the gzip header/trailer contiguous in `in_buf_`, which ISA-L's wrapper
+  // parser needs -- a header split across tiny pipe reads fails validation.
+  size_t read_full(size_t off, size_t cap) {
+    size_t got = off;
+    while (got < cap) {
+      const ssize_t n = ::read(fd_, in_buf_.data() + got, cap - got);
+      if (n < 0) {
+        if (errno == EINTR)
+          continue;
+        break;  // read error -> treat what we have as the end
+      }
+      if (n == 0)
+        break;  // EOF
+      got += static_cast<size_t>(n);
+    }
+    const size_t new_bytes = got - off;
+    if (new_bytes)
+      comp_read_.fetch_add(new_bytes, std::memory_order_relaxed);
+    return got;
+  }
+
+  // Decompress up to `cap` bytes into `out`; returns bytes produced, 0 only at
+  // true end of stream. Refills compressed input as needed and steps across
+  // concatenated gzip members. Throws on a genuine inflate error.
+  size_t fill(char *out, size_t cap) {
+    state_.next_out = reinterpret_cast<uint8_t *>(out);
+    state_.avail_out = static_cast<uint32_t>(cap);
+    while (state_.avail_out > 0) {
+      if (state_.avail_in == 0 && !input_eof_) {
+        const size_t got = read_full(0, in_buf_.size());
+        if (got == 0)
+          input_eof_ = true;
+        else {
+          state_.next_in = in_buf_.data();
+          state_.avail_in = static_cast<uint32_t>(got);
+        }
+      }
+      if (state_.avail_in == 0 && input_eof_)
+        break;  // nothing left to feed
+      const int ret = isal_inflate(&state_);
+      if (ret != ISAL_DECOMP_OK)
+        throw std::runtime_error("ISA-L inflate error (" + std::to_string(ret) +
+                                 ") on : " + path_);
+      if (state_.block_state == ISAL_BLOCK_FINISH) {
+        // Finished one gzip member. Peek for a concatenated next member; make
+        // sure at least the 2 magic bytes are contiguous at the buffer front.
+        if (state_.avail_in < 2 && !input_eof_) {
+          size_t off = 0;
+          if (state_.avail_in == 1) { in_buf_[0] = state_.next_in[0]; off = 1; }
+          const size_t got = read_full(off, in_buf_.size());
+          if (got == off)
+            input_eof_ = true;
+          state_.next_in = in_buf_.data();
+          state_.avail_in = static_cast<uint32_t>(got);
+        }
+        if (state_.avail_in >= 2 && state_.next_in[0] == 0x1f &&
+            state_.next_in[1] == 0x8b) {
+          uint8_t *keep_in = state_.next_in;
+          const uint32_t keep_av = state_.avail_in;
+          isal_inflate_reset(&state_);
+          state_.crc_flag = ISAL_GZIP;
+          state_.next_in = keep_in;   // reset clears these; restore the member
+          state_.avail_in = keep_av;
+        } else {
+          input_eof_ = true;          // trailing bytes are not another member
+          break;
+        }
+      }
+    }
+    return cap - state_.avail_out;
+  }
+};
+
+// Streaming gzip reader for the PARALLEL path: a background thread inflates
+// fixed-size blocks (bounded pool) while the dispatcher consumes them via
+// getline. Same interface as GzBlockDecompressor / BgzfBlockReader.
+class IsalBlockReader {
+ private:
+  IsalInflater inf_;
+  const size_t block_size_;
+  std::vector<std::vector<char>> blocks_;  // fixed pool of decompressed blocks
+  std::vector<size_t> lens_;
+  std::queue<int> free_q_, filled_q_;
+  std::mutex mtx_;
+  std::condition_variable free_cv_, filled_cv_;
+  std::thread worker_;
+  bool producer_done_ = false, stop_requested_ = false;
+  std::string err_;                  // set if the background inflate failed
+
+  int cur_idx_ = -1;
+  size_t cur_pos_ = 0, cur_len_ = 0;
+  bool consumed_eof_ = false;
+
+  void producer_loop() {
+    while (true) {
+      int idx;
+      {
+        std::unique_lock<std::mutex> lk(mtx_);
+        free_cv_.wait(lk, [&] { return !free_q_.empty() || stop_requested_; });
+        if (stop_requested_)
+          return;
+        idx = free_q_.front();
+        free_q_.pop();
+      }
+      size_t n = 0;
+      std::string e;
+      try {
+        n = inf_.fill(blocks_[idx].data(), block_size_);
+      } catch (const std::exception &ex) {
+        e = ex.what();
+      }
+      std::lock_guard<std::mutex> lk(mtx_);
+      if (n > 0 && e.empty()) {
+        lens_[idx] = n;
+        filled_q_.push(idx);
+      } else {
+        free_q_.push(idx);
+        producer_done_ = true;
+        if (!e.empty())
+          err_ = e;
+        filled_cv_.notify_one();
+        return;
+      }
+      filled_cv_.notify_one();
+    }
+  }
+
+  bool ensure_data() {
+    if (cur_idx_ >= 0 && cur_pos_ < cur_len_)
+      return true;
+    if (cur_idx_ >= 0) {
+      {
+        std::lock_guard<std::mutex> lk(mtx_);
+        free_q_.push(cur_idx_);
+      }
+      free_cv_.notify_one();
+      cur_idx_ = -1;
+    }
+    std::unique_lock<std::mutex> lk(mtx_);
+    filled_cv_.wait(lk, [&] { return !filled_q_.empty() || producer_done_; });
+    if (filled_q_.empty()) {  // producer finished and nothing left to consume
+      consumed_eof_ = true;
+      if (!err_.empty()) {
+        const std::string e = err_;
+        lk.unlock();
+        throw std::runtime_error(e);
+      }
+      return false;
+    }
+    cur_idx_ = filled_q_.front();
+    filled_q_.pop();
+    cur_pos_ = 0;
+    cur_len_ = lens_[cur_idx_];
+    return true;
+  }
+
+ public:
+  IsalBlockReader(const std::string &path, size_t bs, int npool)
+      : inf_(path), block_size_(bs) {
+    blocks_.resize(npool);
+    lens_.assign(npool, 0);
+    for (int i = 0; i < npool; ++i) {
+      blocks_[i].resize(block_size_);
+      free_q_.push(i);
+    }
+    worker_ = std::thread(&IsalBlockReader::producer_loop, this);
+  }
+  ~IsalBlockReader() {
+    {
+      std::lock_guard<std::mutex> lk(mtx_);
+      stop_requested_ = true;
+    }
+    free_cv_.notify_all();
+    filled_cv_.notify_all();
+    if (worker_.joinable())
+      worker_.join();
+  }
+  IsalBlockReader(const IsalBlockReader &) = delete;
+  IsalBlockReader &operator=(const IsalBlockReader &) = delete;
+
+  // Copy one line (up to and including '\n', NUL-terminated) into dst, exactly
+  // like gzgets. Returns bytes written (0 only at end of stream).
+  size_t getline(char *dst, size_t maxlen) {
+    size_t i = 0;
+    const size_t lim = maxlen - 1;
+    while (i < lim) {
+      if (!ensure_data())
+        break;
+      const std::vector<char> &blk = blocks_[cur_idx_];
+      while (cur_pos_ < cur_len_ && i < lim) {
+        const char c = blk[cur_pos_++];
+        dst[i++] = c;
+        if (c == '\n') {
+          dst[i] = '\0';
+          return i;
+        }
+      }
+    }
+    dst[i] = '\0';
+    return i;
+  }
+
+  bool eof() const { return consumed_eof_; }
+  size_t compressed_offset() const { return inf_.compressed_offset(); }
+};
+
+// Synchronous ISA-L gzip line reader for the SERIAL (-t1) path: no background
+// thread, inflates one buffer at a time inline in getline. Same getline/eof
+// interface as gzgets, so GzFastqReader can drive it in place of zlib.
+class IsalLineReader {
+ private:
+  IsalInflater inf_;
+  std::vector<char> buf_;   // one decompressed staging buffer
+  size_t pos_ = 0, len_ = 0;
+  bool eof_ = false;
+
+  bool refill() {
+    len_ = inf_.fill(buf_.data(), buf_.size());
+    pos_ = 0;
+    if (len_ == 0) { eof_ = true; return false; }
+    return true;
+  }
+
+ public:
+  explicit IsalLineReader(const std::string &path, size_t bufsize = (1u << 22))
+      : inf_(path), buf_(bufsize) {}
+
+  size_t getline(char *dst, size_t maxlen) {
+    size_t i = 0;
+    const size_t lim = maxlen - 1;
+    while (i < lim) {
+      if (pos_ >= len_ && !refill())
+        break;
+      while (pos_ < len_ && i < lim) {
+        const char c = buf_[pos_++];
+        dst[i++] = c;
+        if (c == '\n') {
+          dst[i] = '\0';
+          return i;
+        }
+      }
+    }
+    dst[i] = '\0';
+    return i;
+  }
+
+  bool eof() const { return eof_ && pos_ >= len_; }
+  size_t compressed_offset() const { return inf_.compressed_offset(); }
+};
+#endif  // USE_ISAL
+
+/*******************************************************/
+/*********** PLAIN (UNCOMPRESSED) LINE SOURCE **********/
+/*******************************************************/
+// A line source over an uncompressed FASTQ file exposing the exact getline() /
+// eof() interface of GzBlockDecompressor, so the parallel dispatcher can drive
+// it unchanged. The whole file is memory-mapped (MADV_SEQUENTIAL), so getline
+// is a memchr('\n') + memcpy out of the page cache with no per-line syscall.
+class PlainBlockReader {
+ private:
+  int fd_ = -1;
+  void *map_ = MAP_FAILED;
+  size_t maplen_ = 0;
+  const char *p_ = nullptr;
+  const char *end_ = nullptr;
+
+ public:
+  explicit PlainBlockReader(const std::string &fn) {
+    fd_ = open(fn.c_str(), O_RDONLY);
+    if (fd_ < 0)
+      throw std::runtime_error("Cannot open FASTQ file : " + fn);
+    struct stat st;
+    if (fstat(fd_, &st) != 0)
+      throw std::runtime_error("Cannot stat FASTQ file : " + fn);
+    maplen_ = static_cast<size_t>(st.st_size);
+    if (maplen_ == 0)
+      return;  // empty file: p_ == end_ == nullptr -> immediate eof
+    map_ = mmap(nullptr, maplen_, PROT_READ, MAP_PRIVATE, fd_, 0);
+    if (map_ == MAP_FAILED)
+      throw std::runtime_error("Cannot mmap FASTQ file : " + fn);
+    madvise(map_, maplen_, MADV_SEQUENTIAL);
+    p_ = static_cast<const char *>(map_);
+    end_ = p_ + maplen_;
+  }
+  ~PlainBlockReader() {
+    if (map_ != MAP_FAILED && map_ != nullptr)
+      munmap(map_, maplen_);
+    if (fd_ >= 0)
+      close(fd_);
+  }
+  PlainBlockReader(const PlainBlockReader &) = delete;
+  PlainBlockReader &operator=(const PlainBlockReader &) = delete;
+
+  // Copy one line (up to and including '\n', NUL-terminated) into dst, exactly
+  // like GzBlockDecompressor::getline. Returns bytes written (0 at end).
+  size_t getline(char *dst, size_t maxlen) {
+    if (p_ >= end_)
+      return 0;
+    const size_t avail = static_cast<size_t>(end_ - p_);
+    const size_t lim = std::min(avail, maxlen - 1);
+    const char *nl = static_cast<const char *>(memchr(p_, '\n', lim));
+    const size_t n = nl ? static_cast<size_t>(nl - p_) + 1 : lim;
+    std::memcpy(dst, p_, n);
+    dst[n] = '\0';
+    p_ += n;
+    return n;
+  }
+  bool eof() const { return p_ >= end_; }
+
+  // Direct access to the memory-mapped bytes, for the zero-copy chunked parser.
+  const char *data() const { return p_; }
+  size_t size() const { return static_cast<size_t>(end_ - p_); }
+};
+
+#ifdef USE_HTS
+// A gzip/BGZF line source backed by htslib's BGZF reader, exposing the same
+// getline()/eof() interface as GzBlockDecompressor. htslib decompresses with
+// libdeflate (both external libraries), and for BGZF (bgzip) input it inflates
+// the blocks in parallel across n_threads via bgzf_mt -- so bgzip'd files
+// decompress on multiple cores instead of a single zlib stream. Plain gzip is
+// read as one stream but still with libdeflate. Reads big blocks with
+// bgzf_read and splits lines in place to avoid a per-line allocation.
+class BgzfBlockReader {
+ private:
+  BGZF *fp_ = nullptr;
+  std::vector<char> buf_;
+  size_t pos_ = 0, len_ = 0;
+  bool eof_ = false;
+  bool fill() {
+    const ssize_t n = bgzf_read(fp_, buf_.data(), buf_.size());
+    if (n <= 0) {
+      eof_ = true;
+      pos_ = len_ = 0;
+      return false;
+    }
+    len_ = static_cast<size_t>(n);
+    pos_ = 0;
+    return true;
+  }
+
+ public:
+  BgzfBlockReader(const std::string &path, int n_threads, size_t bufsize) {
+    fp_ = bgzf_open(path.c_str(), "r");
+    if (fp_ == nullptr)
+      throw std::runtime_error("Cannot open gzip FASTQ file : " + path);
+    if (n_threads > 1)
+      bgzf_mt(fp_, n_threads, 256);
+    buf_.resize(bufsize);
+  }
+  ~BgzfBlockReader() {
+    if (fp_ != nullptr)
+      bgzf_close(fp_);
+  }
+  BgzfBlockReader(const BgzfBlockReader &) = delete;
+  BgzfBlockReader &operator=(const BgzfBlockReader &) = delete;
+
+  // Copy one line (up to and including '\n', NUL-terminated) into dst, exactly
+  // like GzBlockDecompressor::getline. Returns bytes written (0 only at end).
+  size_t getline(char *dst, size_t maxlen) {
+    size_t i = 0;
+    const size_t lim = maxlen - 1;
+    while (i < lim) {
+      if (pos_ >= len_ && !fill())
+        break;
+      while (pos_ < len_ && i < lim) {
+        const char c = buf_[pos_++];
+        dst[i++] = c;
+        if (c == '\n') {
+          dst[i] = '\0';
+          return i;
+        }
+      }
+    }
+    dst[i] = '\0';
+    return i;
+  }
+  bool eof() const { return eof_ && pos_ >= len_; }
+};
+#endif  // USE_HTS
+
 /*******************************************************/
 /*************** READ FASTQ GZ RCORD *******************/
 /*******************************************************/
@@ -306,9 +762,16 @@ class GzFastqReader : public StreamReader {
   static const size_t GZ_BLOCK_SIZE = (1<<22);  // 4 MiB decompressed blocks
   static const int GZ_NUM_BLOCKS = 6;           // bounded prefetch (~24 MiB)
   char *gzbuf;
-  gzFile fileobj;
   const bool threaded;              // overlap decompression on a bg thread
+#ifdef USE_ISAL
+  // ISA-L igzip backends: a background block reader when threaded, otherwise a
+  // synchronous single-thread line reader. Exactly one is non-null after load.
+  IsalBlockReader *idecomp = nullptr;
+  IsalLineReader *iserial = nullptr;
+#else
+  gzFile fileobj;
   GzBlockDecompressor *decomp;      // non-null only when threaded
+#endif
 
  public:
   GzFastqReader(FalcoConfig &fc, const size_t _buffer_size);
@@ -343,6 +806,39 @@ class ParallelWorker : public StreamReader {
 // read_step == 1; the caller falls back otherwise.
 void read_gz_parallel(FalcoConfig &config, FastqStats &master, size_t nthreads);
 
+// Multi-threaded uncompressed-FASTQ driver. Same dispatcher / worker / merge
+// machinery as read_gz_parallel (hence the same byte-identical result), but the
+// serial dispatcher pulls lines from a memory-mapped file instead of a
+// background inflater. Only valid for read_step == 1.
+void read_uncompressed_parallel(FalcoConfig &config, FastqStats &master,
+                                size_t nthreads);
+
+// Fully parallel (chunked, zero-copy) uncompressed-FASTQ driver: each thread
+// parses its own memory-mapped byte range in place, with duplication handled by
+// a short serial prefix plus parallel occurrence counting. Byte-identical to the
+// single-threaded pass; read_step == 1 only.
+void read_uncompressed_chunked(FalcoConfig &config, FastqStats &master,
+                               size_t nthreads);
+
+// [FalcoAmadeus] Parallel SAM driver: mmap the text, byte-split into per-thread
+// line ranges, parse in place. Byte-identical to the serial SamReader.
+void read_sam_chunked(FalcoConfig &config, FastqStats &master, size_t nthreads);
+
+// Gzip/BGZF driver: decompress the whole file to RAM (BGZF blocks inflated in
+// parallel via htslib bgzf_mt + libdeflate), then parse it with the chunked
+// parallel parser. Byte-identical; read_step == 1 only. Falls back to
+// read_gz_parallel when built without htslib.
+void read_gz_chunked(FalcoConfig &config, FastqStats &master, size_t nthreads);
+
+// [FalcoAmadeus] Fully parallel BAM driver: decompress the BGZF to a temp file
+// (drop-behind), walk the record offsets serially (cheap), then parse records in
+// parallel across nthreads, byte-identical to the serial BamReader path.
+void read_bam_chunked(FalcoConfig &config, FastqStats &master, size_t nthreads);
+
+// [FalcoAmadeus] FUSED BAM driver: decompress one chunk at a time into a reused
+// huge-page buffer and parse it, never materialising the whole stream.
+void read_bam_fused(FalcoConfig &config, FastqStats &master, size_t nthreads);
+
 /*******************************************************/
 /*************** READ SAM RECORD ***********************/
 /*******************************************************/
@@ -374,7 +870,16 @@ class BamReader : public StreamReader {
   bam_hdr_t *hdr;
   bam1_t *b;
   int rd_ret, fmt_ret;
+  int n_threads = 1;   // htslib decompression thread pool size
   char *last;
+  // [FalcoAmadeus] reused scratch for the ASCII-decoded SEQ (nibbles unpacked
+  // once, then fed through the shared base-class sequence engine)
+  std::vector<char> decode_buf;
+  // reused scratch for reversed qual of reads longer than the static buffer
+  std::vector<char> qual_rev_scratch;
+  // read_quality_line body on an explicit qual pointer (shared with the
+  // in-place parallel path)
+  void quality_pass(const char *qptr, std::size_t seq_len, FastqStats &stats);
  public:
   BamReader(FalcoConfig &fc, const size_t _buffer_size);
   size_t load();
@@ -385,6 +890,21 @@ class BamReader : public StreamReader {
   inline void read_sequence_line(FastqStats &stats);
   inline void read_quality_line(FastqStats &stats);  // parse quality
   inline void put_base_in_buffer(const size_t pos);  // puts base in buffer or leftover
+
+  // [FalcoAmadeus] parallel-BAM support: a worker owns a reusable bam1_t and is
+  // handed raw on-disk records (pointer past the 4-byte block_size, length bs).
+  void bam_worker_init();                       // allocate b, enter parallel mode
+  void bam_load_raw(const char *rec, uint32_t bs);   // fill b from raw bytes + revcomp
+  // full per-record processing into `stats` for global read index g; returns the
+  // sequence length and reports the parsed tile in tile_cur_out.
+  size_t process_record_parallel(const char *rec, uint32_t bs, FastqStats &stats,
+                                 GCRecord *gcr, size_t g, size_t &tile_cur_out);
+  // tile-less variant that parses the on-disk record bytes in place (no copy,
+  // no revcomp pass, no writes into the chunk buffer)
+  size_t process_record_parallel_inplace(const char *rec, FastqStats &stats,
+                                         GCRecord *gcr, size_t g);
+  // decode just the duplication key (truncated, reverse-complemented) into dst.
+  void decode_key(const char *rec, uint32_t bs, char *dst, size_t &keylen);
   ~BamReader();
 };
 #endif

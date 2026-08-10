@@ -1749,6 +1749,7 @@ ModuleSequenceDuplicationLevels::ModuleSequenceDuplicationLevels(
   grade_dup_warn = grade_dup.find("warn")->second;
   grade_dup_error = grade_dup.find("error")->second;
   assay = config.assay_profile;
+  nthreads = std::max<std::size_t>(1, config.threads);
 }
 
 void
@@ -1758,17 +1759,38 @@ ModuleSequenceDuplicationLevels::summarize_module(FastqStats &stats) {
 
   // Key is frequenccy (r), value is number of times we saw a sequence
   // with that frequency (Nr)
-  for (auto v : stats.sequence_count) {
-    if (counts_by_freq.count(v.second) == 0) {
-      counts_by_freq[v.second] = 0;
-    }
+  // [FalcoAmadeus] iterate by const reference: the by-value loop copied every
+  // (sequence, count) pair -- 100k heap-allocated std::string copies -- which
+  // was ~0.19 s of the run, dwarfing the actual counting. operator[] already
+  // value-initializes an absent key to 0, so the count() pre-check was a
+  // redundant second lookup. Same keys, same increments -> identical result.
+  for (const auto &v : stats.sequence_count)
     counts_by_freq[v.second]++;
-  }
 
   // Now we change it to the FastQC corrected extrapolation
-  for (auto v : counts_by_freq) {
-    counts_by_freq[v.first] = get_corrected_count(
-      stats.count_at_limit, stats.num_reads, v.first, v.second);
+  // [FalcoAmadeus] get_corrected_count runs an O(count_at_limit) product per
+  // DISTINCT frequency (FastQC's own algorithm) -- measured ~0.19 s on a 30M
+  // read file, the single largest post-parse cost. The per-frequency
+  // computations are independent, so run them in parallel: each key's
+  // arithmetic (and its double -> size_t store) is exactly the serial
+  // expression, values are written back per key, and every LATER reader of
+  // counts_by_freq iterates the untouched map structure -- byte-identical.
+  {
+    std::vector<std::pair<std::size_t, std::size_t>> freqs;
+    freqs.reserve(counts_by_freq.size());
+    for (const auto &v : counts_by_freq)
+      freqs.emplace_back(v.first, v.second);
+    std::vector<double> corrected(freqs.size());
+    const std::size_t nf = freqs.size();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic) num_threads(nthreads) \
+  if (nthreads > 1 && nf > 32)
+#endif
+    for (std::size_t i = 0; i < nf; ++i)
+      corrected[i] = get_corrected_count(stats.count_at_limit, stats.num_reads,
+                                         freqs[i].first, freqs[i].second);
+    for (std::size_t i = 0; i < nf; ++i)
+      counts_by_freq[freqs[i].first] = corrected[i];
   }
 
   // Group in blocks similarly to fastqc
@@ -1971,9 +1993,17 @@ ModuleOverrepresentedSequences::summarize_module(FastqStats &stats) {
       overrep_sequences.push_back(*it);
     }
   }
-  // sort strings by frequency
+  // Sort by frequency, breaking ties by the sequence itself. This is a
+  // deterministic total order, so the listing is reproducible regardless of
+  // the duplication map's iteration order (the open-addressing map in
+  // dup_hash_map.hpp does not iterate in the same order as std::unordered_map,
+  // and unordered_map's order is itself non-portable across libstdc++ versions).
   std::sort(std::begin(overrep_sequences), std::end(overrep_sequences),
-            [](const auto &a, const auto &b) { return a.second > b.second; });
+            [](const auto &a, const auto &b) {
+              if (a.second != b.second)
+                return a.second > b.second;
+              return a.first < b.first;
+            });
 }
 
 void

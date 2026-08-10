@@ -92,7 +92,16 @@ div.summary ul li a::before {
 div.summary ul li a.pass::before { background:var(--pass); }
 div.summary ul li a.warn::before { background:var(--warn); }
 div.summary ul li a.fail::before { background:var(--fail); }
-div.main { margin-left:var(--sidebar-w); padding:1.5em 2em 4.5em; max-width:1180px; }
+div.main {
+  /* Center the content when there is room, but never let it slide under the
+     fixed sidebar. margin-left is the page-centering offset, floored at the
+     sidebar width; it does NOT depend on whether the sidebar is shown, so
+     toggling the menu never moves the modules -- on a wide screen they stay
+     centered where they were; on a narrow one they stay clear of the sidebar. */
+  margin-left:max(var(--sidebar-w), calc((100% - 1180px) / 2));
+  margin-right:auto;
+  padding:1.5em 2em 4.5em; max-width:1180px;
+}
 div.module {
   background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
   box-shadow:var(--shadow); padding:1.35em 1.7em 1.6em; margin-bottom:1.5em;
@@ -196,6 +205,22 @@ select.palette-select {
   background-repeat:no-repeat; background-position:right .8em center;
 }
 select.palette-select:hover { border-color:var(--brand); }
+button.sidebar-toggle {
+  border:1px solid var(--border); background:var(--surface-2); color:var(--text);
+  border-radius:999px; width:2.1em; height:2.1em; font-size:1.05rem; line-height:1;
+  cursor:pointer; display:inline-flex; align-items:center; justify-content:center;
+  padding:0; margin-right:.5em; flex:0 0 auto; transition:background .15s, transform .15s;
+}
+button.sidebar-toggle:hover { background:var(--brand); color:#fff; transform:scale(1.08); }
+/* Collapsed sidebar: hide the summary panel, and drop the sidebar reservation
+   from the content's left margin so the freed strip is actually used. The floor
+   only mattered to keep clear of the sidebar; with the sidebar gone the content
+   just centers (or, when the window is too narrow to center, fills the width).
+   On a wide screen this collapsed margin already equals the shown one (both are
+   the centering offset), so the graphics do NOT move; the content only reclaims
+   space on the narrower windows where the reservation was wasting it. */
+body.nav-collapsed div.summary { display:none; }
+body.nav-collapsed div.main { margin-left:max(0px, calc((100% - 1180px) / 2)); }
 /* Center the Plotly modebar icons inside their (hover) background squares. */
 .js-plotly-plot .modebar-btn { display:inline-flex !important; align-items:center; justify-content:center; }
 .js-plotly-plot .modebar-btn svg { vertical-align:middle; display:block; }
@@ -596,6 +621,44 @@ if (document.getElementById('kmerlineplot') !== null) {
     });
     sum.parentNode.insertBefore(btn,sum.nextSibling);
   }
+  // [FalcoAmadeus] Scroll to a module WITHOUT a document-level fragment
+  // navigation. In the paired combined report each view is a srcdoc iframe,
+  // where a plain href="#id" resolves against the PARENT url and reloads the
+  // whole paired page inside the frame (producing a duplicate top bar).
+  // Intercepting the click and scrolling keeps navigation inside this
+  // document, and lets us offset for the sticky header so the target title
+  // is not hidden underneath it.
+  document.querySelectorAll('a[href^="#"]').forEach(function(a){
+    var href=a.getAttribute('href'); if(!href||href==='#') return;
+    a.addEventListener('click',function(e){
+      var t=document.getElementById(href.slice(1)); if(!t) return;
+      e.preventDefault();
+      var hdr=document.querySelector('div.header');
+      var off=(hdr&&getComputedStyle(hdr).display!=='none')?hdr.offsetHeight+12:12;
+      var y=t.getBoundingClientRect().top+(window.pageYOffset||document.documentElement.scrollTop)-off;
+      window.scrollTo({top:y,behavior:'smooth'});
+    });
+  });
+})();
+
+// [FalcoAmadeus] Collapsible summary sidebar: a header toggle hides the
+// sidebar and lets the modules use the full width (useful on small screens).
+// The state is persisted, and exposed via falcoSetNav so the paired combined
+// report can drive every mate view from one shared control.
+(function(){
+  var body=document.body;
+  function apply(c){ body.classList.toggle('nav-collapsed',c);
+    try{localStorage.setItem('falco-nav',c?'1':'0');}catch(e){} }
+  var init=false; try{init=localStorage.getItem('falco-nav')==='1';}catch(e){}
+  var t=document.createElement('button'); t.className='sidebar-toggle';
+  t.title='Show / hide the summary sidebar'; t.setAttribute('aria-label','Toggle sidebar');
+  t.innerHTML='&#9776;';
+  t.onclick=function(){ apply(!body.classList.contains('nav-collapsed')); };
+  var hdr=document.querySelector('div.header');
+  if(hdr) hdr.insertBefore(t,hdr.firstChild);
+  apply(init);
+  window.falcoSetNav=function(c){ apply(!!c); };
+  window.falcoNav=function(){ return body.classList.contains('nav-collapsed'); };
 })();
 
 // [FalcoAmadeus] dark-mode toggle (persisted) that also re-themes the plots
