@@ -1,5 +1,5 @@
 {% set name = "falcoamadeus" %}
-{% set version = "1" %}
+{% set version = "2" %}
 
 package:
   name: {{ name }}
@@ -7,7 +7,9 @@ package:
 
 source:
   url: https://github.com/joachimwolff/falcoAmadeus/archive/refs/tags/v{{ version }}.tar.gz
-  sha256: 665aac96987c28e14a45c9465dc5723b893af4e5ed9d40b8e38e3edef28f86e1
+  # placeholder: recompute after tagging v2, e.g.
+  #   curl -sL <url> | sha256sum
+  sha256: 0000000000000000000000000000000000000000000000000000000000000000
 
 build:
   number: 0
@@ -28,6 +30,8 @@ requirements:
   host:
     - zlib
     - htslib
+    - libdeflate  # parallel BGZF decompression (BAM, bgzip FASTQ)
+    - isa-l       # fast plain-gzip inflate
     - llvm-openmp  # [osx]
   run:
     - htslib
