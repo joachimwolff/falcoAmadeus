@@ -14,8 +14,8 @@ dnl  WITHOUT ANY WARRANTY; without even the implied warranty of
 dnl  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
 dnl  General Public License for more details.
 
-AC_INIT([FalcoAmadeus], [1], [],
-        [falcoAmadeus], [https://github.com/joachimwolff/falco])
+AC_INIT([FalcoAmadeus], [2], [],
+        [falcoAmadeus], [https://github.com/joachimwolff/falcoAmadeus])
 dnl the config.h is not currently #included in the source, and only
 dnl used to keep command lines short.
 AC_CONFIG_HEADERS([config.h])
