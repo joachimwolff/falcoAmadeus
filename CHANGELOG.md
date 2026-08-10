@@ -1,5 +1,35 @@
 # Changelog
 
+## FalcoAmadeus 3
+
+A portability and memory release, verified end to end on Apple Silicon
+(M3 Pro, macOS 26.6) with byte-identical output to the Linux build.
+
+### Fixed
+
+- **macOS builds compile again.** Two `madvise(..., MADV_HUGEPAGE)` calls
+  (Linux-only optimization hints, introduced with the v2 BAM work) broke the
+  macOS arm64 build at compile time; both are now compiled conditionally.
+- **BAM memory on macOS.** The BGZF block-index walk memory-mapped the whole
+  compressed file and relied on `MADV_DONTNEED` drop-behind, which Darwin
+  treats as a lazy hint: a 4&nbsp;GB BAM peaked at 3.1 to 3.8&nbsp;GB resident
+  on macOS. The walk now streams through a bounded 8&nbsp;MB `pread` window:
+  ~150&nbsp;MB peak on macOS (unchanged on Linux), and BAM runs about 30%
+  faster on Apple Silicon as a side effect.
+
+### Added
+
+- **macOS CI.** The push/PR pipeline now includes a macos job building with
+  the full optional dependency set (htslib, libdeflate, ISA-L), so
+  Darwin-only breakage is caught before release.
+
+### Notes
+
+- On Apple Silicon (163M reads, M3 Pro): BAM 9.7&nbsp;s at `-t 12`
+  (~36x falco 1.3.1), gzipped FASTQ 40&nbsp;s (~10x). falco2 cannot be built
+  on macOS at all (its source needs C++23 `std::views::enumerate`, which
+  libc++ does not implement).
+
 ## FalcoAmadeus 2
 
 A performance release: every input format now parses in parallel, and
