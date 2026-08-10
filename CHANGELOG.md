@@ -1,5 +1,77 @@
 # Changelog
 
+## FalcoAmadeus 2
+
+A performance release: every input format now parses in parallel, and
+single-threaded runs are faster too. Output remains **byte-identical** to
+upstream falco at every thread count; each change in this release was gated on
+the upstream md5 test suite, on diffs against the previous binary across all
+formats (including high-duplication and reverse-strand BAM inputs), and on
+`-t 1 == -t 8 == -t 16` output equality.
+
+### Added
+
+- **Parallel parsing for every input format** (`-t N`): uncompressed FASTQ and
+  SAM are memory-mapped and parsed in place across record-aligned byte ranges;
+  BAM decompresses and parses in overlapped, double-buffered chunks (BGZF
+  blocks inflate in parallel via libdeflate); plain gzip inflates with ISA-L
+  into bounded chunks parsed in parallel. Single-core runs use the same
+  drivers, so `-t 1` is faster as well.
+- **Standard input** (`-`): all formats can be read from a pipe
+  (`--format` required; the per-tile module is unavailable on pipes).
+- **ISA-L igzip** support for plain-gzip inflate (autodetected at configure
+  time, optional).
+- **rapidgzip backend** (optional, `--with-rapidgzip=DIR` at configure time,
+  enabled per run with `FA_RAPIDGZIP=1`): parallel decompression of large
+  plain-gzip files on machines with spare cores and memory.
+- README benchmark section with the 163M-read three-tool comparison
+  (falco 1.3.1, falco2, FalcoAmadeus) and the accompanying figure.
+
+### Performance
+
+Measured on 163,264,569 reads (AMD Ryzen 9 7950X, warm page cache),
+FalcoAmadeus at `-t 16`: FASTQ 3.6&nbsp;s, gzipped FASTQ 17.3&nbsp;s, SAM
+5.7&nbsp;s, BAM 6.1&nbsp;s. That is 12x (gzip) to 53x (FASTQ) faster than
+single-threaded falco 1.3.1 and faster than falco2 in every format at both
+`-t 8` and `-t 16`, at lower peak memory (133 to 239&nbsp;MB vs falco2's 211
+to 308&nbsp;MB). The main mechanisms:
+
+- SIMD statistics kernels (AVX-512, SSSE3 and BMI2 on x86, NEON on ARM,
+  scalar fallback everywhere): the sequence pass, the quality pass with
+  cache-resident accumulator tiles, chain-free adapter window probes, and
+  BAM packed-base decode including reverse-complement.
+- Order-exact parallel bookkeeping: duplication's first-100k-unique
+  semantics, the floating-point GC model and read subsampling reproduce the
+  serial trajectory exactly, which is what keeps output byte-identical.
+- Duplication tracker: open-addressing map keyed directly off the sequence
+  buffer, hash-fingerprint slot tags with a flat shadow key store, lazy
+  allocation in parallel workers, and prefetched split-phase lookups.
+- Bounded memory: inputs stream through reused chunk buffers with
+  drop-behind page management and cold-file readahead, so peak memory stays
+  flat (roughly 35 to 250&nbsp;MB by format and thread count) regardless of
+  input size.
+
+### Fixed
+
+- Default-adapter runs (no `adapter_list.txt` in the working directory,
+  i.e. every typical run) silently used the slow string-search matcher
+  instead of the optimized one; this upstream falco bug roughly doubled
+  whole-run cost on all formats.
+- `--version` printed `falco 1`; it now prints `falcoAmadeus 2`.
+- The overrepresented-sequences listing is sorted deterministically
+  (frequency, then sequence) regardless of hash-map iteration order.
+- Paired-view HTML report no longer renders a duplicate top bar; the module
+  sidebar is collapsible.
+- `make distcheck`: `src/dup_hash_map.hpp` is shipped in release tarballs,
+  committed test-suite artifacts were removed (with a dist-hook guard), and
+  VPATH builds get a `test/` log directory.
+
+### Changed
+
+- Version 2: the `fastqc_data.txt` header line is now `##FalcoAmadeus 2` and
+  the test-suite checksums were regenerated for it (outputs differ from
+  version 1 only in that line).
+
 ## FalcoAmadeus 1
 
 First release of **FalcoAmadeus**, a performance-focused and sequencing-aware
