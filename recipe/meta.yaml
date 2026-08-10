@@ -7,9 +7,7 @@ package:
 
 source:
   url: https://github.com/joachimwolff/falcoAmadeus/archive/refs/tags/v{{ version }}.tar.gz
-  # placeholder: recompute after tagging v2, e.g.
-  #   curl -sL <url> | sha256sum
-  sha256: 0000000000000000000000000000000000000000000000000000000000000000
+  sha256: a8eb5edb91f3f81608028f147c33342b464c86d5f55374943a62016df51e8000
 
 build:
   number: 0
