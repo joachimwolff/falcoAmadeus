@@ -4519,12 +4519,32 @@ bgzf_walk_index(const std::string &path) {
   if (fstat(fd, &stt) != 0) { close(fd); return r; }
   const std::size_t csize = static_cast<std::size_t>(stt.st_size);
   if (csize < 18) { close(fd); return r; }
-  const unsigned char *comp = static_cast<const unsigned char *>(
-    mmap(nullptr, csize, PROT_READ, MAP_PRIVATE, fd, 0));
-  if (comp == MAP_FAILED) { close(fd); return r; }
-  madvise(const_cast<unsigned char *>(comp), csize, MADV_SEQUENTIAL);
-  const std::size_t WPG = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
-  std::size_t wdrop = 0;
+  // Walk the block chain through a small sliding pread window instead of an
+  // mmap of the whole compressed file. The mmap variant relied on
+  // MADV_DONTNEED drop-behind to stay lean, but Darwin treats that as a lazy
+  // hint and kept the entire file resident (measured ~3.8 GB peak RSS on a
+  // 4 GB BAM on macOS); a bounded buffer costs the same one sequential read
+  // and is lean on every platform. A BGZF block is at most 65536 bytes, so a
+  // window refill from the current block offset always fits a whole block.
+  const std::size_t WIN = std::size_t(8) << 20;
+  std::vector<unsigned char> wbuf(WIN);
+  std::size_t wbase = 0, wlen = 0;  // file offset and valid bytes of the window
+  auto fill_from = [&](std::size_t off) {
+    wbase = off;
+    wlen = 0;
+    while (wlen < WIN) {
+      const ssize_t n = pread(fd, wbuf.data() + wlen,
+                              std::min(WIN - wlen, csize - off - wlen),
+                              static_cast<off_t>(off + wlen));
+      if (n <= 0)
+        break;
+      wlen += static_cast<std::size_t>(n);
+      if (off + wlen >= csize)
+        break;
+    }
+  };
+  // window-relative view of an absolute file offset (caller bounds-checks)
+  auto at = [&](std::size_t abs) { return wbuf.data() + (abs - wbase); };
   auto le16 = [](const unsigned char *q) {
     return static_cast<std::size_t>(q[0]) | (static_cast<std::size_t>(q[1]) << 8);
   };
@@ -4533,22 +4553,32 @@ bgzf_walk_index(const std::string &path) {
            (static_cast<std::size_t>(q[2]) << 16) |
            (static_cast<std::size_t>(q[3]) << 24);
   };
+  fill_from(0);
   std::size_t p = 0, utotal = 0;
   bool bgzf_ok = true;
   while (p + 18 <= csize) {
-    if (!(comp[p] == 0x1f && comp[p + 1] == 0x8b && comp[p + 2] == 8 &&
-          (comp[p + 3] & 4))) {
+    // ensure the window holds this block's header; a full block always fits
+    if (p + 18 > wbase + wlen)
+      fill_from(p);
+    if (p + 18 > wbase + wlen)
+      break;  // short read: treat like a truncated file
+    if (!(at(p)[0] == 0x1f && at(p)[1] == 0x8b && at(p)[2] == 8 &&
+          (at(p)[3] & 4))) {
       bgzf_ok = (p != 0);
       break;
     }
-    const std::size_t xlen = le16(comp + p + 10);
+    const std::size_t xlen = le16(at(p) + 10);
     std::size_t xp = p + 12;
     const std::size_t xe = xp + xlen;
+    if (xe > wbase + wlen && xe <= csize) {
+      fill_from(p);
+      if (xe > wbase + wlen) break;
+    }
     std::size_t bsize = 0;
     while (xp + 4 <= xe && xe <= csize) {
-      const std::size_t sl = le16(comp + xp + 2);
-      if (comp[xp] == 'B' && comp[xp + 1] == 'C' && sl == 2) {
-        bsize = le16(comp + xp + 4) + 1;
+      const std::size_t sl = le16(at(xp) + 2);
+      if (at(xp)[0] == 'B' && at(xp)[1] == 'C' && sl == 2) {
+        bsize = le16(at(xp) + 4) + 1;
         break;
       }
       xp += 4 + sl;
@@ -4557,7 +4587,11 @@ bgzf_walk_index(const std::string &path) {
       bgzf_ok = (p != 0 && bsize != 0);
       break;
     }
-    const std::size_t isize = le32(comp + p + bsize - 4);
+    if (p + bsize > wbase + wlen) {  // footer past the window: refill
+      fill_from(p);
+      if (p + bsize > wbase + wlen) break;
+    }
+    const std::size_t isize = le32(at(p + bsize - 4));
     if (isize > 0) {
       r.coff.push_back(p);
       r.clen.push_back(bsize);
@@ -4566,13 +4600,7 @@ bgzf_walk_index(const std::string &path) {
     }
     utotal += isize;
     p += bsize;
-    if (p - wdrop >= (std::size_t(16) << 20)) {  // release scanned headers
-      const std::size_t sa = (wdrop + WPG - 1) & ~(WPG - 1), sb = p & ~(WPG - 1);
-      if (sb > sa) madvise(const_cast<unsigned char *>(comp) + sa, sb - sa, MADV_DONTNEED);
-      wdrop = p;
-    }
   }
-  munmap(const_cast<unsigned char *>(comp), csize);  // decompression pread()s instead
   if (!bgzf_ok || r.coff.empty()) { close(fd); return r; }
   r.fd = fd; r.csize = csize; r.utotal = utotal; r.ok = true;
   return r;
