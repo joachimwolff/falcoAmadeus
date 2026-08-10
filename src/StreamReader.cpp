@@ -2685,6 +2685,18 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
     if (sb > sa)
       madvise(const_cast<char *>(base) + sa, sb - sa, MADV_DONTNEED);
   };
+  // Async readahead for a byte range of the file-backed mmap. On a cold file
+  // the dynamic sub-range scheduling interleaves eight fault cursors in one
+  // VMA, which defeats the kernel's sequential-readahead heuristic (measured
+  // 1.85 -> 1.3 GB/s on a 38.8 GB disk-resident input); WILLNEED restores deep
+  // sequential device queues. A pure hint with no semantic effect.
+  auto warm_range = [&](std::size_t a, std::size_t b) {
+    if (!can_drop || b <= a)
+      return;
+    const std::size_t sa = a & ~(PGSZ - 1);
+    const std::size_t sb = (b + PGSZ - 1) & ~(PGSZ - 1);
+    madvise(const_cast<char *>(base) + sa, sb - sa, MADV_WILLNEED);
+  };
 
   std::vector<std::unique_ptr<typename P::Worker>> workers(nthreads);
   std::vector<std::unique_ptr<FastqStats>> wstats(nthreads);
@@ -2819,6 +2831,9 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
           for (std::size_t r = 1; r <= nranges; ++r)
             if (sync[r] < sync[r - 1])
               sync[r] = sync[r - 1];
+          // prime the readahead pipeline: the first ranges (which also cover
+          // the dup prefix's bytes) start faulting before any thread parses
+          warm_range(sync[0], sync[std::min(nranges, 2 * nthreads)]);
 
           // -- duplication prefix continues across slices (global read order) -
           dup_stop = off;  // cap filled earlier: every record here is post-cap
@@ -2892,6 +2907,10 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
 #else
         const std::size_t tid = 0;
 #endif
+        // keep the readahead pipeline ~2*nthreads ranges deep: each consumed
+        // range asynchronously warms the one that will be parsed soon
+        if (r + 2 * nthreads < nranges)
+          warm_range(sync[r + 2 * nthreads], sync[r + 2 * nthreads + 1]);
         std::vector<GCRecord> &gc = replayer.parse_bufs()[r];
         gc.clear();  // capacity persists across slices
         typename P::Worker &w = *workers[tid];
