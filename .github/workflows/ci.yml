@@ -63,3 +63,41 @@ jobs:
             test-suite.log
             test/falco.log
           if-no-files-found: ignore
+
+  # macOS with the FULL optional dependency set. This must build htslib,
+  # libdeflate and ISA-L: large parts of StreamReader.cpp are compiled only
+  # under USE_HTS/USE_LIBDEFLATE/USE_ISAL, so a plain macOS build would give
+  # false confidence (the v2 MADV_HUGEPAGE breakage lived in exactly such a
+  # region and was first seen by bioconda's osx-arm64 builder).
+  build-and-test-macos:
+    name: Build and test (macos, hts+libdeflate+isal)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: brew install autoconf automake htslib libdeflate isa-l
+
+      - name: Generate the configure script
+        run: ./autogen.sh
+
+      - name: Configure
+        run: |
+          BREW_PREFIX="$(brew --prefix)"
+          ./configure --enable-hts \
+            CPPFLAGS="-I${BREW_PREFIX}/include" \
+            LDFLAGS="-L${BREW_PREFIX}/lib"
+
+      - name: Build
+        run: make -j3
+
+      - name: Run test suite (make check)
+        run: make check
+
+      - name: Show test log on failure
+        if: failure()
+        run: |
+          echo "===== test-suite.log ====="
+          cat test-suite.log 2>/dev/null || true
+          echo "===== test/falco.log ====="
+          cat test/falco.log 2>/dev/null || true

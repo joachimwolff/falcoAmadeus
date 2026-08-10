@@ -156,10 +156,12 @@ anaconda installer.
 
 > **Note:** the bioconda package is being submitted. Until it lands, build from
 > source (below). The bioconda recipe lives in [`recipe/`](recipe/); publishing
-> it requires pushing a `v1` release tag to this repository, filling in the
-> tarball `sha256` in [`recipe/meta.yaml`](recipe/meta.yaml), and opening a pull
-> request against
-> [bioconda-recipes](https://github.com/bioconda/bioconda-recipes).
+> version 2 requires pushing a `v2` release tag to this repository, filling in
+> the tarball `sha256` in [`recipe/meta.yaml`](recipe/meta.yaml), and opening a
+> pull request against
+> [bioconda-recipes](https://github.com/bioconda/bioconda-recipes). The conda
+> build links htslib, libdeflate and ISA-L, so it ships with full performance
+> on all input formats.
 
 ## Installing from a source release
 
@@ -211,13 +213,33 @@ $ sudo apt install zlib1g zlib1g-dev
 
 ### Optional C++ dependencies
 
-[htslib](https://github.com/samtools/htslib) is required to process BAM files.
-If not provided, BAM files are treated as unrecognized formats. To build with
-htslib, add `--enable-hts`:
+All of these are optional, detected at configure time, and fall back
+gracefully when absent -- but the first two are strongly recommended, since
+the fast parallel BAM and gzip paths depend on them:
+
+- [htslib](https://github.com/samtools/htslib) is required to process BAM
+  files (without it BAM is treated as an unrecognized format). Enable with
+  `--enable-hts`.
+- [libdeflate](https://github.com/ebiggers/libdeflate) powers parallel BGZF
+  block decompression (BAM and bgzip-compressed FASTQ). Detected
+  automatically when the header and library are installed.
+- [ISA-L](https://github.com/intel/isa-l) roughly doubles plain-gzip
+  decompression speed. Detected automatically.
+- [rapidgzip](https://github.com/mxmlnkn/rapidgzip) (header-only) can
+  decompress even a single plain-gzip stream in parallel. Build with
+  `--with-rapidgzip=<checkout>/librapidarchive/src` and enable per run with
+  `FA_RAPIDGZIP=1`; worthwhile for very large plain-gzip files on machines
+  with spare cores and memory.
+
+A typical full-performance build:
 
 ```
 $ ./configure CXXFLAGS="-O3 -Wall" --enable-hts
 ```
+
+with htslib, libdeflate and ISA-L installed where the compiler can find them
+(add their locations to `CPPFLAGS`/`LDFLAGS` if they live in a non-default
+prefix, e.g. a conda environment).
 
 Running FalcoAmadeus
 ====================
