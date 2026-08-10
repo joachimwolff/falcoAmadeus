@@ -56,8 +56,15 @@ falcoAmadeus_SOURCES = \
 	src/html_template.hpp \
 	src/OptionParser.hpp \
 	src/smithlab_utils.hpp \
+	src/dup_hash_map.hpp \
 	src/aux.hpp
 
 TESTS = test/falco.test
 TEST_EXTENSIONS = .test
 CLEANFILES = tests_build/test_data.tgz
+
+# EXTRA_DIST packs the whole test/ directory; keep stray in-tree test-suite
+# artifacts out of release tarballs (a shipped falco.log breaks the VPATH
+# test harness of make distcheck).
+dist-hook:
+	rm -f $(distdir)/test/*.log $(distdir)/test/*.trs

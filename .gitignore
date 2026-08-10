@@ -29,3 +29,8 @@ stamp-h1
 
 # the bioconda recipe build script is a source file, not a build artifact
 !recipe/build.sh
+# test-suite artifacts
+test/*.log
+test/*.trs
+test_output/
+test_build/
