@@ -437,14 +437,16 @@ struct GzFastqPairReader {
   }
 
   // Canonical read name: header without the leading '@', truncated at the first
-  // whitespace, with a trailing /1 or /2 mate token removed -- so the two mates
-  // of a pair share the same name.
+  // whitespace, with a trailing /1 or /2 (or .1 or .2, as written by
+  // fastq-dump --readids) mate token removed -- so the two mates of a pair
+  // share the same name.
   static std::string
   canonical_name(const std::string &h) {
     std::size_t b = (!h.empty() && h[0] == '@') ? 1 : 0;
     std::size_t e = h.find_first_of(" \t", b);
     std::string name = h.substr(b, (e == std::string::npos ? h.size() : e) - b);
-    if (name.size() >= 2 && name[name.size() - 2] == '/' &&
+    if (name.size() >= 2 &&
+        (name[name.size() - 2] == '/' || name[name.size() - 2] == '.') &&
         (name.back() == '1' || name.back() == '2'))
       name.erase(name.size() - 2);
     return name;
@@ -591,11 +593,12 @@ fingerprint_mate(const std::string &file) {
       if (!line(beg, h_e, h_n) || !line(h_n, s_e, s_n) ||
           !line(s_n, p_e, p_n) || !line(p_n, q_e, q_n))
         break;
-      // canonical name: drop '@', cut at whitespace, drop a /1 or /2 suffix
+      // canonical name: drop '@', cut at whitespace, drop a /1 or /2 (or
+      // .1 or .2) mate suffix, as canonical_name does
       std::size_t nb = beg + (buf[beg] == '@' ? 1 : 0), ne = nb;
       while (ne < h_e && buf[ne] != ' ' && buf[ne] != '\t')
         ++ne;
-      if (ne - nb >= 2 && buf[ne - 2] == '/' &&
+      if (ne - nb >= 2 && (buf[ne - 2] == '/' || buf[ne - 2] == '.') &&
           (buf[ne - 1] == '1' || buf[ne - 1] == '2'))
         ne -= 2;
       const std::size_t slen = s_e - h_n;

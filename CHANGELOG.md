@@ -22,7 +22,9 @@
 - **Mates out of order are rejected.** `--paired-with` accepted R1/R2 files
   whose read identifiers did not correspond and reported a duplicate rate
   for meaningless pairs. Mismatched identifiers now stop the run with an
-  explanatory error; `--allow-unmatched-pairs` overrides.
+  explanatory error; `--allow-unmatched-pairs` overrides. Mate suffixes
+  `/1`, `/2` and the `.1`, `.2` written by `fastq-dump --readids` are
+  recognised.
 
 ### Performance
 

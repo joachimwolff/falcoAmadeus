@@ -46,6 +46,16 @@ sim reorder --pairs 1000 --dup 0.25 --reorder-r2
 if run reorder; then echo "FAIL reorder: accepted mismatched mates"; fail=1
 else echo "ok   reorder: rejected mismatched mates"; fi
 
+# fastq-dump --readids naming (<spot>.1 / <spot>.2) pairs; shifted mates do not
+awk 'NR % 4 == 1 {$1 = $1 ".1"} {print}' "$W/dup25_R1.fastq" > "$W/sra_R1.fastq"
+awk 'NR % 4 == 1 {$1 = $1 ".2"} {print}' "$W/dup25_R2.fastq" > "$W/sra_R2.fastq"
+run sra
+expect sra "Paired-end exact" 25
+tail -n +5 "$W/sra_R2.fastq" > "$W/srashift_R2.fastq"
+head -n -4 "$W/sra_R1.fastq" > "$W/srashift_R1.fastq"
+if run srashift; then echo "FAIL srashift: accepted shifted mates"; fail=1
+else echo "ok   srashift: rejected shifted mates"; fi
+
 # thread invariance of the paired report
 for t in 1 8; do
   mkdir -p "$W/t$t"
