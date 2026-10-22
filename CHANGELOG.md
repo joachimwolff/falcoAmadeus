@@ -26,6 +26,37 @@
 
 ### Performance
 
+Measured on a 32-core Threadripper 7970X (whole machine, and pinned to 4
+cores / 8 hardware threads), cold and warm page cache, 1 to 32 threads, on
+public data (GSM4212622 10M reads; SRR14777166 29.9M reads as FASTQ, gzip,
+BGZF, SAM and BAM). falcoAmadeus is now faster than falco 2.0.3 and uses
+less memory in all 96 time and memory comparisons (falco 2.0.3 aborts on
+the SAM file); before these changes it lost 14.
+
+- **No cache-line sharing between parsing threads.** The per-range GC
+  record vectors and per-thread tile record vectors were adjacent objects
+  appended once per read by neighbouring threads. Each range now appends on
+  the parsing thread's stack. 29.9M reads, `-t 32`: 0.43 s (falco 2.0.3)
+  vs 0.53 s before, 0.33 s now.
+- **Cold-cache reads.** Uncompressed FASTQ that is not in the page cache is
+  read with sequential `pread` into the parse pipeline instead of being
+  memory-mapped (kernel readahead stays effective); the BGZF block index is
+  walked on a background thread instead of reading the whole compressed
+  file before the first chunk. BGZF `-t 8`, cold: 1.23 s to 0.90 s.
+- **Parallel BGZF FASTQ.** Block groups are read and inflated by the parse
+  team itself, overlapping the parse of the previous chunk.
+- **Lower fixed costs:** page-cache residency sampled at 1024 pages instead
+  of a full `mincore` walk (~70 ms on a 4 GB file); FastQC's duplication
+  extrapolation runs 8 duplication levels per AVX2 pass, bit-identical
+  (0.19 s to 0.075 s); GC models built lazily per read length (~9 ms); HTML
+  placeholders replaced without `std::regex` (~12 ms); no passive-wait
+  re-exec at `-t 1`; range boundaries found by the parsing threads.
+- **Memory:** per-thread duplication counts in 32-bit cells (folded into
+  the map before they could overflow), per-position quality tables in
+  calloc'd zero pages, 64 MB memory-mapped slices, and at most 8 threads
+  with 32 MB chunks for plain gzip, whose single serial inflater bounds the
+  throughput. Peak RSS at `-t 32`: FASTQ 179 MB (falco 2.0.3: 326 MB), gzip
+  111 MB (308 MB), BGZF 215 MB (236 MB), BAM 182 MB (222 MB).
 - Paired mode reads both mates concurrently in large ISA-L/zlib blocks and
   streams the pooled combined view instead of writing a concatenated
   temporary copy of both inputs (tiled input and builds without ISA-L keep
