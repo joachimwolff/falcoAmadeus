@@ -2727,13 +2727,15 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
 
   // Slice size scales with the thread count: parsed pages stay resident until
   // the slice's deferred drop, so the slice is the driver's RSS window. 16 MB
-  // per thread keeps -t1 near the serial readers' footprint while -t8+ keeps
-  // the full 128 MB slices. Slicing CANNOT affect output: the dup prefix,
+  // per thread keeps -t1 near the serial readers' footprint; slices are
+  // capped at 64 MB (from -t4), where two resident slices cost no more than
+  // falco2's mapped window and larger slices measured no faster. Slicing
+  // CANNOT affect output: the dup prefix,
   // range decomposition and GC replay all preserve the global record order
   // whatever the slice boundaries (and the t1..tN identity gate covers the
   // different slicings empirically).
   const std::size_t CHUNK =
-    std::min(std::size_t(128) << 20,
+    std::min(std::size_t(64) << 20,
              std::max(std::size_t(16) << 20, nthreads * (std::size_t(16) << 20)));
   const std::size_t PGSZ = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
   auto drop_range = [&](std::size_t a, std::size_t b) {
