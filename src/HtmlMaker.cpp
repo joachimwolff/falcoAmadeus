@@ -23,6 +23,33 @@
 #include <regex>
 #include <sstream>
 
+// [FalcoAmadeus] Replace every {{tag}} with `rep`, left to right, without
+// rescanning inserted text: the same result as the std::regex_replace calls
+// it replaces (which recompiled a regex and rescanned the whole template per
+// placeholder, ~12 ms per report). regex_replace interprets '$' sequences in
+// the replacement, so replacements containing '$' keep the regex path.
+static void
+replace_tag(std::string &s, const std::string &tag, const std::string &rep) {
+  const std::string lit = "{{" + tag + "}}";
+  if (rep.find('$') != std::string::npos) {
+    s = std::regex_replace(s, std::regex("\\{\\{" + tag + "\\}\\}"), rep);
+    return;
+  }
+  std::string out;
+  out.reserve(s.size() + rep.size());
+  std::size_t from = 0;
+  for (std::size_t pos = s.find(lit); pos != std::string::npos;
+       pos = s.find(lit, from)) {
+    out.append(s, from, pos - from);
+    out.append(rep);
+    from = pos + lit.size();
+  }
+  if (from == 0)
+    return;  // no occurrence: leave the string untouched
+  out.append(s, from, std::string::npos);
+  s.swap(out);
+}
+
 void
 HtmlMaker::put_data(const std::string &placeholder, const std::string &data) {
   auto pos = html_boilerplate.find(placeholder);
@@ -53,25 +80,16 @@ HtmlMaker::put_comment(std::string &comment_begin, std::string &comment_end,
 
 void
 HtmlMaker::put_file_details(const FalcoConfig &falco_config) {
-  using namespace std::string_literals;
-  static constexpr auto left_tag = "\\{\\{";
-  static constexpr auto right_tag = "\\}\\}";
-
   const auto filename_formatted = falco_config.filename_stripped;
-  std::regex filename_re(left_tag + "filename"s + right_tag);
-  html_boilerplate =
-    std::regex_replace(html_boilerplate, filename_re, filename_formatted);
+  replace_tag(html_boilerplate, "filename", filename_formatted);
 
   using system_clock = std::chrono::system_clock;
   auto time_unformatted = system_clock::to_time_t(system_clock::now());
   std::string time_formatted = std::string(ctime(&time_unformatted));
 
-  std::regex date_re(left_tag + "date"s + right_tag);
-  html_boilerplate =
-    std::regex_replace(html_boilerplate, date_re, time_formatted);
+  replace_tag(html_boilerplate, "date", time_formatted);
 
-  std::regex version_re(left_tag + "version"s + right_tag);
-  html_boilerplate = std::regex_replace(html_boilerplate, version_re, VERSION);
+  replace_tag(html_boilerplate, "version", VERSION);
 
   // [FalcoAmadeus] In paired-end mode, note inside the duplication module that
   // this rate is per-mate and name the partner file; the corrected paired rate
@@ -87,11 +105,8 @@ HtmlMaker::put_file_details(const FalcoConfig &falco_config) {
       "copy only when both mates match, is written to "
       "<code>paired_duplication.txt</code> in the parent directory.</p>";
   }
-  std::regex paired_re(left_tag + "pairednote"s + right_tag);
-  html_boilerplate = std::regex_replace(html_boilerplate, paired_re, paired_note);
+  replace_tag(html_boilerplate, "pairednote", paired_note);
 
   // [FalcoAmadeus] top-of-report banner for the pooled paired "combined" view.
-  std::regex combined_re(left_tag + "combinednote"s + right_tag);
-  html_boilerplate =
-    std::regex_replace(html_boilerplate, combined_re, falco_config.combined_note);
+  replace_tag(html_boilerplate, "combinednote", falco_config.combined_note);
 }
