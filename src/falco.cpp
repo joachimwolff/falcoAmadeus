@@ -45,6 +45,8 @@
 #include <thread>
 #include <cstring>
 #include <memory>
+#include <cstdlib>
+#include <unistd.h>
 
 #include <zlib.h>
 
@@ -1160,6 +1162,20 @@ write_combined_paired_report(const std::string &out_file,
 
 int
 main(int argc, char *argv[]) {
+  // [FalcoAmadeus] Idle OpenMP threads should sleep, not spin: worker threads
+  // wait at barriers while serial steps (duplication prefix, GC replay
+  // hand-off) run, and busy-waiting there costs 10-35% extra CPU time with
+  // no wall-time benefit, which matters on machines with few cores. libgomp
+  // reads OMP_WAIT_POLICY when the library loads, before main(), so when the
+  // user has not chosen a policy, set it and re-execute this binary once.
+  // An explicit OMP_WAIT_POLICY is always respected; if re-execution is
+  // unavailable the run simply continues with the default policy.
+  if (std::getenv("OMP_WAIT_POLICY") == nullptr) {
+    setenv("OMP_WAIT_POLICY", "passive", 1);
+#ifdef __linux__
+    execv("/proc/self/exe", argv);
+#endif
+  }
 
   try {
     static const std::string FALCO_VERSION =
