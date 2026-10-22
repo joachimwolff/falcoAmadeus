@@ -3152,7 +3152,8 @@ class SerialChunkSource {
 template <class Source>
 static void
 read_stream_fused(FalcoConfig &config, FastqStats &master,
-                  std::size_t nthreads, Source &src) {
+                  std::size_t nthreads, Source &src,
+                  std::size_t chunk_cap = std::size_t(64) << 20) {
   const std::size_t BUF = FastqStats::SHORT_READ_THRESHOLD;
   ParallelWorker cfg(config, BUF);
   const bool tile_ignore = cfg.tile_ignore;
@@ -3173,11 +3174,11 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
   // straddling the previous chunk's end is copied, so the chunk switch moves
   // only that one partial record. The bytes parsed, and their order, are
   // exactly those of the sequential version.
-  // Chunk size scales with the team (8 MB per thread, 16-64 MB): two chunks
-  // are resident at a time, so this bounds memory at low thread counts while
-  // keeping large chunks for wide teams.
+  // Chunk size scales with the team (8 MB per thread, 16 MB to chunk_cap):
+  // two chunks are resident at a time, so this bounds memory at low thread
+  // counts while keeping large chunks for wide teams.
   const std::size_t CHUNK = std::min<std::size_t>(
-    std::size_t(64) << 20,
+    chunk_cap,
     std::max<std::size_t>(std::size_t(16) << 20,
                           nthreads * (std::size_t(8) << 20)));
   const std::size_t FRONT = std::size_t(4) << 20;
@@ -4102,7 +4103,11 @@ read_gz_chunked(FalcoConfig &config, FastqStats &master,
   {
     IsalInflater raw(config.filename);
     SerialChunkSource<IsalInflater> src(raw);
-    read_stream_fused(config, master, nthreads, src);
+    // One serial inflater bounds the throughput: seven parsing threads keep
+    // up with it, so a larger team and chunks beyond 32 MB only add CPU time
+    // and memory. Output is identical at any team size.
+    read_stream_fused(config, master, std::min<std::size_t>(nthreads, 8), src,
+                      std::size_t(32) << 20);
   }
 #else
   // Fallback: background block decompressor feeding the serial dispatcher.
