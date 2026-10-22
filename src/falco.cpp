@@ -43,6 +43,7 @@
 #include <exception>
 #include <string_view>
 #include <thread>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <cstdlib>
@@ -1020,12 +1021,21 @@ analyze_and_write(FalcoConfig &falco_config, const std::string &filename,
     log_process("Finished reading file");
   }
 
+  static const bool fa_times = std::getenv("FA_TIMES") != nullptr;
+  const auto t0 = std::chrono::steady_clock::now();
   stats.summarize();
+  const auto t1 = std::chrono::steady_clock::now();
 
   // Write results
   write_results(falco_config, stats, skip_text, skip_html, skip_short_summary,
                 do_call, file_prefix, out_dir, summary_filename, data_filename,
                 report_filename);
+  if (fa_times) {
+    const auto t2 = std::chrono::steady_clock::now();
+    std::fprintf(stderr, "[FA_TIMES main] summarize %.3f  write_results %.3f\n",
+                 std::chrono::duration<double>(t1 - t0).count(),
+                 std::chrono::duration<double>(t2 - t1).count());
+  }
 }
 
 // [FalcoAmadeus] read an entire file into a string (for embedding mate reports).

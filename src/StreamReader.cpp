@@ -2748,6 +2748,20 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
   // see the same records. Off when the K-mer count pass needs plimit early.
   bool lazy = false;
   std::size_t lazy_end = 0;
+  std::size_t rstep = 0;  // range stride within the current slice
+  auto bound = [&](std::size_t r) -> std::size_t {
+    if (r == 0) return off;
+    if (r >= nranges) return lazy ? lazy_end : plimit;
+    return P::find_start(base, plimit, off + r * rstep);
+  };
+  // FA_TIMES=1: per-phase wall times on stderr (diagnostics only)
+  static const bool fa_times = std::getenv("FA_TIMES") != nullptr;
+  auto now = [] {
+    return std::chrono::duration<double>(
+             std::chrono::steady_clock::now().time_since_epoch()).count();
+  };
+  double t_single = 0, t_parse = 0, t_mark = now(), t_begin = t_mark;
+  std::size_t n_slices = 0;
 
   // [FalcoAmadeus] One persistent parallel region spans worker construction
   // and the whole slice loop, with only TWO barriers per slice: all serial
@@ -2778,6 +2792,8 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
 #pragma omp single
 #endif
       {
+        const double ts0 = fa_times ? now() : 0;
+        if (fa_times) t_parse += ts0 - t_mark;
         // ---- close out the previous slice (no-op before the first) ----
         if (slice_open) {
           for (std::size_t r = 0; r < nranges; ++r)
@@ -2844,17 +2860,18 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
             ? 1
             : std::min(R_MAX, std::max<std::size_t>(
                                 1, (sbytes + RANGE_BYTES - 1) / RANGE_BYTES));
+          // Range boundaries are computed by the threads that parse them
+          // (bound() below), not serially here: find_start is monotone in its
+          // offset (a later offset never yields an earlier record start), so
+          // each boundary is a pure function of r, identical to the serial
+          // computation, and the 2 threads sharing a boundary agree on it.
           sync[0] = off;
           sync[nranges] = plimit;
-          for (std::size_t r = 1; r < nranges; ++r)
-            sync[r] = P::find_start(base, plimit, off + r * (sbytes / nranges));
-          for (std::size_t r = 1; r <= nranges; ++r)
-            if (sync[r] < sync[r - 1])
-              sync[r] = sync[r - 1];
+          rstep = sbytes / nranges;
           // prime the readahead pipeline: the first ranges (which also cover
           // the dup prefix's bytes) start faulting before any thread parses
           if (!lazy)
-            warm_range(sync[0], sync[std::min(nranges, 2 * nthreads)]);
+            warm_range(off, bound(std::min(nranges, 2 * nthreads)));
 
           // -- duplication prefix continues across slices (global read order) -
           dup_stop = off;  // cap filled earlier: every record here is post-cap
@@ -2895,7 +2912,9 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
               deltas[t].assign(nent, 0);
           }
           slice_open = true;
+          ++n_slices;
         }
+        if (fa_times) { t_mark = now(); t_single += t_mark - ts0; }
       }  // barrier publishes s_done / plimit / sync / dup_stop / count_dup
       if (s_done)
         break;
@@ -2905,10 +2924,12 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
 #ifdef _OPENMP
 #pragma omp for schedule(dynamic)
 #endif
-        for (std::size_t r = 0; r < nranges; ++r)
-          counts[r] = (sync[r] < sync[r + 1])
-            ? P::count_chunk(base, sync[r], sync[r + 1], plimit, nodrop)
+        for (std::size_t r = 0; r < nranges; ++r) {
+          const std::size_t lo = bound(r), hi = bound(r + 1);
+          counts[r] = (lo < hi)
+            ? P::count_chunk(base, lo, hi, plimit, nodrop)
             : 0;
+        }
 #ifdef _OPENMP
 #pragma omp single
 #endif
@@ -2932,7 +2953,7 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
         // keep the readahead pipeline ~2*nthreads ranges deep: each consumed
         // range asynchronously warms the one that will be parsed soon
         if (r + 2 * nthreads < nranges)
-          warm_range(sync[r + 2 * nthreads], sync[r + 2 * nthreads + 1]);
+          warm_range(bound(r + 2 * nthreads), bound(r + 2 * nthreads + 1));
         std::vector<GCRecord> &gc = replayer.parse_bufs()[r];
         gc.clear();  // capacity persists across slices
         typename P::Worker &w = *workers[tid];
@@ -2941,10 +2962,9 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
         // old per-record `tail && (j + 1 == n)`: for any record that is not
         // the file's last, the quality line's own newline makes parse_one's
         // qual_no_nl probe false -- exactly as if can_be_last were false.
-        const bool tail =
-          !lazy && (plimit == size) && (sync[r + 1] == plimit);
-        std::size_t p = sync[r];
-        const std::size_t pend = lazy ? lazy_end : sync[r + 1];
+        std::size_t p = bound(r);
+        const std::size_t pend = bound(r + 1);
+        const bool tail = !lazy && (plimit == size) && (pend == plimit);
         std::size_t g = need_g ? gstart[r] : 0;  // g meaningful only for k-mer
         std::size_t n = 0;
         std::size_t tdrop = p;
@@ -2989,7 +3009,9 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
       }  // barrier: counts[] complete -> next iteration's single closes out
     }
   }
+  const double t_fin0 = fa_times ? now() : 0;
   replayer.finish();  // every slice replayed, in exact slice order
+  const double t_fin1 = fa_times ? now() : 0;
 
   std::thread releaser;
   if (release_input)
@@ -3001,6 +3023,12 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
   merge_worker_stats(config, master, nthreads, total, wstats, empty_gc, deltas,
                      tilerecs, gstart, count_dup_final,
                      /*tile_ignore=*/true, /*skip_gc=*/true);
+  if (fa_times)
+    std::fprintf(stderr,
+                 "[FA_TIMES bytes] slices %zu  serial %.3f  parse %.3f  "
+                 "replay-wait %.3f  merge %.3f  total %.3f\n",
+                 n_slices, t_single, t_parse, t_fin1 - t_fin0, now() - t_fin1,
+                 now() - t_begin);
   if (releaser.joinable())
     releaser.join();
 }
@@ -3127,6 +3155,12 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
   std::size_t carry = 0;           // bytes of the current chunk to carry over
   bool eof = false, s_done = false, slice_open = false, first = true;
   bool no_more = false;  // the chunk just parsed was the last one
+  std::size_t sstep = 0;  // range stride within the current chunk
+  auto sbound = [&](std::size_t r) -> std::size_t {
+    if (r == 0) return 0;
+    if (r >= nranges) return plimit;
+    return find_record_start(buf, plimit, r * sstep);
+  };
   bool count_dup = false;
 
   // produce the first chunk up front (nothing to overlap it with)
@@ -3223,12 +3257,12 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
             nranges = std::min(
               R_MAX, std::max<std::size_t>(
                        1, (plimit + RANGE_BYTES - 1) / RANGE_BYTES));
+            // boundaries are found by the parsing threads (sbound below);
+            // find_record_start is monotone in its offset, so this equals the
+            // serial computation (see read_bytes_fused)
             sync[0] = 0;
             sync[nranges] = plimit;
-            for (std::size_t r = 1; r < nranges; ++r)
-              sync[r] = find_record_start(buf, plimit, r * (plimit / nranges));
-            for (std::size_t r = 1; r <= nranges; ++r)
-              if (sync[r] < sync[r - 1]) sync[r] = sync[r - 1];
+            sstep = plimit / nranges;
 
             // -- duplication prefix (serial, global order) below the cap --
             dup_stop = 0;  // cap filled earlier: everything is post-cap
@@ -3281,11 +3315,12 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
 #ifdef _OPENMP
 #pragma omp for schedule(dynamic)
 #endif
-        for (std::size_t r = 0; r < nranges; ++r)
-          counts[r] = (sync[r] < sync[r + 1])
-            ? FastqPolicy::count_chunk(buf, sync[r], sync[r + 1], plimit,
-                                       nodrop)
+        for (std::size_t r = 0; r < nranges; ++r) {
+          const std::size_t lo = sbound(r), hi = sbound(r + 1);
+          counts[r] = (lo < hi)
+            ? FastqPolicy::count_chunk(buf, lo, hi, plimit, nodrop)
             : 0;
+        }
 #ifdef _OPENMP
 #pragma omp single
 #endif
@@ -3338,9 +3373,9 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
         FastqStats &ws = *wstats[tid];
         // can_be_last for every record of the tail range: equivalent to the
         // old per-record form (see read_bytes_fused).
-        const bool tail = eof && (sync[r + 1] == plimit);
-        std::size_t p = sync[r];
-        const std::size_t pend = sync[r + 1];
+        std::size_t p = sbound(r);
+        const std::size_t pend = sbound(r + 1);
+        const bool tail = eof && (pend == plimit);
         std::size_t g = need_g ? gstart[r] : 0;  // g meaningful only for k-mer
         std::size_t n = 0;
         // Deferred-by-one dup lookup (see read_bytesplit_core). Keys point
@@ -3535,15 +3570,14 @@ file_cache_resident_fraction(const std::string &path) {
 #else
   std::vector<unsigned char> vec(npages);
 #endif
-  double frac = 0.0;
-  if (mincore(m, len, vec.data()) == 0) {
-    size_t resident = 0;
-    for (size_t i = 0; i < npages; ++i)
-      resident += (vec[i] & 1);
-    frac = static_cast<double>(resident) / static_cast<double>(npages);
+    if (mincore(static_cast<char *>(m) + idx * pg, 1, &v) == 0) {
+      resident += (v & 1);
+      ++probed;
+    }
   }
   munmap(m, len);
-  return frac;
+  return probed ? static_cast<double>(resident) / static_cast<double>(probed)
+                : 0.0;
 }
 
 #endif
