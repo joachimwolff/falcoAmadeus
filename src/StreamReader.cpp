@@ -2739,6 +2739,15 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
   std::size_t dropped = 0;
   std::size_t plimit = 0, dup_stop = 0, nranges = 0;
   bool count_dup = false, s_done = false, slice_open = false;
+  // [FalcoAmadeus] Single-thread slices end lazily: instead of probing for the
+  // last record boundary before the slice end (a page touch up to a slice
+  // ahead of the parser, which defeats the kernel's sequential readahead on a
+  // file that is not in the page cache), the slice consists of the records
+  // that START before `lazy_end`, and the parse itself discovers where the
+  // last of them ends. The duplication prefix applies the same rule, so both
+  // see the same records. Off when the K-mer count pass needs plimit early.
+  bool lazy = false;
+  std::size_t lazy_end = 0;
 
   // [FalcoAmadeus] One persistent parallel region spans worker construction
   // and the whole slice loop, with only TWO barriers per slice: all serial
@@ -2788,8 +2797,14 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
         if (!s_done) {
           const std::size_t end = std::min(off + CHUNK, size);
           // -- slice limit: last record boundary <= end (whole tail at EOF) --
+          lazy = false;
           if (end == size) {
             plimit = size;
+          }
+          else if (nthreads == 1 && !need_g) {
+            lazy = true;
+            lazy_end = end;
+            plimit = size;  // parse bound; the slice end is set by the parse
           }
           else {
             // Probe backward for a record boundary close to `end`, widening
@@ -2820,10 +2835,15 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
             plimit = (q > off) ? q : end;  // degenerate giant record: take it
           }
           // -- record-aligned sub-range boundaries (serial: ~1 us per probe) --
-          const std::size_t sbytes = plimit - off;
-          nranges = std::min(
-            R_MAX, std::max<std::size_t>(
-                     1, (sbytes + RANGE_BYTES - 1) / RANGE_BYTES));
+          // A single thread parses the slice front to back as one range: the
+          // boundary probes would touch pages ahead of the parse cursor, which
+          // turns sequential file reads into scattered ones and disables the
+          // kernel's readahead on a file that is not yet in the page cache.
+          const std::size_t sbytes = (lazy ? lazy_end : plimit) - off;
+          nranges = (nthreads == 1)
+            ? 1
+            : std::min(R_MAX, std::max<std::size_t>(
+                                1, (sbytes + RANGE_BYTES - 1) / RANGE_BYTES));
           sync[0] = off;
           sync[nranges] = plimit;
           for (std::size_t r = 1; r < nranges; ++r)
@@ -2833,13 +2853,15 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
               sync[r] = sync[r - 1];
           // prime the readahead pipeline: the first ranges (which also cover
           // the dup prefix's bytes) start faulting before any thread parses
-          warm_range(sync[0], sync[std::min(nranges, 2 * nthreads)]);
+          if (!lazy)
+            warm_range(sync[0], sync[std::min(nranges, 2 * nthreads)]);
 
           // -- duplication prefix continues across slices (global read order) -
           dup_stop = off;  // cap filled earlier: every record here is post-cap
           if (do_hash && dup_cont) {
             std::size_t p = off;
-            while (dup_cont && p < plimit) {
+            const std::size_t dup_end = lazy ? lazy_end : plimit;
+            while (dup_cont && p < dup_end) {
               const char *key;
               std::size_t klen;
               const std::size_t next = P::dup_key(base, plimit, p, key, klen);
@@ -2919,9 +2941,10 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
         // old per-record `tail && (j + 1 == n)`: for any record that is not
         // the file's last, the quality line's own newline makes parse_one's
         // qual_no_nl probe false -- exactly as if can_be_last were false.
-        const bool tail = (plimit == size) && (sync[r + 1] == plimit);
+        const bool tail =
+          !lazy && (plimit == size) && (sync[r + 1] == plimit);
         std::size_t p = sync[r];
-        const std::size_t pend = sync[r + 1];
+        const std::size_t pend = lazy ? lazy_end : sync[r + 1];
         std::size_t g = need_g ? gstart[r] : 0;  // g meaningful only for k-mer
         std::size_t n = 0;
         std::size_t tdrop = p;
@@ -2961,6 +2984,8 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
             ++deltas[tid][static_cast<std::size_t>(it - mbegin)];
         }
         counts[r] = n;  // == the count pass's value on well-formed input
+        if (lazy)
+          plimit = p;  // one thread, one range: the slice ends here
       }  // barrier: counts[] complete -> next iteration's single closes out
     }
   }
@@ -2993,6 +3018,37 @@ read_chunked_core(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
 }
 
 #if defined(USE_ISAL) || defined(USE_RAPIDGZIP)
+// [FalcoAmadeus] Adapts a sequential byte source (anything with
+// fill(out, cap) returning bytes written, 0 at end) to the chunk-source
+// interface of read_stream_fused: producing a chunk is a single work item.
+template <class S>
+class SerialChunkSource {
+ public:
+  explicit SerialChunkSource(S &s) : s_(s) {}
+  size_t plan(size_t cap) {
+    cap_ = cap;
+    got_ = 0;
+    return eof_ ? 0 : 1;
+  }
+  void run(size_t, char *dst) {
+    while (got_ < cap_) {
+      const size_t g = s_.fill(dst + got_, cap_ - got_);
+      if (g == 0) {
+        eof_ = true;
+        break;
+      }
+      got_ += g;
+    }
+  }
+  size_t produced() const { return got_; }
+  bool at_eof() const { return eof_; }
+
+ private:
+  S &s_;
+  size_t cap_ = 0, got_ = 0;
+  bool eof_ = false;
+};
+
 // [FalcoAmadeus] Fused streaming gz driver. Profiling showed plain-gz throughput
 // is bounded not by ISA-L inflate (fast) but by the single-threaded dispatcher,
 // which touches every byte to split lines. This inflates a bounded chunk with
@@ -3016,10 +3072,30 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
     return;
   }
 
-  const std::size_t CHUNK = std::size_t(64) << 20;
-  const std::size_t SLACK = std::size_t(16) << 20;  // headroom for small leftovers
-  std::vector<char> bufv(CHUNK + SLACK);
-  char *buf = bufv.data();
+  // [FalcoAmadeus] Double-buffered chunks with inflation folded into the parse
+  // phase. While the team parses chunk k from one buffer, the next chunk is
+  // produced into the other buffer by work items scheduled in the SAME dynamic
+  // loop as the parse ranges (listed first, so they start immediately): one
+  // item for a serial source (ISA-L, rapidgzip, chained files), one item per
+  // block group for BGZF. Inflation and parsing therefore overlap without any
+  // thread beyond the -t team, and a straggler of either kind is absorbed by
+  // dynamic scheduling. Each buffer reserves FRONT bytes in which the record
+  // straddling the previous chunk's end is copied, so the chunk switch moves
+  // only that one partial record. The bytes parsed, and their order, are
+  // exactly those of the sequential version.
+  // Chunk size scales with the team (8 MB per thread, 16-64 MB): two chunks
+  // are resident at a time, so this bounds memory at low thread counts while
+  // keeping large chunks for wide teams.
+  const std::size_t CHUNK = std::min<std::size_t>(
+    std::size_t(64) << 20,
+    std::max<std::size_t>(std::size_t(16) << 20,
+                          nthreads * (std::size_t(8) << 20)));
+  const std::size_t FRONT = std::size_t(4) << 20;
+  std::vector<char> bufs[2];
+  bufs[0].resize(FRONT + CHUNK);
+  bufs[1].resize(FRONT + CHUNK);
+  int cur = 0;
+  char *buf = nullptr;
 
   std::vector<std::unique_ptr<ParallelWorker>> workers(nthreads);
   std::vector<std::unique_ptr<FastqStats>> wstats(nthreads);
@@ -3029,42 +3105,37 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
     wstats[t].reset(new FastqStats(config.do_kmer));
   }
 
-  // [FalcoAmadeus] Same three driver-overhead cuts as read_bytes_fused (see the
-  // comments there for the full arguments): (1) when the K-mer module is off,
-  // no phase needs the global read index g, so the per-chunk record-count pass
-  // over every byte is skipped and counts fall out of the parse; the dup gate
-  // compares record start offsets against the byte where the serial dup prefix
-  // stopped (the prefix consumes records in order, so that byte boundary
-  // selects exactly the old `g >= fill_boundary` read set); (2) the ordered GC
-  // replay of chunk s runs on a background thread while chunk s+1 inflates and
-  // parses (double-buffered records, strict submission order -> identical FP
-  // accumulation order); (3) one persistent parallel region replaces the 3-4
-  // team fork/joins per chunk, with the serial inflate in a `single`.
+  // [FalcoAmadeus] Same driver-overhead cuts as read_bytes_fused (see the
+  // comments there): no count pass unless the K-mer module needs the global
+  // read index, a byte-offset duplication gate, the ordered GC replay on a
+  // background thread, and one persistent parallel region.
   const bool need_g = config.do_kmer;
-
-  // Work-stealing sub-ranges, exactly as in read_bytes_fused (see the comment
-  // there for the byte-identity argument).
   const std::size_t RANGE_BYTES = std::size_t(1) << 19;
   const std::size_t R_MAX = std::max<std::size_t>(
-    nthreads, (CHUNK + SLACK + RANGE_BYTES - 1) / RANGE_BYTES);
+    nthreads, (FRONT + CHUNK + RANGE_BYTES - 1) / RANGE_BYTES);
 
   bool dup_cont = true;
-  std::size_t dup_seen = 0, nent = 0, total = 0, leftover_len = 0;
+  std::size_t dup_seen = 0, nent = 0, total = 0;
   auto mbegin = master.sequence_count.begin();
   std::vector<std::size_t> sync(R_MAX + 1), counts(R_MAX), gstart(R_MAX + 1);
   auto nodrop = [](std::size_t, std::size_t) {};
 
   GCReplayer replayer(master, R_MAX);
-  bool eof = false;
   // shared per-chunk state, written in `single` blocks (barriers publish it)
   std::size_t filled_end = 0, plimit = 0, dup_stop = 0, nranges = 0;
-  bool count_dup = false, s_done = false, s_skip = false, slice_open = false;
+  std::size_t ntasks = 0;          // production items for the NEXT chunk
+  std::size_t carry = 0;           // bytes of the current chunk to carry over
+  bool eof = false, s_done = false, slice_open = false, first = true;
+  bool no_more = false;  // the chunk just parsed was the last one
+  bool count_dup = false;
 
-  // Two barriers per chunk: ONE `single` closes out the previous chunk
-  // (counts fold + GC submit + straddle memmove), inflates the next, finds
-  // the parse limit and the range sync points and runs the dup prefix; then
-  // ONE `for` parses. The other threads sleep/spin through the serial inflate
-  // exactly once per chunk instead of once per phase.
+  // produce the first chunk up front (nothing to overlap it with)
+  {
+    const std::size_t n = src.plan(CHUNK);
+    for (std::size_t i = 0; i < n; ++i)
+      src.run(i, bufs[0].data() + FRONT);
+  }
+
 #ifdef _OPENMP
 #pragma omp parallel num_threads(nthreads)
 #endif
@@ -3075,128 +3146,138 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
 #endif
       {
         // ---- close out the previous chunk (no-op before the first) ----
-        if (slice_open) {
-          for (std::size_t r = 0; r < nranges; ++r)
-            total += counts[r];
-          replayer.submit(nranges);  // replays while the next chunk inflates
-          leftover_len = filled_end - plimit;
-          if (leftover_len) std::memmove(buf, buf + plimit, leftover_len);
-          slice_open = false;
+        const char *prev = buf;
+        std::size_t left = 0;
+        if (!first) {
+          if (slice_open) {
+            for (std::size_t r = 0; r < nranges; ++r)
+              total += counts[r];
+            replayer.submit(nranges);  // replays while this chunk parses
+          }
+          left = carry;
+          cur ^= 1;
         }
-        s_done = eof;
-        s_skip = false;
-        if (!s_done) {
-          // ---- inflate one chunk after the carried leftover (serial) ----
-          if (bufv.size() < leftover_len + CHUNK) {
-            bufv.resize(leftover_len + CHUNK);  // huge single record: grow
-            buf = bufv.data();
-          }
-          const std::size_t target = leftover_len + CHUNK;
-          std::size_t filled = leftover_len;
-          while (filled < target) {
-            const std::size_t got = src.fill(buf + filled, target - filled);
-            if (got == 0) { eof = true; break; }
-            filled += got;
-          }
-          filled_end = filled;
-          if (filled_end == 0) {
-            s_done = true;
+        first = false;
+        slice_open = false;
+        if (no_more) {
+          s_done = true;  // the EOF chunk has been parsed and closed out
+        }
+        else {
+        // ---- the chunk in bufs[cur] was produced during the last parse ----
+        const std::size_t got = src.produced();
+        eof = src.at_eof();
+        std::vector<char> &B = bufs[cur];
+        if (left > FRONT) {
+          // a carried partial record larger than the reserve (giant reads):
+          // shift the fresh data right to make room
+          B.resize(left + got);
+          std::memmove(B.data() + left, B.data() + FRONT, got);
+          buf = B.data();
+        }
+        else {
+          buf = B.data() + (FRONT - left);
+        }
+        if (left)
+          std::memcpy(buf, prev + (filled_end - left), left);
+        filled_end = left + got;
+
+        // ---- queue production of the next chunk into the other buffer ----
+        ntasks = 0;
+        if (!eof) {
+          std::vector<char> &N = bufs[cur ^ 1];
+          if (N.size() < FRONT + CHUNK)
+            N.resize(FRONT + CHUNK);
+          ntasks = src.plan(CHUNK);
+        }
+
+        nranges = 0;
+        carry = 0;
+        s_done = (filled_end == 0 && eof);
+        if (filled_end > 0) {
+          // ---- parse limit: on the last chunk parse to the end, else carry
+          // the straddling tail record (see read_bytes_fused). ----
+          if (eof) {
+            plimit = filled_end;
           }
           else {
-            // ---- parse limit: on the last chunk parse to the end, else carry
-            // the straddling tail record. A record whose 4 lines do not all
-            // fit before `filled_end` makes parse_record return `filled_end`,
-            // so walk complete records forward from a small backward probe and
-            // cut at the first that straddles. ----
-            if (eof) {
-              plimit = filled_end;
+            std::size_t q = SIZE_MAX;
+            for (std::size_t BACK = std::size_t(128) << 10;; BACK <<= 3) {
+              const std::size_t probe =
+                filled_end > BACK ? filled_end - BACK : 0;
+              q = find_record_start(buf, filled_end, probe);
+              if (q < filled_end || probe == 0)
+                break;
             }
-            else {
-              // Backward probe with a widening window (see read_bytes_fused:
-              // any true boundary converges on the same cut).
-              std::size_t q = SIZE_MAX;
-              for (std::size_t BACK = std::size_t(128) << 10;; BACK <<= 3) {
-                const std::size_t probe =
-                  filled_end > BACK ? filled_end - BACK : 0;
-                q = find_record_start(buf, filled_end, probe);
-                if (q < filled_end || probe == 0)
-                  break;
-              }
-              for (;;) {
-                std::size_t so, sl;
-                const std::size_t r = parse_record(buf, filled_end, q, so, sl);
-                if (r >= filled_end)
-                  break;  // record at q straddles the end -> carry from here
-                q = r;
-              }
-              plimit = q;
+            for (;;) {
+              std::size_t so, sl;
+              const std::size_t r = parse_record(buf, filled_end, q, so, sl);
+              if (r >= filled_end)
+                break;  // record at q straddles the end -> carry from here
+              q = r;
             }
-            if (plimit == 0) {  // no complete record yet (spans whole buffer)
-              leftover_len = filled_end;
-              if (eof)
-                s_done = true;
-              else
-                s_skip = true;  // read more input, then retry
-            }
-            else {
-              // -- record-aligned sub-range boundaries (serial, ~1 us each) --
-              nranges = std::min(
-                R_MAX, std::max<std::size_t>(
-                         1, (plimit + RANGE_BYTES - 1) / RANGE_BYTES));
-              sync[0] = 0;
-              sync[nranges] = plimit;
-              for (std::size_t r = 1; r < nranges; ++r)
-                sync[r] = find_record_start(buf, plimit,
-                                            r * (plimit / nranges));
-              for (std::size_t r = 1; r <= nranges; ++r)
-                if (sync[r] < sync[r - 1]) sync[r] = sync[r - 1];
+            plimit = q;
+          }
+          carry = filled_end - plimit;
+          if (plimit > 0) {
+            // -- record-aligned sub-range boundaries (serial, ~1 us each) --
+            nranges = std::min(
+              R_MAX, std::max<std::size_t>(
+                       1, (plimit + RANGE_BYTES - 1) / RANGE_BYTES));
+            sync[0] = 0;
+            sync[nranges] = plimit;
+            for (std::size_t r = 1; r < nranges; ++r)
+              sync[r] = find_record_start(buf, plimit, r * (plimit / nranges));
+            for (std::size_t r = 1; r <= nranges; ++r)
+              if (sync[r] < sync[r - 1]) sync[r] = sync[r - 1];
 
-              // -- duplication prefix (serial, global order) below the cap --
-              dup_stop = 0;  // cap filled earlier: everything is post-cap
-              if (do_hash && dup_cont) {
-                std::size_t p = 0;
-                while (dup_cont && p < plimit) {
-                  const char *key;
-                  std::size_t klen;
-                  const std::size_t next =
-                    FastqPolicy::dup_key(buf, plimit, p, key, klen);
-                  const auto it = master.sequence_count.find(key, klen);
-                  if (it == master.sequence_count.end()) {
-                    master.sequence_count.emplace(key, klen, 1);
-                    master.count_at_limit = dup_seen;
-                    ++master.num_unique_seen;
-                    if (master.num_unique_seen ==
-                        Constants::unique_reads_stop_counting)
-                      dup_cont = false;  // the cap-filling record IS consumed
-                  }
-                  else {
-                    ++it->second;
-                    master.count_at_limit += dup_cont;
-                  }
-                  ++dup_seen;
-                  p = next;  // always step past the consumed record
+            // -- duplication prefix (serial, global order) below the cap --
+            dup_stop = 0;  // cap filled earlier: everything is post-cap
+            if (do_hash && dup_cont) {
+              std::size_t p = 0;
+              while (dup_cont && p < plimit) {
+                const char *key;
+                std::size_t klen;
+                const std::size_t next =
+                  FastqPolicy::dup_key(buf, plimit, p, key, klen);
+                const auto it = master.sequence_count.find(key, klen);
+                if (it == master.sequence_count.end()) {
+                  master.sequence_count.emplace(key, klen, 1);
+                  master.count_at_limit = dup_seen;
+                  ++master.num_unique_seen;
+                  if (master.num_unique_seen ==
+                      Constants::unique_reads_stop_counting)
+                    dup_cont = false;  // the cap-filling record IS consumed
                 }
-                dup_stop = p;  // first unconsumed byte == old g-based gate
+                else {
+                  ++it->second;
+                  master.count_at_limit += dup_cont;
+                }
+                ++dup_seen;
+                p = next;  // always step past the consumed record
               }
-              count_dup = do_hash && !dup_cont;
-              if (count_dup && nent == 0) {  // freeze the map, size deltas
-                nent = master.sequence_count.size();
-                mbegin = master.sequence_count.begin();
-                for (std::size_t t = 0; t < nthreads; ++t)
-                  deltas[t].assign(nent, 0);
-              }
-              slice_open = true;
+              dup_stop = p;  // first unconsumed byte == old g-based gate
             }
+            count_dup = do_hash && !dup_cont;
+            if (count_dup && nent == 0) {  // freeze the map, size deltas
+              nent = master.sequence_count.size();
+              mbegin = master.sequence_count.begin();
+              for (std::size_t t = 0; t < nthreads; ++t)
+                deltas[t].assign(nent, 0);
+            }
+            slice_open = true;
+          }
+          else if (eof) {
+            s_done = true;  // trailing bytes that form no complete record
           }
         }
-      }  // barrier publishes s_done / s_skip / plimit / buf / filled_end
+        no_more = eof;
+        }
+      }  // barrier publishes buf / filled_end / plimit / ranges / ntasks
       if (s_done)
         break;
-      if (s_skip)
-        continue;
 
       // ---- Phase 1, k-mer runs only: count records for each range's g0 ------
-      if (need_g) {
+      if (need_g && nranges) {
 #ifdef _OPENMP
 #pragma omp for schedule(dynamic)
 #endif
@@ -3215,11 +3296,36 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
         }
       }
 
-      // ---- Phase 2: parallel parse + per-base stats + deferred dup counting -
+      // ---- Phase 2: production of the next chunk + parallel parse of this
+      // chunk + per-base stats + deferred dup counting. Production items are
+      // spread evenly among the parse ranges (one first, so I/O starts at
+      // once), so producing and parsing overlap instead of running as two
+      // back-to-back stages. ----
+      char *const next_dst = bufs[cur ^ 1].data() + FRONT;
+      const std::size_t nitems = ntasks + nranges;
 #ifdef _OPENMP
 #pragma omp for schedule(dynamic)
 #endif
-      for (std::size_t r = 0; r < nranges; ++r) {
+      for (std::size_t it = 0; it < nitems; ++it) {
+        // item `it` is production item k when it == floor(k * nitems / ntasks)
+        std::size_t k = SIZE_MAX, r = it;
+        if (ntasks && nthreads == 1) {
+          // one thread: parse first, then produce, so asynchronous readahead
+          // of the next chunk runs while this one is parsed
+          if (it >= nranges)
+            k = it - nranges;
+        }
+        else if (ntasks) {
+          const std::size_t kk = (it * ntasks + ntasks - 1) / nitems;  // ceil
+          if (kk < ntasks && (kk * nitems) / ntasks == it)
+            k = kk;
+          // parse ranges before `it` = it - (production items before it)
+          r = it - (it * ntasks + nitems - 1) / nitems;
+        }
+        if (k != SIZE_MAX) {
+          src.run(k, next_dst);
+          continue;
+        }
 #ifdef _OPENMP
         const std::size_t tid = static_cast<std::size_t>(omp_get_thread_num());
 #else
@@ -3237,11 +3343,9 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
         const std::size_t pend = sync[r + 1];
         std::size_t g = need_g ? gstart[r] : 0;  // g meaningful only for k-mer
         std::size_t n = 0;
-        // Deferred-by-one dup lookup (see read_bytesplit_core): overlap the
-        // slot load with the next record's parse. Keys point into `buf`, which
-        // is stable until after this parallel phase (the straddle memmove runs
-        // later, in a `single`), and the pending probe is flushed before this
-        // thread finishes the range.
+        // Deferred-by-one dup lookup (see read_bytesplit_core). Keys point
+        // into `buf`, which stays valid until the next chunk switch, and the
+        // pending probe is flushed before this range ends.
         std::uint64_t ph = 0; const char *pp = nullptr; std::size_t pn = 0;
         bool pv = false;
         while (p < pend) {
@@ -3258,20 +3362,20 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
             const std::uint64_t h = DupHashMap::hash_of(key, klen);
             master.sequence_count.prefetch(h);
             if (pv) {
-              const auto it = master.sequence_count.find_hashed(ph, pp, pn);
-              if (it != master.sequence_count.end())
-                ++deltas[tid][static_cast<std::size_t>(it - mbegin)];
+              const auto f = master.sequence_count.find_hashed(ph, pp, pn);
+              if (f != master.sequence_count.end())
+                ++deltas[tid][static_cast<std::size_t>(f - mbegin)];
             }
             ph = h; pp = key; pn = klen; pv = true;
           }
         }
         if (pv) {
-          const auto it = master.sequence_count.find_hashed(ph, pp, pn);
-          if (it != master.sequence_count.end())
-            ++deltas[tid][static_cast<std::size_t>(it - mbegin)];
+          const auto f = master.sequence_count.find_hashed(ph, pp, pn);
+          if (f != master.sequence_count.end())
+            ++deltas[tid][static_cast<std::size_t>(f - mbegin)];
         }
         counts[r] = n;  // == the count pass's value on well-formed input
-      }  // barrier: counts[] complete -> next iteration's single closes out
+      }  // barrier: counts[] complete, next chunk produced
     }
   }
   replayer.finish();  // every chunk replayed, in exact chunk order
@@ -3405,9 +3509,138 @@ read_sam_chunked(FalcoConfig &config, FastqStats &master, std::size_t nthreads) 
                               [src]() { delete src; }, /*can_drop=*/true);
 }
 
+#if defined(USE_ISAL) || defined(USE_RAPIDGZIP)
+// [FalcoAmadeus] Fraction of a file's pages currently in the page cache
+// (mincore over a read-only mapping; no data is touched). Used to pick the
+// zero-copy mmap parse for cached files and streamed reads otherwise.
+static double
+file_cache_resident_fraction(const std::string &path) {
+  const int fd = ::open(path.c_str(), O_RDONLY);
+  if (fd < 0)
+    return 0.0;
+  struct stat st;
+  if (fstat(fd, &st) != 0 || st.st_size == 0) {
+    ::close(fd);
+    return 0.0;
+  }
+  const size_t len = static_cast<size_t>(st.st_size);
+  void *m = mmap(nullptr, len, PROT_READ, MAP_SHARED, fd, 0);
+  ::close(fd);
+  if (m == MAP_FAILED)
+    return 0.0;
+  const size_t pg = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+  const size_t npages = (len + pg - 1) / pg;
+#if defined(__APPLE__)
+  std::vector<char> vec(npages);
+#else
+  std::vector<unsigned char> vec(npages);
+#endif
+  double frac = 0.0;
+  if (mincore(m, len, vec.data()) == 0) {
+    size_t resident = 0;
+    for (size_t i = 0; i < npages; ++i)
+      resident += (vec[i] & 1);
+    frac = static_cast<double>(resident) / static_cast<double>(npages);
+  }
+  munmap(m, len);
+  return frac;
+}
+
+#endif
+#if defined(USE_ISAL) || defined(USE_RAPIDGZIP)
+// [FalcoAmadeus] Chunk source for uncompressed FASTQ: each chunk is read with
+// several pread() calls issued as parallel work items into the spare buffer
+// of read_stream_fused, overlapping I/O with the parse of the previous chunk.
+// Explicit sequential reads keep the kernel's readahead effective and avoid
+// one page fault per 4 KB page; on a file that is not yet in the page cache
+// the memory-mapped path was 2-2.5x slower than read()-based tools.
+class PlainFileChunkSource {
+ public:
+  explicit PlainFileChunkSource(const std::string &path) {
+    fd_ = ::open(path.c_str(), O_RDONLY);
+    if (fd_ < 0)
+      throw std::runtime_error("Cannot open FASTQ file : " + path);
+    struct stat st;
+    if (fstat(fd_, &st) != 0) {
+      ::close(fd_);
+      throw std::runtime_error("Cannot stat FASTQ file : " + path);
+    }
+    size_ = static_cast<size_t>(st.st_size);
+#ifdef POSIX_FADV_SEQUENTIAL
+    posix_fadvise(fd_, 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
+  }
+  ~PlainFileChunkSource() {
+    if (fd_ >= 0)
+      ::close(fd_);
+  }
+  PlainFileChunkSource(const PlainFileChunkSource &) = delete;
+  PlainFileChunkSource &operator=(const PlainFileChunkSource &) = delete;
+
+  size_t plan(size_t cap) {
+    start_ = off_;
+    len_ = std::min(cap, size_ - off_);
+    off_ += len_;
+    eof_ = (off_ >= size_);
+#ifdef POSIX_FADV_WILLNEED
+    // start asynchronous readahead of the whole chunk now, so the device
+    // works while the current chunk is parsed (matters most at -t 1)
+    if (len_)
+      posix_fadvise(fd_, static_cast<off_t>(start_),
+                    static_cast<off_t>(std::min(2 * len_, size_ - start_)),
+                    POSIX_FADV_WILLNEED);
+#endif
+    return (len_ + PIECE - 1) / PIECE;
+  }
+  void run(size_t i, char *dst) {
+    const size_t a = i * PIECE, b = std::min(len_, a + PIECE);
+    size_t done = a;
+    while (done < b) {
+      const ssize_t n = pread(fd_, dst + done, b - done,
+                              static_cast<off_t>(start_ + done));
+      if (n <= 0) {
+        failed_.store(true, std::memory_order_relaxed);
+        return;
+      }
+      done += static_cast<size_t>(n);
+    }
+  }
+  size_t produced() const {
+    if (failed_.load(std::memory_order_relaxed))
+      throw std::runtime_error("read error in FASTQ file");
+    return len_;
+  }
+  bool at_eof() const { return eof_; }
+
+ private:
+  static constexpr size_t PIECE = size_t(4) << 20;
+  int fd_ = -1;
+  size_t size_ = 0, off_ = 0, start_ = 0, len_ = 0;
+  bool eof_ = false;
+  std::atomic<bool> failed_{false};
+};
+#endif
+
 void
 read_uncompressed_chunked(FalcoConfig &config, FastqStats &master,
                           std::size_t nthreads) {
+#if defined(USE_ISAL) || defined(USE_RAPIDGZIP)
+  // Streamed reads for tile-less input (the stream driver is tile-less; tiled
+  // input keeps the memory-mapped driver below).
+  {
+    ParallelWorker probe(config, FastqStats::SHORT_READ_THRESHOLD);
+    // Multi-threaded runs on a file that is not (mostly) in the page cache
+    // stream it with explicit reads; cached files, and single-threaded runs
+    // (whose strictly sequential mmap parse keeps kernel readahead ahead of
+    // the parser), keep the zero-copy memory-mapped driver.
+    if (probe.tile_ignore && nthreads > 1 &&
+        file_cache_resident_fraction(config.filename) < 0.9) {
+      PlainFileChunkSource src(config.filename);
+      read_stream_fused(config, master, nthreads, src);
+      return;
+    }
+  }
+#endif
   // Heap-allocated so the munmap can be handed to the background releaser inside
   // read_chunked_core; the closure runs (and completes) before the core returns.
   PlainBlockReader *src = new PlainBlockReader(config.filename);
@@ -3693,10 +3926,22 @@ decompress_bgzf_libdeflate(const std::string &path, std::size_t nthreads) {
 }
 #endif  // USE_HTS && USE_LIBDEFLATE
 
+#if defined(USE_HTS) && defined(USE_LIBDEFLATE) && \
+    (defined(USE_ISAL) || defined(USE_RAPIDGZIP))
+static bool read_bgzf_fastq_fused(FalcoConfig &config, FastqStats &master,
+                                  std::size_t nthreads);
+#endif
+
 void
 read_gz_chunked(FalcoConfig &config, FastqStats &master,
                 std::size_t nthreads) {
-#if defined(USE_HTS) && defined(USE_LIBDEFLATE)
+#if defined(USE_HTS) && defined(USE_LIBDEFLATE) && \
+    (defined(USE_ISAL) || defined(USE_RAPIDGZIP))
+  // BGZF: inflate each chunk's blocks in parallel straight into the streaming
+  // parser (bounded memory, no temporary decompressed copy).
+  if (read_bgzf_fastq_fused(config, master, nthreads))
+    return;
+#elif defined(USE_HTS) && defined(USE_LIBDEFLATE)
   // Fast path: parallel BGZF block decompression with libdeflate, then parse.
   {
     GzBuffer g = decompress_bgzf_libdeflate(config.filename, nthreads);
@@ -3735,14 +3980,16 @@ read_gz_chunked(FalcoConfig &config, FastqStats &master,
   if (config.seekable_input && nthreads >= 2 &&
       get_file_size(config.filename) >= (std::size_t(1) << 30) &&
       std::getenv("FA_RAPIDGZIP")) {
-    RapidgzipSource src(config.filename, nthreads);
+    RapidgzipSource raw(config.filename, nthreads);
+    SerialChunkSource<RapidgzipSource> src(raw);
     read_stream_fused(config, master, nthreads, src);
     return;
   }
 #endif
 #if defined(USE_ISAL)
   {
-    IsalInflater src(config.filename);
+    IsalInflater raw(config.filename);
+    SerialChunkSource<IsalInflater> src(raw);
     read_stream_fused(config, master, nthreads, src);
   }
 #else
@@ -3848,7 +4095,8 @@ void
 read_pooled_fastq(FalcoConfig &config, FastqStats &master, size_t nthreads,
                   const std::vector<std::string> &files) {
 #if defined(USE_ISAL)
-  ChainedFastqSource src(files);
+  ChainedFastqSource raw(files);
+  SerialChunkSource<ChainedFastqSource> src(raw);
   read_stream_fused(config, master, nthreads, src);
 #else
   (void)config; (void)master; (void)nthreads; (void)files;
@@ -4710,6 +4958,100 @@ bgzf_walk_index(const std::string &path) {
   r.fd = fd; r.csize = csize; r.utotal = utotal; r.ok = true;
   return r;
 }
+
+#if defined(USE_LIBDEFLATE) && (defined(USE_ISAL) || defined(USE_RAPIDGZIP))
+// [FalcoAmadeus] Chunk source for BGZF-compressed FASTQ (see
+// read_stream_fused): plan() selects the next run of BGZF blocks that fits
+// the chunk and splits it into groups; run(i) inflates group i straight into
+// the destination at the blocks' known offsets. read_stream_fused executes
+// the groups as items of its parse loop, so the next chunk inflates in
+// parallel while the current one is parsed. The bytes delivered, and their
+// order, are exactly the decompressed stream.
+class BgzfParallelSource {
+ public:
+  explicit BgzfParallelSource(BgzfIndex &ix) : ix_(ix) {}
+
+  size_t plan(size_t cap) {
+    const size_t nb = ix_.coff.size();
+    b0_ = next_;
+    size_t last = next_, need = 0;
+    while (last < nb && need + ix_.ulen[last] <= cap) {
+      need += ix_.ulen[last];
+      ++last;
+    }
+    b1_ = last;
+    next_ = last;
+    produced_ = need;
+    eof_ = (last == nb);
+    if (b1_ == b0_)
+      return 0;
+    // read the compressed bytes of the whole run once (sequential I/O)
+    const size_t c0 = ix_.coff[b0_];
+    const size_t clen = ix_.coff[b1_ - 1] + ix_.clen[b1_ - 1] - c0;
+    if (cbuf_.size() < clen)
+      cbuf_.resize(clen);
+    size_t done = 0;
+    while (done < clen) {
+      const ssize_t n = pread(ix_.fd, cbuf_.data() + done, clen - done,
+                              static_cast<off_t>(c0 + done));
+      if (n <= 0)
+        throw std::runtime_error("read error in BGZF file");
+      done += static_cast<size_t>(n);
+    }
+    return (b1_ - b0_ + GROUP - 1) / GROUP;
+  }
+
+  // Inflate block group i of the planned run into dst (the chunk start).
+  // Errors are recorded and raised by the next produced() call, since an
+  // exception must not leave an OpenMP worksharing loop.
+  void run(size_t i, char *dst) {
+    const size_t g0 = b0_ + i * GROUP;
+    const size_t g1 = std::min(b1_, g0 + GROUP);
+    const size_t c0 = ix_.coff[b0_], u0 = ix_.uoff[b0_];
+    thread_local libdeflate_decompressor *d = nullptr;
+    if (d == nullptr)
+      d = libdeflate_alloc_decompressor();
+    for (size_t b = g0; b < g1; ++b) {
+      size_t act = 0;
+      if (d == nullptr ||
+          libdeflate_gzip_decompress(
+            d, cbuf_.data() + (ix_.coff[b] - c0), ix_.clen[b],
+            dst + (ix_.uoff[b] - u0), ix_.ulen[b], &act) !=
+            LIBDEFLATE_SUCCESS ||
+          act != ix_.ulen[b])
+        failed_.store(true, std::memory_order_relaxed);
+    }
+  }
+
+  size_t produced() const {
+    if (failed_.load(std::memory_order_relaxed))
+      throw std::runtime_error("BGZF block failed to decompress");
+    return produced_;
+  }
+  bool at_eof() const { return eof_; }
+
+ private:
+  static constexpr size_t GROUP = 16;  // blocks per work item (~1 MB)
+  BgzfIndex &ix_;
+  size_t next_ = 0, b0_ = 0, b1_ = 0, produced_ = 0;
+  bool eof_ = false;
+  std::atomic<bool> failed_{false};
+  std::vector<unsigned char> cbuf_;
+};
+
+// Returns false when the file is not BGZF (caller uses the plain-gzip path).
+static bool
+read_bgzf_fastq_fused(FalcoConfig &config, FastqStats &master,
+                      std::size_t nthreads) {
+  BgzfIndex ix = bgzf_walk_index(config.filename);
+  if (!ix.ok)
+    return false;
+  BgzfParallelSource src(ix);
+  read_stream_fused(config, master, nthreads, src);
+  close(ix.fd);
+  return true;
+}
+#endif
 
 // [FalcoAmadeus] FUSED parallel BAM driver: decompress ONE ~128 MB chunk of BGZF
 // blocks at a time into a REUSED anonymous huge-page buffer (faulted once, then
