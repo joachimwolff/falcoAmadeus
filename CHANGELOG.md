@@ -25,6 +25,12 @@
   explanatory error; `--allow-unmatched-pairs` overrides. Mate suffixes
   `/1`, `/2` and the `.1`, `.2` written by `fastq-dump --readids` are
   recognised.
+- **No read past the GC model for 101 G/C bases.** For reads longer than
+  100 bases the GC count covers 101 bases while the model has length 100
+  (inherited from falco); a read whose first 101 bases are all G or C read
+  one entry past the end of the model. It now contributes nothing (falco's
+  output in practice); with the lazily built models the stray read could
+  crash paired mode at `-t 1`.
 
 ### Performance
 
@@ -59,11 +65,16 @@ the SAM file); before these changes it lost 14.
   with 32 MB chunks for plain gzip, whose single serial inflater bounds the
   throughput. Peak RSS at `-t 32`: FASTQ 179 MB (falco 2.0.3: 326 MB), gzip
   111 MB (308 MB), BGZF 215 MB (236 MB), BAM 182 MB (222 MB).
-- Paired mode reads both mates concurrently in large ISA-L/zlib blocks and
-  streams the pooled combined view instead of writing a concatenated
-  temporary copy of both inputs (tiled input and builds without ISA-L keep
-  the temporary copy). 2M simulated pairs, `-t 8`: uncompressed 2.64 s to
-  0.93 s, gzip 5.5 s to 2.8 s.
+- **Paired mode reads each mate once.** The parse collects the pairing
+  fingerprints, the combined view is derived exactly from the two mates
+  (its fastqc_data.txt equals the analysis of R1 followed by R2), gzipped
+  mates are read concurrently, and the exact and FastQC-style paired counts
+  run in parallel. Outputs are unchanged. 10M HG002 pairs (SRR12898355):
+  uncompressed `-t 8` 2.87 s to 0.88 s and `-t 32` 3.44 s to 0.43 s
+  (falco 2.0.3 on the two files: 1.04 s and 0.47 s); gzip `-t 8` 15.3 s to
+  3.2 s (falco 2.0.3: 7.3 s); peak RSS 380-480 MB (falco 2.0.3: 580-650 MB).
+  Tiled input, the K-mer module and builds without ISA-L keep the separate
+  pairing pass and pooled re-read.
 
 ### Tests
 
