@@ -2595,28 +2595,24 @@ class DupDeltas32 {
 // [FalcoAmadeus] Native paired mode, per read: the name and key
 // fingerprints (see PairedHooks), and for the second mate the occurrence of
 // its duplication key in the first mate's map (the combined view).
-inline void
+// Returns the duplication-map hash of the read's key (hash_of over
+// get_truncate_point(seqlen) bytes), which the caller reuses for its own
+// duplication count and for the combined view's lookup.
+inline std::uint64_t
 pair_fingerprints(const char *rec, const char *end, const char *key,
-                  std::size_t seqlen, std::vector<std::uint32_t> &nfv,
-                  std::vector<std::uint64_t> &kfv, DupHashMap *cm,
-                  std::uint32_t *crow, DupHashMap::iterator cmbegin) {
+                  std::size_t seqlen, std::uint64_t &key_out,
+                  std::uint32_t &name_out) {
   const std::uint64_t nf = pair_name_fp(rec, end);
-  nfv.push_back(static_cast<std::uint32_t>(nf ^ (nf >> 32)));
+  name_out = static_cast<std::uint32_t>(nf ^ (nf >> 32));
   std::size_t sl = seqlen;
   if (sl && key[sl - 1] == '\r')
     --sl;
   const std::size_t kl = get_truncate_point(sl);
   std::uint64_t kfp, h;
   DupHashMap::fp_and_hash(key, kl, kfp, h);
-  kfv.push_back(kfp);
-  if (cm) {
-    const std::size_t klen = get_truncate_point(seqlen);
-    if (klen != kl)
-      h = DupHashMap::hash_of(key, klen);
-    const auto it = cm->find_hashed(h, key, klen);
-    if (it != cm->end())
-      ++crow[static_cast<std::size_t>(it - cmbegin)];
-  }
+  key_out = kfp;
+  const std::size_t klen = get_truncate_point(seqlen);
+  return (klen == kl) ? h : DupHashMap::hash_of(key, klen);
 }
 
 // [FalcoAmadeus] A range's GC record vector, moved onto the parsing
@@ -2726,17 +2722,31 @@ private:
       // range 1's, ... (same statements as the previous inline replay)
       for (std::size_t r = 0; r < nused; ++r) {
         const std::vector<GCRecord> &gc = bufs_[slot][r];
-        for (const GCRecord &gr : gc) {
-          if (gr.kind == 1) {
-            for (const auto &v : FastqStats::gc_models[gr.a].models[gr.b])
-              master_.gc_count[v.percent] += v.increment;
-          }
-          else if (gr.kind == 2) {
-            ++master_.gc_count[gr.a];
+        if (gc2_) {  // both targets in one pass, each in read order
+          for (const GCRecord &gr : gc) {
+            if (gr.kind == 1) {
+              for (const auto &v : FastqStats::gc_models[gr.a].models[gr.b]) {
+                master_.gc_count[v.percent] += v.increment;
+                gc2_[v.percent] += v.increment;
+              }
+            }
+            else if (gr.kind == 2) {
+              ++master_.gc_count[gr.a];
+              ++gc2_[gr.a];
+            }
           }
         }
-        if (gc2_)
-          replay_gc_records(gc, gc2_);
+        else {
+          for (const GCRecord &gr : gc) {
+            if (gr.kind == 1) {
+              for (const auto &v : FastqStats::gc_models[gr.a].models[gr.b])
+                master_.gc_count[v.percent] += v.increment;
+            }
+            else if (gr.kind == 2) {
+              ++master_.gc_count[gr.a];
+            }
+          }
+        }
         if (sink_)
           sink_->insert(sink_->end(), gc.begin(), gc.end());
       }
@@ -2875,6 +2885,7 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
     H = config.paired_hooks;
     if (H) {
       H->used = true;
+      H->init_hist(nthreads);
       H->ends_with_newline = (size == 0 || base[size - 1] == '\n');
       if (H->keep_gc_records)
         replayer.set_record_sink(&H->gc_records);
@@ -2883,6 +2894,8 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
         cm = H->comb_map;
         cmbegin = cm->begin();
         dd2.init(cm->size());
+        H->comb_counts.assign(cm->size(), 0);
+        dd2.set_sink(&H->comb_counts);  // the map stays R1's own
       }
       else if (do_hash && H->wait_comb_map) {
         cm = H->wait_comb_map();
@@ -2895,10 +2908,25 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
       }
     }
   }
-  std::vector<std::vector<std::uint32_t>> rnf(H ? R_MAX : 0);
-  std::vector<std::vector<std::uint64_t>> rkf(H ? R_MAX : 0);
-  std::vector<double> bpr(nthreads, 0.0);  // bytes per record, per thread
+  std::vector<FpSpan> rspan(H ? R_MAX : 0);  // fingerprints per range
+  std::vector<FpSlab> slabs(nthreads);        // per-thread arena position
   bool comb_notified = false;
+  std::size_t pre_stop = 0;  // end of an adopted duplication prefix
+  if constexpr (std::is_same<P, FastqPolicy>::value) {
+    if (H && do_hash && H->prefix && H->prefix->full && nthreads >= 2 &&
+        master.sequence_count.size() == 0) {
+      PairedHooks::DupPrefix &dp = *H->prefix;
+      master.sequence_count = std::move(dp.map);
+      master.count_at_limit = dp.count_at_limit;
+      master.num_unique_seen = dp.num_unique_seen;
+      dup_seen = dp.reads;
+      dup_cont = false;
+      pre_stop = dp.stop;
+      mbegin = master.sequence_count.begin();
+    }
+    if (H)
+      H->prefix.reset();
+  }
   std::size_t off = P::find_start(base, size, 0);
   std::size_t dropped = 0;
   std::size_t plimit = 0, dup_stop = 0, nranges = 0;
@@ -2964,7 +2992,7 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
             total += counts[r];
           if (H)
             for (std::size_t r = 0; r < nranges; ++r)
-              H->take_range(rnf[r], rkf[r]);
+              H->take_range(rspan[r]);
           // Replay + page drop both run on the replay thread while the next
           // slice parses: the replay reads only its GCRecords, and the pages
           // dropped are the fully parsed previous slice (nothing reads them
@@ -3041,7 +3069,8 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
             warm_range(off, bound(std::min(nranges, 2 * nthreads)));
 
           // -- duplication prefix continues across slices (global read order) -
-          dup_stop = off;  // cap filled earlier: every record here is post-cap
+          // cap filled earlier: every record here past the prefix is post-cap
+          dup_stop = std::max(off, pre_stop);
           if (do_hash && dup_cont) {
             std::size_t p = off;
             const std::size_t dup_end = lazy ? lazy_end : plimit;
@@ -3147,25 +3176,15 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
         const char *pp = nullptr;
         std::size_t pn = 0;
         bool pv = false;
-        // this range's fingerprints, appended on the thread's stack (see
-        // LocalGCBuf) and moved back below
-        std::vector<std::uint32_t> nfv;
-        std::vector<std::uint64_t> kfv;
-        if (H) {
-          nfv.swap(rnf[r]);
-          kfv.swap(rkf[r]);
-          nfv.clear();
-          kfv.clear();
-          // size from this thread's bytes per record so far (chunks keep
-          // their capacity until they are concatenated)
-          if (bpr[tid] > 0) {
-            const std::size_t est =
-              static_cast<std::size_t>((pend - p) / bpr[tid] * 1.05) + 16;
-            nfv.reserve(est);
-            kfv.reserve(est);
-          }
-        }
-        const std::size_t p_first = p;
+        // this range's fingerprints, written into the thread's arena slab
+        // (a FASTQ record has at least 6 bytes, which bounds the count)
+        const std::size_t fp0 =
+          H ? slabs[tid].reserve(*H, (pend - p) / 6 + 2) : 0;
+        std::uint32_t *const khist = H ? H->key_hist[tid].data() : nullptr;
+        std::uint64_t chh = 0;
+        const char *cpp = nullptr;
+        std::size_t cpn = 0;
+        bool cv = false;
         while (p < pend) {
           const std::size_t rec_start = p;
           std::size_t seqlen = 0, tile_cur = 0;
@@ -3175,13 +3194,27 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
                            tail, seqlen, tile_cur, key);
           ++g;
           ++n;
-          if (H)
-            pair_fingerprints(base + rec_start, base + plimit, key, seqlen,
-                              nfv, kfv, cm, cm ? dd2.row(tid) : nullptr,
-                              cmbegin);
+          std::uint64_t hk = 0;
+          if (H) {
+            hk = pair_fingerprints(base + rec_start, base + plimit, key,
+                                   seqlen, slabs[tid].key[fp0 + n - 1],
+                                   slabs[tid].name[fp0 + n - 1]);
+            ++khist[slabs[tid].key[fp0 + n - 1] >> (64 - FP_BUCKET_BITS)];
+            if (cm) {  // combined view, deferred by one read like the
+                       // mate's own count below
+              const std::size_t klen = get_truncate_point(seqlen);
+              cm->prefetch(hk);
+              if (cv) {
+                const auto f = cm->find_hashed(chh, cpp, cpn);
+                if (f != cm->end())
+                  ++dd2.row(tid)[static_cast<std::size_t>(f - cmbegin)];
+              }
+              chh = hk; cpp = key; cpn = klen; cv = true;
+            }
+          }
           if (count_dup && rec_start >= dup_stop) {
             const std::size_t klen = get_truncate_point(seqlen);
-            const std::uint64_t h = DupHashMap::hash_of(key, klen);
+            const std::uint64_t h = H ? hk : DupHashMap::hash_of(key, klen);
             master.sequence_count.prefetch(h);
             if (pv) {
               const auto it = master.sequence_count.find_hashed(ph, pp, pn);
@@ -3200,11 +3233,15 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
           if (it != master.sequence_count.end())
             ++dd.row(tid)[static_cast<std::size_t>(it - mbegin)];
         }
+        if (cv) {
+          const auto f = cm->find_hashed(chh, cpp, cpn);
+          if (f != cm->end())
+            ++dd2.row(tid)[static_cast<std::size_t>(f - cmbegin)];
+        }
         if (H) {
-          if (n > 0)
-            bpr[tid] = static_cast<double>(p - p_first) / static_cast<double>(n);
-          rnf[r].swap(nfv);
-          rkf[r].swap(kfv);
+          rspan[r] = FpSpan{slabs[tid].key + fp0, slabs[tid].name + fp0, n,
+                            static_cast<std::uint32_t>(tid)};
+          slabs[tid].used += n;
         }
         counts[r] = n;  // == the count pass's value on well-formed input
         if (lazy)
@@ -3375,6 +3412,7 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
   char last_byte = '\n';
   if (H) {
     H->used = true;
+    H->init_hist(nthreads);
     if (H->keep_gc_records)
       replayer.set_record_sink(&H->gc_records);
     replayer.set_gc2(H->gc2);
@@ -3382,6 +3420,8 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
       cm = H->comb_map;
       cmbegin = cm->begin();
       dd2.init(cm->size());
+      H->comb_counts.assign(cm->size(), 0);
+      dd2.set_sink(&H->comb_counts);  // the map stays R1's own
     }
     else if (do_hash && H->wait_comb_map) {
       cm = H->wait_comb_map();
@@ -3393,9 +3433,8 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
       }
     }
   }
-  std::vector<std::vector<std::uint32_t>> rnf(H ? R_MAX : 0);
-  std::vector<std::vector<std::uint64_t>> rkf(H ? R_MAX : 0);
-  std::vector<double> bpr(nthreads, 0.0);  // bytes per record, per thread
+  std::vector<FpSpan> rspan(H ? R_MAX : 0);  // fingerprints per range
+  std::vector<FpSlab> slabs(nthreads);        // per-thread arena position
   bool comb_notified = false;
   // shared per-chunk state, written in `single` blocks (barriers publish it)
   std::size_t filled_end = 0, plimit = 0, dup_stop = 0, nranges = 0;
@@ -3442,7 +3481,7 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
               total += counts[r];
             if (H)
               for (std::size_t r = 0; r < nranges; ++r)
-                H->take_range(rnf[r], rkf[r]);
+                H->take_range(rspan[r]);
             replayer.submit(nranges);  // replays while this chunk parses
           }
           left = carry;
@@ -3649,23 +3688,14 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
         // pending probe is flushed before this range ends.
         std::uint64_t ph = 0; const char *pp = nullptr; std::size_t pn = 0;
         bool pv = false;
-        std::vector<std::uint32_t> nfv;  // see read_bytes_fused
-        std::vector<std::uint64_t> kfv;
-        if (H) {
-          nfv.swap(rnf[r]);
-          kfv.swap(rkf[r]);
-          nfv.clear();
-          kfv.clear();
-          // size from this thread's bytes per record so far (chunks keep
-          // their capacity until they are concatenated)
-          if (bpr[tid] > 0) {
-            const std::size_t est =
-              static_cast<std::size_t>((pend - p) / bpr[tid] * 1.05) + 16;
-            nfv.reserve(est);
-            kfv.reserve(est);
-          }
-        }
-        const std::size_t p_first = p;
+        // fingerprints into the thread's arena slab (see read_bytes_fused)
+        const std::size_t fp0 =
+          H ? slabs[tid].reserve(*H, (pend - p) / 6 + 2) : 0;
+        std::uint32_t *const khist = H ? H->key_hist[tid].data() : nullptr;
+        std::uint64_t chh = 0;
+        const char *cpp = nullptr;
+        std::size_t cpn = 0;
+        bool cv = false;
         while (p < pend) {
           const std::size_t rec_start = p;
           std::size_t seqlen = 0, tile_cur = 0;
@@ -3675,12 +3705,27 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
                                      tile_ignore, tail, seqlen, tile_cur, key);
           ++g;
           ++n;
-          if (H)
-            pair_fingerprints(buf + rec_start, buf + plimit, key, seqlen, nfv,
-                              kfv, cm, cm ? dd2.row(tid) : nullptr, cmbegin);
+          std::uint64_t hk = 0;
+          if (H) {
+            hk = pair_fingerprints(buf + rec_start, buf + plimit, key,
+                                   seqlen, slabs[tid].key[fp0 + n - 1],
+                                   slabs[tid].name[fp0 + n - 1]);
+            ++khist[slabs[tid].key[fp0 + n - 1] >> (64 - FP_BUCKET_BITS)];
+            if (cm) {  // combined view, deferred by one read like the
+                       // mate's own count below
+              const std::size_t klen = get_truncate_point(seqlen);
+              cm->prefetch(hk);
+              if (cv) {
+                const auto f = cm->find_hashed(chh, cpp, cpn);
+                if (f != cm->end())
+                  ++dd2.row(tid)[static_cast<std::size_t>(f - cmbegin)];
+              }
+              chh = hk; cpp = key; cpn = klen; cv = true;
+            }
+          }
           if (count_dup && rec_start >= dup_stop) {
             const std::size_t klen = get_truncate_point(seqlen);
-            const std::uint64_t h = DupHashMap::hash_of(key, klen);
+            const std::uint64_t h = H ? hk : DupHashMap::hash_of(key, klen);
             master.sequence_count.prefetch(h);
             if (pv) {
               const auto f = master.sequence_count.find_hashed(ph, pp, pn);
@@ -3695,11 +3740,15 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
           if (f != master.sequence_count.end())
             ++dd.row(tid)[static_cast<std::size_t>(f - mbegin)];
         }
+        if (cv) {
+          const auto f = cm->find_hashed(chh, cpp, cpn);
+          if (f != cm->end())
+            ++dd2.row(tid)[static_cast<std::size_t>(f - cmbegin)];
+        }
         if (H) {
-          if (n > 0)
-            bpr[tid] = static_cast<double>(p - p_first) / static_cast<double>(n);
-          rnf[r].swap(nfv);
-          rkf[r].swap(kfv);
+          rspan[r] = FpSpan{slabs[tid].key + fp0, slabs[tid].name + fp0, n,
+                            static_cast<std::uint32_t>(tid)};
+          slabs[tid].used += n;
         }
         counts[r] = n;  // == the count pass's value on well-formed input
       }  // barrier: counts[] complete, next chunk produced
@@ -3960,6 +4009,39 @@ class PlainFileChunkSource {
   std::atomic<bool> failed_{false};
 };
 #endif
+
+std::unique_ptr<PairedHooks::DupPrefix>
+fastq_dup_prefix(const std::string &filename) {
+  // the walk of read_bytes_fused's prefix over the whole file: records are
+  // consumed in file order until the tracker holds its last sequence
+  std::unique_ptr<PairedHooks::DupPrefix> r(new PairedHooks::DupPrefix);
+  PlainBlockReader src(filename);
+  const char *base = src.data();
+  const std::size_t size = src.size();
+  std::size_t p = FastqPolicy::find_start(base, size, 0);
+  bool cont = true;
+  while (cont && p < size) {
+    const char *key;
+    std::size_t klen;
+    const std::size_t next = FastqPolicy::dup_key(base, size, p, key, klen);
+    const auto fe = r->map.find_or_emplace(key, klen, 1);
+    if (fe.second) {
+      r->count_at_limit = r->reads;
+      ++r->num_unique_seen;
+      if (r->num_unique_seen == Constants::unique_reads_stop_counting)
+        cont = false;
+    }
+    else {
+      ++fe.first->second;
+      ++r->count_at_limit;
+    }
+    ++r->reads;
+    p = next;
+  }
+  r->stop = p;
+  r->full = !cont;
+  return r;
+}
 
 void
 read_uncompressed_chunked(FalcoConfig &config, FastqStats &master,

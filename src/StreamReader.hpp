@@ -23,6 +23,8 @@
 #include <bitset>
 #include <vector>
 #include <functional>
+#include <new>
+#include <algorithm>
 #if defined(__SSE2__)
 #include <emmintrin.h>
 #endif
@@ -86,24 +88,81 @@ using GCRecordPacked = GCRecord;
 // drivers (memory-mapped and streamed, tile-less, read_step 1) fill these per
 // read, in file order, when FalcoConfig::paired_hooks is set, and set `used`.
 // Other paths leave `used` false and the caller falls back to separate passes.
+// A run of consecutive reads' fingerprints, in file order: duplication keys
+// and (32-bit) read-name fingerprints in separate arrays.
+struct FpSpan {
+  std::uint64_t *key;
+  std::uint32_t *name;
+  std::size_t n;
+  std::uint32_t tid;  // parse thread that wrote it
+};
+
+// Duplication keys are partitioned by their top FP_BUCKET_BITS bits for the
+// exact counts; the parse threads count each bucket as they write the keys.
+constexpr unsigned FP_BUCKET_BITS = 12;
+
+// Bump allocator for fingerprints in large anonymous regions, backed by huge
+// pages where available: tens of millions of entries are written once by the
+// parse threads and read by the pairing report, and 4 KB first-touch faults
+// from 32 threads were a large part of the paired parse time. Regions are
+// reserved, not committed: only the entries a thread writes become resident,
+// so each thread takes one large region and appends its ranges to it.
+class FpArena {
+ public:
+  explicit FpArena(bool huge = true) : huge_(huge) {}
+  FpArena(const FpArena &) = delete;
+  FpArena &operator=(const FpArena &) = delete;
+  ~FpArena() { release(); }
+  void *grab(std::size_t bytes) {
+    void *p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (p == MAP_FAILED)
+      throw std::bad_alloc();
+#ifdef MADV_HUGEPAGE
+    if (huge_)
+      madvise(p, bytes, MADV_HUGEPAGE);
+#endif
+    std::lock_guard<std::mutex> lk(m_);
+    blocks_.emplace_back(p, bytes);
+    return p;
+  }
+  void release() {
+    for (auto &b : blocks_)
+      munmap(b.first, b.second);
+    blocks_.clear();
+  }
+
+ private:
+  bool huge_;
+  std::mutex m_;
+  std::vector<std::pair<void *, std::size_t>> blocks_;
+};
+
 struct PairedHooks {
-  // Fingerprints in file order, as consecutive chunks (one per parse range;
-  // moved, not copied, out of the parser). Names are compared only with the
-  // other mate's name at the same index, so 32 bits suffice.
-  std::vector<std::vector<std::uint32_t>> name_chunks;
-  std::vector<std::vector<std::uint64_t>> key_chunks;
+  // Fingerprints of every read in file order, as spans (one per parse range)
+  // into the arenas; the names are released once the mates are compared.
+  // (names are small and short-lived: regular pages, no per-thread 2 MB
+  // remainder)
+  FpArena key_arena{true}, name_arena{false};
+  std::vector<FpSpan> spans;
+  // per parse thread: number of keys in each bucket (see FP_BUCKET_BITS)
+  std::vector<std::vector<std::uint32_t>> key_hist;
+  void init_hist(std::size_t nthreads) {
+    key_hist.assign(nthreads, std::vector<std::uint32_t>(
+                                std::size_t(1) << FP_BUCKET_BITS, 0));
+  }
   std::size_t num_reads = 0;
   bool ends_with_newline = true;  // last byte of the stream is '\n'
   // First mate: called once with its duplication map as soon as the map
   // holds every tracked sequence (100k distinct), or with nullptr at the end
   // of the read if it never does. From then on the map's key set is fixed.
   std::function<void(DupHashMap *)> on_comb_map;
-  // Second mate, combined view. Either live (the first mate has finished):
-  // GC contributions are also added to gc2 in read order and every read's key
-  // is counted into comb_map; or deferred (mates read concurrently):
+  // Second mate, combined view. Every read's key is counted against the
+  // first mate's map into comb_counts (same indices). Either live (the first
+  // mate has finished): GC contributions are also added to gc2 in read order
+  // and the map is comb_map; or deferred (mates read concurrently):
   // wait_comb_map blocks until the first mate's map is fixed and returns it
-  // (or nullptr), keys are counted into comb_counts (same indices), and the
-  // GC records are kept in read order (gc_records).
+  // (or nullptr), and the GC records are kept in read order (gc_records).
   double *gc2 = nullptr;
   DupHashMap *comb_map = nullptr;
   std::function<DupHashMap *()> wait_comb_map;
@@ -112,16 +171,45 @@ struct PairedHooks {
   std::vector<GCRecordPacked> gc_records;
   bool used = false;
   bool failed = false;  // a driver restarted the file: contents unusable
+  // Second mate: its duplication prefix (the reads up to the one that fills
+  // the tracker), computed ahead while the first mate is read; only the
+  // memory-mapped driver adopts it, any other driver ignores it.
+  struct DupPrefix {
+    DupHashMap map;
+    std::size_t count_at_limit = 0, num_unique_seen = 0;
+    std::size_t reads = 0;  // reads consumed
+    std::size_t stop = 0;   // byte offset of the first read not consumed
+    bool full = false;      // the tracker filled before the end of the file
+  };
+  std::unique_ptr<DupPrefix> prefix;
 
   // Called by a driver, in file order, for each parsed range.
-  void take_range(std::vector<std::uint32_t> &names,
-                  std::vector<std::uint64_t> &keys) {
-    name_chunks.emplace_back();
-    name_chunks.back().swap(names);
-    num_reads += keys.size();
-    key_chunks.emplace_back();
-    key_chunks.back().swap(keys);
+  void take_range(const FpSpan &sp) {
+    if (sp.n == 0)
+      return;
+    spans.push_back(sp);
+    num_reads += sp.n;
   }
+};
+
+// Per-thread write position into a PairedHooks' arenas.
+struct FpSlab {
+  std::uint64_t *key = nullptr;
+  std::uint32_t *name = nullptr;
+  std::size_t cap = 0, used = 0;
+  // room for `max_recs` more entries; returns the first free index
+  std::size_t reserve(PairedHooks &h, std::size_t max_recs) {
+    if (cap - used < max_recs) {
+      cap = std::max<std::size_t>(max_recs, REGION);
+      key = static_cast<std::uint64_t *>(
+        h.key_arena.grab(cap * sizeof(std::uint64_t)));
+      name = static_cast<std::uint32_t *>(
+        h.name_arena.grab(cap * sizeof(std::uint32_t)));
+      used = 0;
+    }
+    return used;
+  }
+  static constexpr std::size_t REGION = std::size_t(1) << 25;  // entries
 };
 
 // Fingerprints of a FASTQ record for the pairing check and the exact paired
@@ -915,6 +1003,11 @@ void read_uncompressed_parallel(FalcoConfig &config, FastqStats &master,
 // single-threaded pass; read_step == 1 only.
 void read_uncompressed_chunked(FalcoConfig &config, FastqStats &master,
                                size_t nthreads);
+
+// [FalcoAmadeus] The duplication prefix of an uncompressed FASTQ file, as the
+// memory-mapped driver computes it (see PairedHooks::prefix).
+std::unique_ptr<PairedHooks::DupPrefix>
+fastq_dup_prefix(const std::string &filename);
 
 // [FalcoAmadeus] Parallel SAM driver: mmap the text, byte-split into per-thread
 // line ranges, parse in place. Byte-identical to the serial SamReader.
