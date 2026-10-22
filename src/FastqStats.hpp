@@ -24,6 +24,9 @@
 #include "dup_hash_map.hpp"
 #include <array>
 #include <mutex>
+#include <new>
+#include <cstring>
+#include <cstdlib>
 #include <cstdint>
 #include "FalcoConfig.hpp"
 // log of a power of two, to use in bit shifting for fast index acces
@@ -119,6 +122,40 @@ struct GCModel {
 /*************************************************************
  ******************** FASTQ STATS ****************************
  *************************************************************/
+
+// [FalcoAmadeus] Fixed-size zero-initialised array in calloc'd storage.
+// Large calloc blocks come from fresh zero pages, so the parts a run never
+// writes (e.g. the per-position rows beyond the longest read) never become
+// resident; every worker thread carries one of these per large table.
+template <class T, std::size_t N>
+class ZeroedArray {
+ public:
+  ZeroedArray() : p_(static_cast<T *>(std::calloc(N, sizeof(T)))) {
+    if (p_ == nullptr)
+      throw std::bad_alloc();
+  }
+  ZeroedArray(const ZeroedArray &o) : ZeroedArray() {
+    std::memcpy(p_, o.p_, N * sizeof(T));
+  }
+  ZeroedArray &operator=(const ZeroedArray &o) {
+    if (this != &o)
+      std::memcpy(p_, o.p_, N * sizeof(T));
+    return *this;
+  }
+  ~ZeroedArray() { std::free(p_); }
+  T &operator[](std::size_t i) { return p_[i]; }
+  const T &operator[](std::size_t i) const { return p_[i]; }
+  T *data() { return p_; }
+  const T *data() const { return p_; }
+  static constexpr std::size_t size() { return N; }
+  T *begin() { return p_; }
+  T *end() { return p_ + N; }
+  const T *begin() const { return p_; }
+  const T *end() const { return p_ + N; }
+
+ private:
+  T *p_;
+};
 
 struct FastqStats {
   // number of bases for static allocation.
@@ -236,7 +273,7 @@ struct FastqStats {
 
   /*********** PER QUALITY VALUE METRICS ****************/
   // Counts of quality in each base position
-  std::array<size_t, kNumQualityValues * SHORT_READ_THRESHOLD> position_quality_count;
+  ZeroedArray<size_t, kNumQualityValues * SHORT_READ_THRESHOLD> position_quality_count;
 
   // [FalcoAmadeus] Transposed per-base quality tile [quality*THRESHOLD + pos].
   // The straight `++position_quality_count[(pos << 7) | qv]` scatter walks a
@@ -256,7 +293,7 @@ struct FastqStats {
   // position_quality_count writers (none remain in-buffer today) with tile
   // writers would also be safe -- addition commutes -- as long as the tile is
   // fully flushed before any read.
-  std::array<std::uint16_t, kNumQualityValues * SHORT_READ_THRESHOLD> qual_tile;
+  ZeroedArray<std::uint16_t, kNumQualityValues * SHORT_READ_THRESHOLD> qual_tile;
   std::uint32_t qual_tile_reads;  // reads accumulated since the last flush
   static const std::uint32_t kQualTileFlushReads = 60000;
   void flush_qtile();  // fold qual_tile into position_quality_count

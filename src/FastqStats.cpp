@@ -70,12 +70,16 @@ FastqStats::flush_tile8() {
 // commutes, so the result is byte-identical to the direct scatter.
 void
 FastqStats::flush_qtile() {
+  // Only nonzero tile entries are folded and cleared: adding or storing a
+  // zero would dirty (and make resident) every page of both tables.
   for (std::size_t q = 0; q < kNumQualityValues; ++q) {
-    const std::uint16_t *src = &qual_tile[q * SHORT_READ_THRESHOLD];
+    std::uint16_t *src = &qual_tile[q * SHORT_READ_THRESHOLD];
     for (std::size_t p = 0; p < SHORT_READ_THRESHOLD; ++p)
-      position_quality_count[(p << kBitShiftQuality) | q] += src[p];
+      if (src[p] != 0) {
+        position_quality_count[(p << kBitShiftQuality) | q] += src[p];
+        src[p] = 0;
+      }
   }
-  qual_tile.fill(0);
   qual_tile_reads = 0;
 }
 
@@ -104,8 +108,7 @@ FastqStats::FastqStats(bool need_kmer) {
   read_length_freq.fill(0);
   quality_count.fill(0);
   gc_count.fill(0);
-  position_quality_count.fill(0);
-  qual_tile.fill(0);
+  // position_quality_count and qual_tile start zeroed (ZeroedArray)
   qual_tile_reads = 0;
   pos_kmer_count.fill(0);
   pos_adapter_count.fill(0);
