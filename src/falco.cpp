@@ -1178,7 +1178,15 @@ main(int argc, char *argv[]) {
   // user has not chosen a policy, set it and re-execute this binary once.
   // An explicit OMP_WAIT_POLICY is always respected; if re-execution is
   // unavailable the run simply continues with the default policy.
-  if (std::getenv("OMP_WAIT_POLICY") == nullptr) {
+  // Single-threaded runs have no idle team threads, so they skip the re-exec.
+  bool multithreaded = false;
+  for (int i = 1; i + 1 < argc; ++i) {
+    const std::string a = argv[i];
+    if ((a == "-t" || a == "--threads" || a == "-threads") &&
+        std::atoi(argv[i + 1]) > 1)
+      multithreaded = true;
+  }
+  if (multithreaded && std::getenv("OMP_WAIT_POLICY") == nullptr) {
     setenv("OMP_WAIT_POLICY", "passive", 1);
 #ifdef __linux__
     execv("/proc/self/exe", argv);
