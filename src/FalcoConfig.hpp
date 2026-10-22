@@ -190,6 +190,10 @@ struct FalcoConfig {
   // disagree (mates out of order or files from different runs), since every
   // paired statistic would be meaningless. This overrides that check.
   bool allow_unmatched_pairs = false;
+  // [FalcoAmadeus] when non-empty, the FASTQ input is the concatenation of
+  // these files, streamed directly (paired-end combined view); filename is
+  // then the first file, used for format/tile detection.
+  std::vector<std::string> pooled_inputs;
 
   /*********** FUNCTIONS TO READ FILES *************/
   void define_file_format();

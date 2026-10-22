@@ -830,6 +830,15 @@ void read_sam_chunked(FalcoConfig &config, FastqStats &master, size_t nthreads);
 // read_gz_parallel when built without htslib.
 void read_gz_chunked(FalcoConfig &config, FastqStats &master, size_t nthreads);
 
+// [FalcoAmadeus] Paired-end combined view: parse several FASTQ/FASTQ.gz files
+// as ONE stream (their concatenation), without writing a concatenated copy.
+// Supported for tile-less input when built with ISA-L; callers check
+// pooled_stream_supported() first and otherwise concatenate to a file.
+bool pooled_stream_supported(const FalcoConfig &config,
+                             const std::string &first_file);
+void read_pooled_fastq(FalcoConfig &config, FastqStats &master,
+                       size_t nthreads, const std::vector<std::string> &files);
+
 // [FalcoAmadeus] Fully parallel BAM driver: decompress the BGZF to a temp file
 // (drop-behind), walk the record offsets serially (cheap), then parse records in
 // parallel across nthreads, byte-identical to the serial BamReader path.

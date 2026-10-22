@@ -3751,6 +3751,111 @@ read_gz_chunked(FalcoConfig &config, FastqStats &master,
 #endif
 }
 
+#if defined(USE_ISAL)
+// [FalcoAmadeus] Byte source that yields the concatenation of several FASTQ
+// files, each decompressed with ISA-L when gzipped (by magic bytes) or read
+// as-is otherwise. Feeding it to read_stream_fused parses exactly the bytes a
+// concatenated copy would hold, without writing that copy.
+class ChainedFastqSource {
+ public:
+  explicit ChainedFastqSource(const std::vector<std::string> &files)
+      : files_(files) {}
+  ~ChainedFastqSource() { close_plain(); }
+  ChainedFastqSource(const ChainedFastqSource &) = delete;
+  ChainedFastqSource &operator=(const ChainedFastqSource &) = delete;
+
+  size_t fill(char *out, size_t cap) {
+    while (idx_ < files_.size()) {
+      if (!open_ && !open_next())
+        return 0;
+      size_t got = 0;
+      if (gz_) {
+        got = gz_->fill(out, cap);
+      }
+      else {
+        while (got < cap) {
+          const ssize_t n = ::read(fd_, out + got, cap - got);
+          if (n < 0)
+            throw std::runtime_error("read error in file: " + files_[idx_]);
+          if (n == 0)
+            break;
+          got += static_cast<size_t>(n);
+        }
+      }
+      if (got > 0)
+        return got;
+      // current file exhausted: move on to the next one
+      gz_.reset();
+      close_plain();
+      open_ = false;
+      ++idx_;
+    }
+    return 0;
+  }
+
+ private:
+  bool open_next() {
+    const std::string &f = files_[idx_];
+    unsigned char magic[2] = {0, 0};
+    const int fd = ::open(f.c_str(), O_RDONLY);
+    if (fd < 0)
+      throw std::runtime_error("Cannot open FASTQ file : " + f);
+    const bool is_gz = (::read(fd, magic, 2) == 2 && magic[0] == 0x1f &&
+                        magic[1] == 0x8b);
+    if (is_gz) {
+      ::close(fd);
+      gz_.reset(new IsalInflater(f));
+    }
+    else {
+      ::lseek(fd, 0, SEEK_SET);
+      fd_ = fd;
+    }
+    open_ = true;
+    return true;
+  }
+  void close_plain() {
+    if (fd_ >= 0)
+      ::close(fd_);
+    fd_ = -1;
+  }
+
+  std::vector<std::string> files_;
+  size_t idx_ = 0;
+  bool open_ = false;
+  int fd_ = -1;
+  std::unique_ptr<IsalInflater> gz_;
+};
+#endif
+
+bool
+pooled_stream_supported(const FalcoConfig &config,
+                        const std::string &first_file) {
+#if defined(USE_ISAL)
+  // The stream driver is tile-less (a stream cannot be pre-scanned for the
+  // per-tile module); tiled input must use a concatenated file instead.
+  FalcoConfig probe = config;
+  probe.filename = first_file;
+  ParallelWorker w(probe, FastqStats::SHORT_READ_THRESHOLD);
+  return w.tile_ignore;
+#else
+  (void)config;
+  (void)first_file;
+  return false;
+#endif
+}
+
+void
+read_pooled_fastq(FalcoConfig &config, FastqStats &master, size_t nthreads,
+                  const std::vector<std::string> &files) {
+#if defined(USE_ISAL)
+  ChainedFastqSource src(files);
+  read_stream_fused(config, master, nthreads, src);
+#else
+  (void)config; (void)master; (void)nthreads; (void)files;
+  throw std::runtime_error("pooled FASTQ streaming requires ISA-L");
+#endif
+}
+
 /*******************************************************/
 /*************** READ SAM RECORD ***********************/
 /*******************************************************/

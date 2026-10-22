@@ -974,7 +974,11 @@ analyze_and_write(FalcoConfig &falco_config, const std::string &filename,
     // chunked parallel parse, byte-identical to single-threaded. Only for
     // read_step == 1; the subsampling counter logic is left to the serial path
     // otherwise.
-    if (bytesplit_seek) {
+    if (!falco_config.pooled_inputs.empty()) {
+      read_pooled_fastq(falco_config, stats, falco_config.threads,
+                        falco_config.pooled_inputs);
+    }
+    else if (bytesplit_seek) {
       // fused gz driver at every thread count: -t1 also gains the in-place
       // chunk parse over the serial reader's per-line getline copies
       read_gz_chunked(falco_config, stats, falco_config.threads);
@@ -995,7 +999,11 @@ analyze_and_write(FalcoConfig &falco_config, const std::string &filename,
     // multi-threaded parser: memory-mapped dispatch + parallel per-read stats,
     // byte-identical to single-threaded. Only for read_step == 1 (same reason
     // as the gzipped path).
-    if (bytesplit_seek) {
+    if (!falco_config.pooled_inputs.empty()) {
+      read_pooled_fastq(falco_config, stats, falco_config.threads,
+                        falco_config.pooled_inputs);
+    }
+    else if (bytesplit_seek) {
       read_uncompressed_chunked(falco_config, stats, falco_config.threads);
     }
     else {
@@ -1681,19 +1689,32 @@ main(int argc, char *argv[]) {
               sample.compare(sample.size() - tag.size(), tag.size(), tag) == 0)
             sample.erase(sample.size() - tag.size());
 
-          // Combined view: analyse R1+R2 pooled as a single dataset. Byte-
-          // concatenate the two inputs into a temp file (multi-member gzip is
-          // read in full) and run the standard pipeline; only the HTML is
-          // needed here, so text/summary are skipped and the temp dir removed.
+          // Combined view: analyse R1+R2 pooled as a single dataset, i.e. the
+          // concatenation of the two inputs. When supported (tile-less input,
+          // ISA-L build) the two files are streamed back to back with no copy;
+          // otherwise they are concatenated into a temporary file (multi-member
+          // gzip is read in full). Either way the parser sees the same bytes.
           const std::string comb_dir = cur_outdir + "/" + sample + "_combined";
           std::error_code cc;
           std::filesystem::create_directories(comb_dir, cc);
           const bool r1_gz =
             filename.size() >= 3 &&
             filename.compare(filename.size() - 3, 3, ".gz") == 0;
-          const std::string pooled_in =
-            comb_dir + "/" + sample + (r1_gz ? ".fastq.gz" : ".fastq");
-          {
+          const std::string pooled_name =
+            sample + (r1_gz ? ".fastq.gz" : ".fastq");
+          const bool stream_pooled =
+            pooled_stream_supported(falco_config, filename);
+          std::string pooled_in = comb_dir + "/" + pooled_name;
+          const std::string saved_sample_name = falco_config.sample_name;
+          if (stream_pooled) {
+            // read R1 then R2 directly; R1 provides format and tile detection,
+            // and the report keeps the pooled name as its Filename label
+            pooled_in = filename;
+            falco_config.pooled_inputs = {filename, paired_with_file};
+            if (falco_config.sample_name.empty())
+              falco_config.sample_name = pooled_name;
+          }
+          else {
             std::ofstream po(pooled_in, std::ofstream::binary);
             append_file_bytes(po, filename);
             append_file_bytes(po, paired_with_file);
@@ -1721,6 +1742,8 @@ main(int argc, char *argv[]) {
                             /*skip_short_summary=*/!want_comb_data, do_call, true,
                             " (combined)");
           falco_config.combined_note.clear();  // don't leak to other reports
+          falco_config.pooled_inputs.clear();
+          falco_config.sample_name = saved_sample_name;
 
           std::error_code rc;
           // The combined HTML report (three tabs) -- unless HTML is skipped.
