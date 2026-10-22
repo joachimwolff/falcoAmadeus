@@ -1,5 +1,45 @@
 # Changelog
 
+## FalcoAmadeus 4 (unreleased)
+
+### Changed
+
+- **Paired-end duplication is counted exactly.** `paired_duplication.txt`
+  previously reported the FastQC estimator (which tracks the first 100,000
+  distinct sequences and extrapolates) as the paired rate, so the result
+  depended on where duplicates sat in the file: 45% true duplication read as
+  0% when the copies came late and 47.4% when early. The paired, Read1-only
+  and Read2-only rates are now counted exactly over all reads from 64-bit
+  fingerprints and are independent of read order. The FastQC-style estimates
+  remain as separately labelled rows for comparison with FastQC/falco. The
+  row names changed (`Paired-end exact`, `Paired-end FastQC-style`, ...).
+- **Idle threads sleep instead of spinning** (`OMP_WAIT_POLICY=passive`
+  unless the user sets it): 10-35% less CPU time at unchanged wall time; on
+  an 8-CPU machine `-t 8` now uses 15% more CPU than `-t 1` (was 60%).
+
+### Fixed
+
+- **Mates out of order are rejected.** `--paired-with` accepted R1/R2 files
+  whose read identifiers did not correspond and reported a duplicate rate
+  for meaningless pairs. Mismatched identifiers now stop the run with an
+  explanatory error; `--allow-unmatched-pairs` overrides.
+
+### Performance
+
+- Paired mode reads both mates concurrently in large ISA-L/zlib blocks and
+  streams the pooled combined view instead of writing a concatenated
+  temporary copy of both inputs (tiled input and builds without ISA-L keep
+  the temporary copy). 2M simulated pairs, `-t 8`: uncompressed 2.64 s to
+  0.93 s, gzip 5.5 s to 2.8 s.
+
+### Tests
+
+- `test/paired/`: a deterministic paired-end simulator with known duplicate
+  fractions and a test script (in CI) covering late/early/shuffled copies,
+  shared-R1-only copies, mate reordering and thread invariance.
+- The upstream parity gate now compares against falco 1.3.2 (identical
+  output to 1.3.1 on the bundled tests).
+
 ## FalcoAmadeus 3
 
 A portability and memory release, verified end to end on Apple Silicon
@@ -26,9 +66,10 @@ A portability and memory release, verified end to end on Apple Silicon
 ### Notes
 
 - On Apple Silicon (163M reads, M3 Pro): BAM 9.7&nbsp;s at `-t 12`
-  (~36x falco 1.3.1), gzipped FASTQ 40&nbsp;s (~10x). falco2 cannot be built
-  on macOS at all (its source needs C++23 `std::views::enumerate`, which
-  libc++ does not implement).
+  (~36x falco 1.3.1), gzipped FASTQ 40&nbsp;s (~10x). The unreleased falco2
+  master of 2026-08-05 could not be built with the conda clang/libc++
+  toolchain on macOS (C++23 `std::views::enumerate`); falco 2.0.2 and later
+  add macOS build support.
 
 ## FalcoAmadeus 2
 
