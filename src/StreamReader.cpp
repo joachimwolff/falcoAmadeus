@@ -2540,6 +2540,40 @@ read_bytesplit_core(FalcoConfig &config, FastqStats &master,
 // worker stats, the read-only duplication map and the deltas; the dup-prefix
 // continuation touches master.sequence_count/num_unique_seen/count_at_limit
 // -- all disjoint from gc_count).
+// [FalcoAmadeus] Per-thread post-cap duplication counts in 32-bit cells
+// (half the memory of size_t: 100k cells per thread). Before a slice/chunk is
+// parsed, reserve() is given an upper bound on its record count (its length
+// in bytes: records start at distinct bytes); whenever the counts since the
+// last fold could exceed 2^32 - 1, all cells are first folded into the map.
+// Integer adds commute, so the final counts are those of size_t cells.
+class DupDeltas32 {
+ public:
+  explicit DupDeltas32(std::size_t nthreads) : d_(nthreads) {}
+  void init(std::size_t nent) {
+    for (auto &v : d_)
+      v.assign(nent, 0);
+  }
+  std::uint32_t *row(std::size_t tid) { return d_[tid].data(); }
+  void reserve(std::size_t max_records, DupHashMap::iterator mbegin) {
+    if (since_ + max_records > UINT32_MAX) {
+      fold(mbegin);
+      since_ = 0;
+    }
+    since_ += max_records;
+  }
+  void fold(DupHashMap::iterator mbegin) {
+    for (auto &v : d_)
+      for (std::size_t i = 0; i < v.size(); ++i) {
+        (mbegin + i)->second += v[i];
+        v[i] = 0;
+      }
+  }
+
+ private:
+  std::vector<std::vector<std::uint32_t>> d_;
+  std::size_t since_ = 0;
+};
+
 // [FalcoAmadeus] A range's GC record vector, moved onto the parsing
 // thread's stack for the duration of the range. The vectors of neighbouring
 // ranges are adjacent 24-byte objects, so appending through the shared array
@@ -2724,7 +2758,8 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
 
   std::vector<std::unique_ptr<typename P::Worker>> workers(nthreads);
   std::vector<std::unique_ptr<FastqStats>> wstats(nthreads);
-  std::vector<std::vector<std::size_t>> deltas(nthreads);
+  std::vector<std::vector<std::size_t>> deltas(nthreads);  // stays empty
+  DupDeltas32 dd(nthreads);
 
   // [FalcoAmadeus] The global read index g is consumed only by k-mer
   // subsampling (g % num_reads_for_kmer; read_step == 1 here), tile sampling
@@ -2932,9 +2967,10 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
           if (count_dup && nent == 0) {
             nent = master.sequence_count.size();
             mbegin = master.sequence_count.begin();
-            for (std::size_t t = 0; t < nthreads; ++t)
-              deltas[t].assign(nent, 0);
+            dd.init(nent);
           }
+          if (count_dup)
+            dd.reserve(sbytes, mbegin);
           slice_open = true;
           ++n_slices;
         }
@@ -3013,7 +3049,7 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
             if (pv) {
               const auto it = master.sequence_count.find_hashed(ph, pp, pn);
               if (it != master.sequence_count.end())
-                ++deltas[tid][static_cast<std::size_t>(it - mbegin)];
+                ++dd.row(tid)[static_cast<std::size_t>(it - mbegin)];
             }
             ph = h; pp = key; pn = klen; pv = true;
           }
@@ -3025,7 +3061,7 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
         if (pv) {
           const auto it = master.sequence_count.find_hashed(ph, pp, pn);
           if (it != master.sequence_count.end())
-            ++deltas[tid][static_cast<std::size_t>(it - mbegin)];
+            ++dd.row(tid)[static_cast<std::size_t>(it - mbegin)];
         }
         counts[r] = n;  // == the count pass's value on well-formed input
         if (lazy)
@@ -3044,6 +3080,8 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
   std::vector<std::vector<std::pair<std::uint32_t, std::uint32_t>>> tilerecs(
     nthreads);
   const bool count_dup_final = do_hash && !dup_cont;
+  if (count_dup_final)
+    dd.fold(mbegin);
   merge_worker_stats(config, master, nthreads, total, wstats, empty_gc, deltas,
                      tilerecs, gstart, count_dup_final,
                      /*tile_ignore=*/true, /*skip_gc=*/true);
@@ -3151,7 +3189,8 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
 
   std::vector<std::unique_ptr<ParallelWorker>> workers(nthreads);
   std::vector<std::unique_ptr<FastqStats>> wstats(nthreads);
-  std::vector<std::vector<std::size_t>> deltas(nthreads);
+  std::vector<std::vector<std::size_t>> deltas(nthreads);  // stays empty
+  DupDeltas32 dd(nthreads);
   for (std::size_t t = 0; t < nthreads; ++t) {
     workers[t].reset(new ParallelWorker(config, BUF));
     wstats[t].reset(new FastqStats(config.do_kmer));
@@ -3325,9 +3364,10 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
             if (count_dup && nent == 0) {  // freeze the map, size deltas
               nent = master.sequence_count.size();
               mbegin = master.sequence_count.begin();
-              for (std::size_t t = 0; t < nthreads; ++t)
-                deltas[t].assign(nent, 0);
+              dd.init(nent);
             }
+            if (count_dup)
+              dd.reserve(plimit, mbegin);
             slice_open = true;
           }
           else if (eof) {
@@ -3429,7 +3469,7 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
             if (pv) {
               const auto f = master.sequence_count.find_hashed(ph, pp, pn);
               if (f != master.sequence_count.end())
-                ++deltas[tid][static_cast<std::size_t>(f - mbegin)];
+                ++dd.row(tid)[static_cast<std::size_t>(f - mbegin)];
             }
             ph = h; pp = key; pn = klen; pv = true;
           }
@@ -3437,7 +3477,7 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
         if (pv) {
           const auto f = master.sequence_count.find_hashed(ph, pp, pn);
           if (f != master.sequence_count.end())
-            ++deltas[tid][static_cast<std::size_t>(f - mbegin)];
+            ++dd.row(tid)[static_cast<std::size_t>(f - mbegin)];
         }
         counts[r] = n;  // == the count pass's value on well-formed input
       }  // barrier: counts[] complete, next chunk produced
@@ -3449,6 +3489,8 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
   std::vector<std::vector<std::pair<std::uint32_t, std::uint32_t>>> tilerecs(
     nthreads);
   const bool count_dup_final = do_hash && !dup_cont;
+  if (count_dup_final)
+    dd.fold(mbegin);
   merge_worker_stats(config, master, nthreads, total, wstats, empty_gc, deltas,
                      tilerecs, gstart, count_dup_final,
                      /*tile_ignore=*/true, /*skip_gc=*/true);
