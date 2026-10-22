@@ -32,6 +32,11 @@
 double
 get_corrected_count(std::size_t count_at_limit, std::size_t num_reads,
                     std::size_t dup_level, std::size_t num_obs);
+// Batch form, bit-identical per element to get_corrected_count.
+void
+get_corrected_counts(std::size_t count_at_limit, std::size_t num_reads,
+                     const std::size_t *dup_level, const std::size_t *num_obs,
+                     double *out, std::size_t n);
 
 /* base groups for longer reads, copied from FastQC*/
 struct BaseGroup {

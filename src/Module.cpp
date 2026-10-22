@@ -16,6 +16,10 @@
 #include "Module.hpp"
 
 #include <algorithm>
+#if defined(__x86_64__)
+#include <immintrin.h>
+#endif
+#include <cstdint>
 #include <cassert>
 #include <cctype>
 #include <cmath>
@@ -197,6 +201,154 @@ get_corrected_count(std::size_t count_at_limit, std::size_t num_reads,
   // proportion
   return num_obs /
          std::max(std::numeric_limits<double>::min(), 1.0 - p_not_seeing);
+}
+
+// [FalcoAmadeus] get_corrected_count for up to 8 duplication levels at once.
+// Every lane executes exactly the scalar operation sequence (same integer
+// operands converted to double, quotient then product, same early exit), and
+// IEEE division and multiplication are correctly rounded in every instruction
+// set, so each result is bit-identical to get_corrected_count. The lanes only
+// hide the latency of the dependent product chain.
+static void
+corrected_count_lanes(std::size_t count_at_limit, std::size_t num_reads,
+                      const std::size_t *dup_level, const double *lim,
+                      double *p_not_seeing, std::size_t nlanes) {
+  constexpr std::size_t L = 8;
+  std::size_t d[L];
+  double lm[L], p[L];
+  std::uint64_t act[L];
+  for (std::size_t l = 0; l < L; ++l) {
+    const bool used = l < nlanes;
+    d[l] = used ? dup_level[l] : 0;
+    lm[l] = used ? lim[l] : 0.0;
+    p[l] = 1.0;
+    act[l] = used ? ~std::uint64_t(0) : 0;
+  }
+  for (std::size_t i = 0; i < count_at_limit;) {
+    const std::size_t stop = std::min(count_at_limit, i + 64);
+    for (; i < stop; ++i) {
+      const std::size_t rem = num_reads - i;
+      const double den = static_cast<double>(rem);
+      for (std::size_t l = 0; l < L; ++l) {
+        const double np = p[l] * (static_cast<double>(rem - d[l]) / den);
+        const std::uint64_t done = (np < lm[l]) ? ~std::uint64_t(0) : 0;
+        const double nv = done ? 0.0 : np;
+        p[l] = act[l] ? nv : p[l];
+        act[l] &= ~done;
+      }
+    }
+    std::uint64_t any = 0;
+    for (std::size_t l = 0; l < L; ++l)
+      any |= act[l];
+    if (!any)
+      break;
+  }
+  for (std::size_t l = 0; l < nlanes; ++l)
+    p_not_seeing[l] = p[l];
+}
+
+#if defined(__x86_64__)
+// AVX2 form of corrected_count_lanes, 8 lanes in two registers. Integer
+// operands below 2^52 convert exactly through the 2^52 bias trick, which is
+// the value static_cast<double> produces; the caller guarantees that range.
+__attribute__((target("avx2"))) static void
+corrected_count_lanes_avx2(std::size_t count_at_limit, std::size_t num_reads,
+                           const std::size_t *dup_level, const double *lim,
+                           double *p_not_seeing, std::size_t nlanes) {
+  alignas(32) std::int64_t d[8];
+  alignas(32) double lm[8], pout[8];
+  alignas(32) std::int64_t am[8];
+  for (std::size_t l = 0; l < 8; ++l) {
+    const bool used = l < nlanes;
+    d[l] = used ? static_cast<std::int64_t>(dup_level[l]) : 0;
+    lm[l] = used ? lim[l] : 0.0;
+    am[l] = used ? -1 : 0;
+  }
+  const __m256i bias_i = _mm256_set1_epi64x(0x4330000000000000LL);
+  const __m256d bias_d = _mm256_set1_pd(4503599627370496.0);  // 2^52
+#define FA_TO_D(x)                                                         \
+  _mm256_sub_pd(_mm256_castsi256_pd(_mm256_or_si256((x), bias_i)), bias_d)
+  const __m256i d0 = _mm256_load_si256(reinterpret_cast<const __m256i *>(d));
+  const __m256i d1 =
+    _mm256_load_si256(reinterpret_cast<const __m256i *>(d + 4));
+  const __m256d lm0 = _mm256_load_pd(lm), lm1 = _mm256_load_pd(lm + 4);
+  __m256d a0 = _mm256_castsi256_pd(
+    _mm256_load_si256(reinterpret_cast<const __m256i *>(am)));
+  __m256d a1 = _mm256_castsi256_pd(
+    _mm256_load_si256(reinterpret_cast<const __m256i *>(am + 4)));
+  __m256d p0 = _mm256_set1_pd(1.0), p1 = p0;
+  const __m256d zero = _mm256_setzero_pd();
+  for (std::size_t i = 0; i < count_at_limit;) {
+    const std::size_t stop = std::min(count_at_limit, i + 64);
+    for (; i < stop; ++i) {
+      const std::int64_t rem = static_cast<std::int64_t>(num_reads - i);
+      const __m256i r = _mm256_set1_epi64x(rem);
+      const __m256d den = _mm256_set1_pd(static_cast<double>(rem));
+      const __m256d q0 = _mm256_div_pd(FA_TO_D(_mm256_sub_epi64(r, d0)), den);
+      const __m256d q1 = _mm256_div_pd(FA_TO_D(_mm256_sub_epi64(r, d1)), den);
+      const __m256d n0 = _mm256_mul_pd(p0, q0), n1 = _mm256_mul_pd(p1, q1);
+      const __m256d x0 = _mm256_cmp_pd(n0, lm0, _CMP_LT_OQ);
+      const __m256d x1 = _mm256_cmp_pd(n1, lm1, _CMP_LT_OQ);
+      p0 = _mm256_blendv_pd(p0, _mm256_blendv_pd(n0, zero, x0), a0);
+      p1 = _mm256_blendv_pd(p1, _mm256_blendv_pd(n1, zero, x1), a1);
+      a0 = _mm256_andnot_pd(x0, a0);
+      a1 = _mm256_andnot_pd(x1, a1);
+    }
+    if (_mm256_movemask_pd(_mm256_or_pd(a0, a1)) == 0)
+      break;
+  }
+#undef FA_TO_D
+  _mm256_store_pd(pout, p0);
+  _mm256_store_pd(pout + 4, p1);
+  for (std::size_t l = 0; l < nlanes; ++l)
+    p_not_seeing[l] = pout[l];
+}
+#endif
+
+void
+get_corrected_counts(std::size_t count_at_limit, std::size_t num_reads,
+                     const std::size_t *dup_level, const std::size_t *num_obs,
+                     double *out, std::size_t n) {
+  std::size_t lv[8], idx[8];
+  double lim[8], pns[8];
+  std::size_t k = 0;
+#if defined(__x86_64__)
+  static const bool have_avx2 = __builtin_cpu_supports("avx2");
+#endif
+  auto flush = [&] {
+    bool done = false;
+#if defined(__x86_64__)
+    // exact conversion needs every operand below 2^52 and no wrap-around
+    const std::size_t min_rem = num_reads - count_at_limit + 1;
+    bool fits = have_avx2 && num_reads < (std::size_t(1) << 52);
+    for (std::size_t j = 0; j < k; ++j)
+      fits = fits && lv[j] <= min_rem;
+    if (fits) {
+      corrected_count_lanes_avx2(count_at_limit, num_reads, lv, lim, pns, k);
+      done = true;
+    }
+#endif
+    if (!done)
+      corrected_count_lanes(count_at_limit, num_reads, lv, lim, pns, k);
+    for (std::size_t j = 0; j < k; ++j)
+      out[idx[j]] = num_obs[idx[j]] /
+        std::max(std::numeric_limits<double>::min(), 1.0 - pns[j]);
+    k = 0;
+  };
+  for (std::size_t i = 0; i < n; ++i) {
+    if (count_at_limit == num_reads ||
+        num_reads - num_obs[i] < count_at_limit) {
+      out[i] = num_obs[i];
+      continue;
+    }
+    lv[k] = dup_level[i];
+    lim[k] = 1.0 - (num_obs[i] / (num_obs[i] + 0.01));
+    idx[k] = i;
+    if (++k == 8)
+      flush();
+  }
+  if (k)
+    flush();
 }
 
 // Function to calculate the deviation of a histogram with 100 bins from a
@@ -1782,13 +1934,22 @@ ModuleSequenceDuplicationLevels::summarize_module(FastqStats &stats) {
       freqs.emplace_back(v.first, v.second);
     std::vector<double> corrected(freqs.size());
     const std::size_t nf = freqs.size();
+    std::vector<std::size_t> lvl(nf), obs(nf);
+    for (std::size_t i = 0; i < nf; ++i) {
+      lvl[i] = freqs[i].first;
+      obs[i] = freqs[i].second;
+    }
+    // batches of 8 consecutive levels (similar loop lengths share a batch)
+    const std::size_t nb = (nf + 7) / 8;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic) num_threads(nthreads) \
-  if (nthreads > 1 && nf > 32)
+  if (nthreads > 1 && nb > 4)
 #endif
-    for (std::size_t i = 0; i < nf; ++i)
-      corrected[i] = get_corrected_count(stats.count_at_limit, stats.num_reads,
-                                         freqs[i].first, freqs[i].second);
+    for (std::size_t b = 0; b < nb; ++b) {
+      const std::size_t a = b * 8, e = std::min(nf, a + 8);
+      get_corrected_counts(stats.count_at_limit, stats.num_reads, &lvl[a],
+                           &obs[a], &corrected[a], e - a);
+    }
     for (std::size_t i = 0; i < nf; ++i)
       counts_by_freq[freqs[i].first] = corrected[i];
   }
