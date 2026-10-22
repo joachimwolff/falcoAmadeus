@@ -62,6 +62,7 @@ class RapidgzipSource {
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+#include <deque>
 #include <unordered_map>
 #ifdef _OPENMP
 #include <omp.h>
@@ -3149,6 +3150,15 @@ class SerialChunkSource {
 // per chunk, with the "first 100k unique" cap discovered mid-stream exactly as
 // read_bytesplit_core does. Tile-less only; tiled input falls back to the
 // dispatcher (per-tile needs a pre-scan a stream cannot provide).
+// Chunk size of read_stream_fused (see the comment there).
+static std::size_t
+stream_chunk_size(std::size_t nthreads,
+                  std::size_t chunk_cap = std::size_t(64) << 20) {
+  return std::min<std::size_t>(
+    chunk_cap, std::max<std::size_t>(std::size_t(16) << 20,
+                                     nthreads * (std::size_t(8) << 20)));
+}
+
 template <class Source>
 static void
 read_stream_fused(FalcoConfig &config, FastqStats &master,
@@ -3177,10 +3187,7 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
   // Chunk size scales with the team (8 MB per thread, 16 MB to chunk_cap):
   // two chunks are resident at a time, so this bounds memory at low thread
   // counts while keeping large chunks for wide teams.
-  const std::size_t CHUNK = std::min<std::size_t>(
-    chunk_cap,
-    std::max<std::size_t>(std::size_t(16) << 20,
-                          nthreads * (std::size_t(8) << 20)));
+  const std::size_t CHUNK = stream_chunk_size(nthreads, chunk_cap);
   const std::size_t FRONT = std::size_t(4) << 20;
   std::vector<char> bufs[2];
   bufs[0].resize(FRONT + CHUNK);
@@ -4979,6 +4986,130 @@ struct BgzfIndex {
   bool ok = false;
 };
 
+// [FalcoAmadeus] Incremental walk of a BGZF block chain through a sliding
+// pread window (no decompression). Walking through a bounded buffer instead of
+// an mmap of the whole compressed file keeps RSS lean on every platform: the
+// mmap variant relied on MADV_DONTNEED drop-behind, which Darwin treats as a
+// lazy hint (measured ~3.8 GB peak RSS on a 4 GB BAM on macOS). A BGZF block
+// is at most 65536 bytes, so a window refill from the current block offset
+// always fits a whole block.
+class BgzfWalker {
+ public:
+  struct Block {
+    std::size_t coff, clen, uoff, ulen;
+  };
+  BgzfWalker(int fd, std::size_t csize) : fd_(fd), csize_(csize), wbuf_(WIN) {}
+
+  // Next block with a nonzero uncompressed size. Returns false at the end of
+  // the chain; ok() then tells whether the chain is a valid BGZF file (an
+  // invalid first block, or a gzip member without a BGZF size field, makes
+  // it invalid; trailing bytes that are not a block end the chain).
+  bool next(Block &b) {
+    while (!done_) {
+      std::size_t isize = 0, bsize = 0;
+      if (!step(bsize, isize)) {
+        done_ = true;
+        break;
+      }
+      const std::size_t p = p_;
+      p_ += bsize;
+      const std::size_t u = utotal_;
+      utotal_ += isize;
+      if (isize > 0) {
+        b = Block{p, bsize, u, isize};
+        ++nblocks_;
+        return true;
+      }
+    }
+    return false;
+  }
+  bool done() const { return done_; }
+  bool ok() const { return ok_; }
+  std::size_t nblocks() const { return nblocks_; }
+  std::size_t utotal() const { return utotal_; }
+
+ private:
+  // 1 MB: holds any whole block (<= 64 KB); the window lives as long as the
+  // walk, which overlaps the whole run for BGZF FASTQ
+  static constexpr std::size_t WIN = std::size_t(1) << 20;
+  void fill_from(std::size_t off) {
+    wbase_ = off;
+    wlen_ = 0;
+    while (wlen_ < WIN) {
+      const ssize_t n = pread(fd_, wbuf_.data() + wlen_,
+                              std::min(WIN - wlen_, csize_ - off - wlen_),
+                              static_cast<off_t>(off + wlen_));
+      if (n <= 0)
+        break;
+      wlen_ += static_cast<std::size_t>(n);
+      if (off + wlen_ >= csize_)
+        break;
+    }
+  }
+  const unsigned char *at(std::size_t abs) const {
+    return wbuf_.data() + (abs - wbase_);
+  }
+  static std::size_t le16(const unsigned char *q) {
+    return static_cast<std::size_t>(q[0]) | (static_cast<std::size_t>(q[1]) << 8);
+  }
+  static std::size_t le32(const unsigned char *q) {
+    return static_cast<std::size_t>(q[0]) | (static_cast<std::size_t>(q[1]) << 8) |
+           (static_cast<std::size_t>(q[2]) << 16) |
+           (static_cast<std::size_t>(q[3]) << 24);
+  }
+  // Parse the block at p_; false ends the chain (ok_ records validity).
+  bool step(std::size_t &bsize, std::size_t &isize) {
+    const std::size_t p = p_;
+    if (p + 18 > csize_)
+      return false;
+    // ensure the window holds this block's header; a full block always fits
+    if (p + 18 > wbase_ + wlen_)
+      fill_from(p);
+    if (p + 18 > wbase_ + wlen_)
+      return false;  // short read: treat like a truncated file
+    if (!(at(p)[0] == 0x1f && at(p)[1] == 0x8b && at(p)[2] == 8 &&
+          (at(p)[3] & 4))) {
+      ok_ = (p != 0);
+      return false;
+    }
+    const std::size_t xlen = le16(at(p) + 10);
+    std::size_t xp = p + 12;
+    const std::size_t xe = xp + xlen;
+    if (xe > wbase_ + wlen_ && xe <= csize_) {
+      fill_from(p);
+      if (xe > wbase_ + wlen_)
+        return false;
+    }
+    bsize = 0;
+    while (xp + 4 <= xe && xe <= csize_) {
+      const std::size_t sl = le16(at(xp) + 2);
+      if (at(xp)[0] == 'B' && at(xp)[1] == 'C' && sl == 2) {
+        bsize = le16(at(xp) + 4) + 1;
+        break;
+      }
+      xp += 4 + sl;
+    }
+    if (bsize == 0 || p + bsize > csize_) {
+      ok_ = (p != 0 && bsize != 0);
+      return false;
+    }
+    if (p + bsize > wbase_ + wlen_) {  // footer past the window: refill
+      fill_from(p);
+      if (p + bsize > wbase_ + wlen_)
+        return false;
+    }
+    isize = le32(at(p + bsize - 4));
+    return true;
+  }
+
+  int fd_;
+  std::size_t csize_;
+  std::vector<unsigned char> wbuf_;
+  std::size_t wbase_ = 0, wlen_ = 0;  // file offset and valid bytes of window
+  std::size_t p_ = 0, utotal_ = 0, nblocks_ = 0;
+  bool done_ = false, ok_ = true;
+};
+
 static BgzfIndex
 bgzf_walk_index(const std::string &path) {
   BgzfIndex r;
@@ -4989,140 +5120,103 @@ bgzf_walk_index(const std::string &path) {
   if (fstat(fd, &stt) != 0) { close(fd); return r; }
   const std::size_t csize = static_cast<std::size_t>(stt.st_size);
   if (csize < 18) { close(fd); return r; }
-  // Walk the block chain through a small sliding pread window instead of an
-  // mmap of the whole compressed file. The mmap variant relied on
-  // MADV_DONTNEED drop-behind to stay lean, but Darwin treats that as a lazy
-  // hint and kept the entire file resident (measured ~3.8 GB peak RSS on a
-  // 4 GB BAM on macOS); a bounded buffer costs the same one sequential read
-  // and is lean on every platform. A BGZF block is at most 65536 bytes, so a
-  // window refill from the current block offset always fits a whole block.
-  const std::size_t WIN = std::size_t(8) << 20;
-  std::vector<unsigned char> wbuf(WIN);
-  std::size_t wbase = 0, wlen = 0;  // file offset and valid bytes of the window
-  auto fill_from = [&](std::size_t off) {
-    wbase = off;
-    wlen = 0;
-    while (wlen < WIN) {
-      const ssize_t n = pread(fd, wbuf.data() + wlen,
-                              std::min(WIN - wlen, csize - off - wlen),
-                              static_cast<off_t>(off + wlen));
-      if (n <= 0)
-        break;
-      wlen += static_cast<std::size_t>(n);
-      if (off + wlen >= csize)
-        break;
-    }
-  };
-  // window-relative view of an absolute file offset (caller bounds-checks)
-  auto at = [&](std::size_t abs) { return wbuf.data() + (abs - wbase); };
-  auto le16 = [](const unsigned char *q) {
-    return static_cast<std::size_t>(q[0]) | (static_cast<std::size_t>(q[1]) << 8);
-  };
-  auto le32 = [](const unsigned char *q) {
-    return static_cast<std::size_t>(q[0]) | (static_cast<std::size_t>(q[1]) << 8) |
-           (static_cast<std::size_t>(q[2]) << 16) |
-           (static_cast<std::size_t>(q[3]) << 24);
-  };
-  fill_from(0);
-  std::size_t p = 0, utotal = 0;
-  bool bgzf_ok = true;
-  while (p + 18 <= csize) {
-    // ensure the window holds this block's header; a full block always fits
-    if (p + 18 > wbase + wlen)
-      fill_from(p);
-    if (p + 18 > wbase + wlen)
-      break;  // short read: treat like a truncated file
-    if (!(at(p)[0] == 0x1f && at(p)[1] == 0x8b && at(p)[2] == 8 &&
-          (at(p)[3] & 4))) {
-      bgzf_ok = (p != 0);
-      break;
-    }
-    const std::size_t xlen = le16(at(p) + 10);
-    std::size_t xp = p + 12;
-    const std::size_t xe = xp + xlen;
-    if (xe > wbase + wlen && xe <= csize) {
-      fill_from(p);
-      if (xe > wbase + wlen) break;
-    }
-    std::size_t bsize = 0;
-    while (xp + 4 <= xe && xe <= csize) {
-      const std::size_t sl = le16(at(xp) + 2);
-      if (at(xp)[0] == 'B' && at(xp)[1] == 'C' && sl == 2) {
-        bsize = le16(at(xp) + 4) + 1;
-        break;
-      }
-      xp += 4 + sl;
-    }
-    if (bsize == 0 || p + bsize > csize) {
-      bgzf_ok = (p != 0 && bsize != 0);
-      break;
-    }
-    if (p + bsize > wbase + wlen) {  // footer past the window: refill
-      fill_from(p);
-      if (p + bsize > wbase + wlen) break;
-    }
-    const std::size_t isize = le32(at(p + bsize - 4));
-    if (isize > 0) {
-      r.coff.push_back(p);
-      r.clen.push_back(bsize);
-      r.uoff.push_back(utotal);
-      r.ulen.push_back(isize);
-    }
-    utotal += isize;
-    p += bsize;
+  BgzfWalker w(fd, csize);
+  BgzfWalker::Block b;
+  while (w.next(b)) {
+    r.coff.push_back(b.coff);
+    r.clen.push_back(b.clen);
+    r.uoff.push_back(b.uoff);
+    r.ulen.push_back(b.ulen);
   }
-  if (!bgzf_ok || r.coff.empty()) { close(fd); return r; }
-  r.fd = fd; r.csize = csize; r.utotal = utotal; r.ok = true;
+  if (!w.ok() || r.coff.empty()) { close(fd); return r; }
+  r.fd = fd; r.csize = csize; r.utotal = w.utotal(); r.ok = true;
   return r;
 }
 
 #if defined(USE_LIBDEFLATE) && (defined(USE_ISAL) || defined(USE_RAPIDGZIP))
 // [FalcoAmadeus] Chunk source for BGZF-compressed FASTQ (see
-// read_stream_fused): plan() selects the next run of BGZF blocks that fits
-// the chunk and splits it into groups; run(i) inflates group i straight into
-// the destination at the blocks' known offsets. read_stream_fused executes
-// the groups as items of its parse loop, so the next chunk inflates in
-// parallel while the current one is parsed. The bytes delivered, and their
-// order, are exactly the decompressed stream.
+// read_stream_fused). A background thread walks the block chain (headers
+// only, through BgzfWalker) and prepares up to two chunk plans ahead: the
+// runs of blocks that fit a chunk. plan() takes the next prepared run and
+// splits it into groups; run(i) reads and inflates group i straight into the
+// destination at the blocks' known offsets. read_stream_fused executes the
+// groups as items of its parse loop, so the next chunk inflates in parallel
+// while the current one is parsed, and the walk overlaps both instead of
+// reading the whole compressed file before the first chunk. The bytes
+// delivered, and their order, are exactly the decompressed stream.
+//
+// The up-front walk this replaces also decided whether the file is BGZF at
+// all; a gzip member without a BGZF size field later in the file sends the
+// whole file to the plain-gzip path. The walker reports that case through
+// invalid(); the caller then discards the partial statistics and re-reads
+// the file on the plain-gzip path, as before.
 class BgzfParallelSource {
  public:
-  explicit BgzfParallelSource(BgzfIndex &ix) : ix_(ix) {}
+  BgzfParallelSource(int fd, std::size_t csize, std::size_t cap)
+    : fd_(fd), walker_(fd, csize), cap_(cap) {
+    th_ = std::thread([this] { walk(); });
+  }
+  ~BgzfParallelSource() {
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      stop_ = true;
+    }
+    cv_.notify_all();
+    th_.join();
+  }
+  BgzfParallelSource(const BgzfParallelSource &) = delete;
+  BgzfParallelSource &operator=(const BgzfParallelSource &) = delete;
+
+  // True when the file holds no data block or is not a valid BGZF chain
+  // (blocks until the walker has decided, which it does at its first block
+  // for any input that is not BGZF from the start).
+  bool empty_or_invalid() {
+    std::unique_lock<std::mutex> lk(m_);
+    cv_.wait(lk, [&] { return !q_.empty() || walk_done_; });
+    return invalid_ || (!q_.empty() && q_.front().blocks.empty() &&
+                        q_.front().eof);
+  }
+  bool invalid() {
+    std::lock_guard<std::mutex> lk(m_);
+    return invalid_;
+  }
 
   size_t plan(size_t cap) {
-    const size_t nb = ix_.coff.size();
-    b0_ = next_;
-    size_t last = next_, need = 0;
-    while (last < nb && need + ix_.ulen[last] <= cap) {
-      need += ix_.ulen[last];
-      ++last;
+    if (cap != cap_)
+      throw std::logic_error("BGZF source: chunk size mismatch");
+    {
+      std::unique_lock<std::mutex> lk(m_);
+      cv_.wait(lk, [&] { return !q_.empty(); });
+      cur_ = std::move(q_.front());
+      q_.pop_front();
     }
-    b1_ = last;
-    next_ = last;
-    produced_ = need;
-    eof_ = (last == nb);
-    if (b1_ == b0_)
+    cv_.notify_all();
+    produced_ = cur_.need;
+    eof_ = cur_.eof;
+    const auto &B = cur_.blocks;
+    if (B.empty())
       return 0;
     // the compressed bytes of the run are read by the work items themselves,
     // each its own group, so no thread reads the whole run serially
-    const size_t c0 = ix_.coff[b0_];
-    const size_t clen = ix_.coff[b1_ - 1] + ix_.clen[b1_ - 1] - c0;
+    const size_t clen = B.back().coff + B.back().clen - B.front().coff;
     if (cbuf_.size() < clen)
       cbuf_.resize(clen);
-    return (b1_ - b0_ + GROUP - 1) / GROUP;
+    return (B.size() + GROUP - 1) / GROUP;
   }
 
   // Read and inflate block group i of the planned run into dst (the chunk
   // start). Errors are recorded and raised by the next produced() call, since
   // an exception must not leave an OpenMP worksharing loop.
   void run(size_t i, char *dst) {
-    const size_t g0 = b0_ + i * GROUP;
-    const size_t g1 = std::min(b1_, g0 + GROUP);
-    const size_t c0 = ix_.coff[b0_], u0 = ix_.uoff[b0_];
+    const auto &B = cur_.blocks;
+    const size_t g0 = i * GROUP;
+    const size_t g1 = std::min(B.size(), g0 + GROUP);
+    const size_t c0 = B.front().coff, u0 = B.front().uoff;
     {
-      const size_t ca = ix_.coff[g0], cb = ix_.coff[g1 - 1] + ix_.clen[g1 - 1];
+      const size_t ca = B[g0].coff, cb = B[g1 - 1].coff + B[g1 - 1].clen;
       size_t done = ca;
       while (done < cb) {
-        const ssize_t n = pread(ix_.fd, cbuf_.data() + (done - c0), cb - done,
+        const ssize_t n = pread(fd_, cbuf_.data() + (done - c0), cb - done,
                                 static_cast<off_t>(done));
         if (n <= 0) {
           failed_.store(true, std::memory_order_relaxed);
@@ -5138,10 +5232,9 @@ class BgzfParallelSource {
       size_t act = 0;
       if (d == nullptr ||
           libdeflate_gzip_decompress(
-            d, cbuf_.data() + (ix_.coff[b] - c0), ix_.clen[b],
-            dst + (ix_.uoff[b] - u0), ix_.ulen[b], &act) !=
-            LIBDEFLATE_SUCCESS ||
-          act != ix_.ulen[b])
+            d, cbuf_.data() + (B[b].coff - c0), B[b].clen,
+            dst + (B[b].uoff - u0), B[b].ulen, &act) != LIBDEFLATE_SUCCESS ||
+          act != B[b].ulen)
         failed_.store(true, std::memory_order_relaxed);
     }
   }
@@ -5154,9 +5247,73 @@ class BgzfParallelSource {
   bool at_eof() const { return eof_; }
 
  private:
+  struct Plan {
+    std::vector<BgzfWalker::Block> blocks;
+    size_t need = 0;
+    bool eof = false;
+  };
   static constexpr size_t GROUP = 16;  // blocks per work item (~1 MB)
-  BgzfIndex &ix_;
-  size_t next_ = 0, b0_ = 0, b1_ = 0, produced_ = 0;
+  static constexpr size_t AHEAD = 2;   // plans prepared ahead of plan()
+
+  // Walker thread: the same block selection as one pass over a full index
+  // (blocks are added while they fit the chunk; a chunk is the last one when
+  // no block follows it).
+  void walk() {
+    BgzfWalker::Block pending{};
+    bool have_pending = false;
+    for (;;) {
+      {
+        std::unique_lock<std::mutex> lk(m_);
+        cv_.wait(lk, [&] { return stop_ || q_.size() < AHEAD; });
+        if (stop_)
+          return;
+      }
+      Plan P;
+      bool end = false;
+      for (;;) {
+        if (!have_pending) {
+          if (!walker_.next(pending)) {
+            end = true;
+            break;
+          }
+          have_pending = true;
+        }
+        if (P.need + pending.ulen > cap_ && !P.blocks.empty())
+          break;
+        P.need += pending.ulen;
+        P.blocks.push_back(pending);
+        have_pending = false;
+      }
+      const bool invalid = end && !walker_.ok();
+      if (invalid) {  // nothing more is delivered; the caller re-reads
+        P.blocks.clear();
+        P.need = 0;
+      }
+      P.eof = end;
+      {
+        std::lock_guard<std::mutex> lk(m_);
+        q_.push_back(std::move(P));
+        if (end) {
+          invalid_ = invalid;
+          walk_done_ = true;
+        }
+      }
+      cv_.notify_all();
+      if (end)
+        return;
+    }
+  }
+
+  int fd_;
+  BgzfWalker walker_;  // used by the walker thread only
+  const size_t cap_;
+  std::thread th_;
+  std::mutex m_;
+  std::condition_variable cv_;
+  std::deque<Plan> q_;
+  bool stop_ = false, walk_done_ = false, invalid_ = false;
+  Plan cur_;  // the run being produced (plan() and run() only)
+  size_t produced_ = 0;
   bool eof_ = false;
   std::atomic<bool> failed_{false};
   std::vector<unsigned char> cbuf_;
@@ -5166,12 +5323,30 @@ class BgzfParallelSource {
 static bool
 read_bgzf_fastq_fused(FalcoConfig &config, FastqStats &master,
                       std::size_t nthreads) {
-  BgzfIndex ix = bgzf_walk_index(config.filename);
-  if (!ix.ok)
+  const int fd = open(config.filename.c_str(), O_RDONLY);
+  if (fd < 0)
     return false;
-  BgzfParallelSource src(ix);
-  read_stream_fused(config, master, nthreads, src);
-  close(ix.fd);
+  struct stat stt;
+  if (fstat(fd, &stt) != 0 || stt.st_size < 18) {
+    close(fd);
+    return false;
+  }
+  bool invalid = false;
+  {
+    BgzfParallelSource src(fd, static_cast<std::size_t>(stt.st_size),
+                           stream_chunk_size(nthreads));
+    if (src.empty_or_invalid()) {
+      close(fd);
+      return false;
+    }
+    read_stream_fused(config, master, nthreads, src);
+    invalid = src.invalid();
+  }
+  close(fd);
+  if (invalid) {  // not BGZF after all: discard and use the plain-gzip path
+    master = FastqStats(config.do_kmer);
+    return false;
+  }
   return true;
 }
 #endif
