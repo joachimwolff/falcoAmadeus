@@ -3545,9 +3545,11 @@ read_sam_chunked(FalcoConfig &config, FastqStats &master, std::size_t nthreads) 
 }
 
 #if defined(USE_ISAL) || defined(USE_RAPIDGZIP)
-// [FalcoAmadeus] Fraction of a file's pages currently in the page cache
-// (mincore over a read-only mapping; no data is touched). Used to pick the
-// zero-copy mmap parse for cached files and streamed reads otherwise.
+// [FalcoAmadeus] Fraction of a file's pages currently in the page cache,
+// estimated from up to 1024 evenly spaced pages (mincore over a read-only
+// mapping; no data is touched). Used to pick the zero-copy mmap parse for
+// cached files and streamed reads otherwise; the choice affects speed only.
+// A full mincore walk of a 4 GB file costs ~70 ms, the sample well under 1 ms.
 static double
 file_cache_resident_fraction(const std::string &path) {
   const int fd = ::open(path.c_str(), O_RDONLY);
@@ -3565,10 +3567,14 @@ file_cache_resident_fraction(const std::string &path) {
     return 0.0;
   const size_t pg = static_cast<size_t>(sysconf(_SC_PAGESIZE));
   const size_t npages = (len + pg - 1) / pg;
+  const size_t nsample = std::min<size_t>(npages, 1024);
+  size_t resident = 0, probed = 0;
+  for (size_t k = 0; k < nsample; ++k) {
+    const size_t idx = k * npages / nsample;
 #if defined(__APPLE__)
-  std::vector<char> vec(npages);
+    char v = 0;
 #else
-  std::vector<unsigned char> vec(npages);
+    unsigned char v = 0;
 #endif
     if (mincore(static_cast<char *>(m) + idx * pg, 1, &v) == 0) {
       resident += (v & 1);
