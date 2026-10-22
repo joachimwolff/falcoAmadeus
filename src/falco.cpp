@@ -698,6 +698,16 @@ run_paired_duplication(const std::string &r1_file, const std::string &r2_file,
                        const bool quiet) {
   // The two mates are independent until they are paired up, so scan them on
   // two threads (halves the wall time of this pass).
+  static const bool fa_times = std::getenv("FA_TIMES") != nullptr;
+  auto tmark = std::chrono::steady_clock::now();
+  auto lap = [&](const char *what) {
+    if (!fa_times)
+      return;
+    const auto now = std::chrono::steady_clock::now();
+    std::fprintf(stderr, "[FA_TIMES pairs] %s %.3f\n", what,
+                 std::chrono::duration<double>(now - tmark).count());
+    tmark = now;
+  };
   MateFingerprints m1, m2;
   std::exception_ptr err2;
   std::thread t2([&] {
@@ -718,6 +728,7 @@ run_paired_duplication(const std::string &r1_file, const std::string &r2_file,
   t2.join();
   if (err2)
     std::rethrow_exception(err2);
+  lap("scan");
 
   const std::size_t num_pairs = m1.key_fp.size();
   if (m2.key_fp.size() != num_pairs)
@@ -754,6 +765,7 @@ run_paired_duplication(const std::string &r1_file, const std::string &r2_file,
   const double fq_pair = fastqc_style_rate(pair_fp);
   const double fq_r1 = fastqc_style_rate(m1.key_fp);
   const double fq_r2 = fastqc_style_rate(m2.key_fp);
+  lap("fastqc-style");
 
   // Exact counts (sorting; the three sorts are independent).
   ExactDup ex_pair, ex_r1, ex_r2;
@@ -764,6 +776,7 @@ run_paired_duplication(const std::string &r1_file, const std::string &r2_file,
     ta.join();
     tb.join();
   }
+  lap("exact");
 
   std::ofstream os(out_file, std::ofstream::binary);
   if (!os.good())
@@ -1656,9 +1669,20 @@ main(int argc, char *argv[]) {
         if (!falco_config.quiet)
           log_process("Running paired-end pairing/duplication pass with " +
                       paired_with_file);
+        static const bool fa_times = std::getenv("FA_TIMES") != nullptr;
+        auto pmark = std::chrono::steady_clock::now();
+        auto plap = [&](const char *what) {
+          if (!fa_times)
+            return;
+          const auto now = std::chrono::steady_clock::now();
+          std::fprintf(stderr, "[FA_TIMES paired] %s %.3f\n", what,
+                       std::chrono::duration<double>(now - pmark).count());
+          pmark = now;
+        };
         const PairStats ps = run_paired_duplication(
           filename, paired_with_file, paired_out,
           falco_config.allow_unmatched_pairs, falco_config.quiet);
+        plap("pairing pass");
 
         std::error_code ec;
         std::filesystem::create_directories(fwd_dir, ec);
@@ -1692,6 +1716,7 @@ main(int argc, char *argv[]) {
                           std::string{}, mate_skip_text, skip_html,
                           mate_skip_text, do_call, true, " (reverse)",
                           r1_base);
+        plap("forward + reverse");
 
         // [FalcoAmadeus] Merge the mate reports into ONE combined HTML with
         // three tabs: Combined (R1+R2 pooled, the default), Forward, Reverse.
@@ -1762,6 +1787,7 @@ main(int argc, char *argv[]) {
                             /*skip_text=*/!want_comb_data, skip_html,
                             /*skip_short_summary=*/!want_comb_data, do_call, true,
                             " (combined)");
+          plap("combined view");
           falco_config.combined_note.clear();  // don't leak to other reports
           falco_config.pooled_inputs.clear();
           falco_config.sample_name = saved_sample_name;
@@ -1790,6 +1816,7 @@ main(int argc, char *argv[]) {
                                     cur_outdir + "/summary.txt", rc);
           }
           std::filesystem::remove_all(comb_dir, rc);  // temp pooled input + html
+          plap("report merge");
           // If the mates carry no data (combined-only), drop their empty dirs.
           if (!want_mate_data) {
             std::filesystem::remove_all(fwd_dir, rc);
