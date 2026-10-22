@@ -1045,6 +1045,11 @@ exact_from_groups(const KeyGroups &g, const std::size_t n,
   return r;
 }
 
+// Passes of the exact counts in the paired report: a quarter of the keys at a
+// time keeps the scratch small (lower peak memory) and, reused across the
+// counts, already faulted in.
+constexpr std::size_t EXACT_PASSES = 4;
+
 static ExactDup
 exact_duplication_parallel(FpView &fps, const std::size_t nthreads,
                            FpVec &tmp, const std::size_t passes = 1) {
@@ -1237,8 +1242,8 @@ paired_duplication_report(FpView &k1, FpView &k2,
       });
     });
     if (!pre)
-      ex_r1 = exact_duplication_parallel(k1, nthreads, scratch);
-    ex_r2 = exact_duplication_parallel(k2, nthreads, scratch);
+      ex_r1 = exact_duplication_parallel(k1, nthreads, scratch, EXACT_PASSES);
+    ex_r2 = exact_duplication_parallel(k2, nthreads, scratch, EXACT_PASSES);
     if (ta.joinable())
       ta.join();  // k1 is overwritten next
     {  // the pair's prefix was taken from k1 before the overwrite
@@ -1251,20 +1256,22 @@ paired_duplication_report(FpView &k1, FpView &k2,
       pair_ready = true;
     }
     pcv.notify_all();
-    ex_pair = exact_from_groups(pair_groups, num_pairs, nthreads, scratch);
+    ex_pair = exact_from_groups(pair_groups, num_pairs, nthreads, scratch,
+                                EXACT_PASSES);
     tb.join();
     tc.join();
   }
   else {
     if (!pre) {
       fq_r1 = fastqc_style_rate(k1, nthreads);
-      ex_r1 = exact_duplication_parallel(k1, nthreads, scratch);
+      ex_r1 = exact_duplication_parallel(k1, nthreads, scratch, EXACT_PASSES);
     }
     fq_r2 = fastqc_style_rate(k2, nthreads);
-    ex_r2 = exact_duplication_parallel(k2, nthreads, scratch);
+    ex_r2 = exact_duplication_parallel(k2, nthreads, scratch, EXACT_PASSES);
     make_pair_keys();
     fq_pair = fastqc_style_rate(k1, nthreads);
-    ex_pair = exact_from_groups(pair_groups, num_pairs, nthreads, scratch);
+    ex_pair = exact_from_groups(pair_groups, num_pairs, nthreads, scratch,
+                                EXACT_PASSES);
   }
   k1.clear();
   k2.clear();
@@ -1699,8 +1706,8 @@ paired_fused_read(const FalcoConfig &falco_config, const std::string &r1,
       const std::size_t nh = std::max<std::size_t>(1, nt / 8);
       px = std::thread([&pf, &perr_x, nb] {
         try {
-          // in quarters: the full scratch would add to the peak memory
-          pf.ex_r1 = exact_duplication_parallel(pf.k1, nb, pf.scratch, 4);
+          pf.ex_r1 =
+            exact_duplication_parallel(pf.k1, nb, pf.scratch, EXACT_PASSES);
         }
         catch (...) {
           perr_x = std::current_exception();
