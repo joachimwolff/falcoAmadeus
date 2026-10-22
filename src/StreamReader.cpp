@@ -489,7 +489,16 @@ StreamReader::postprocess_sequence_line(FastqStats &stats) {
         truncated_length = read_pos;
         truncated_gc_count = cur_gc_count;
       }
-      if (parallel_mode) {
+      // The truncation point is captured after the base at index 100, so
+      // the count covers 101 bases while the model has length 100 (inherited
+      // from falco). A count above the length (101 G/C bases) has no model
+      // entry: falco read past the end of the model there and added nothing
+      // in practice; it contributes nothing here, without the stray read.
+      if (truncated_gc_count > truncated_length) {
+        if (parallel_mode)
+          cur_gc_record->kind = 0;
+      }
+      else if (parallel_mode) {
         // defer to the ordered replay (see GCRecord)
         cur_gc_record->kind = 1;
         cur_gc_record->a = truncated_length;
