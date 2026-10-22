@@ -83,6 +83,8 @@ std::string valid_assay_list();
  *************************************************************/
 
 // config from options, constants, magic numbers, etc
+struct PairedHooks;  // StreamReader.hpp
+
 struct FalcoConfig {
   static const std::string FalcoVersion;
   FalcoConfig(const int argc, char *argv[]);
@@ -194,6 +196,9 @@ struct FalcoConfig {
   // these files, streamed directly (paired-end combined view); filename is
   // then the first file, used for format/tile detection.
   std::vector<std::string> pooled_inputs;
+  // [FalcoAmadeus] per-read outputs for native paired-end mode (falco.cpp);
+  // honoured by the FASTQ parse drivers, null otherwise
+  PairedHooks *paired_hooks = nullptr;
 
   /*********** FUNCTIONS TO READ FILES *************/
   void define_file_format();

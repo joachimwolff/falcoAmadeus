@@ -191,6 +191,36 @@ private:
   // one full mix at the end restores avalanche. Changing the hash only remaps
   // slots -- entry (insertion) order, which the modules iterate, is untouched.
   static std::uint64_t hash_key(const char *p, std::size_t n) {
+    std::uint64_t a, b;
+    lanes(p, n, a, b);
+    return mix(a ^ b);
+  }
+
+ public:
+  // [FalcoAmadeus] 64-bit fingerprint for keys that are compared by
+  // fingerprint alone (paired-end pairing and exact duplication counts). The
+  // table hash above combines its two lanes before the final mix, which is
+  // harmless for the table (find() compares the key bytes) but lets keys that
+  // differ in the same high bits of both lanes collide. Here each lane is
+  // finished by its own bijection before they are combined: keys that differ
+  // in one lane never collide, keys that differ in both with probability
+  // ~2^-64. fp_and_hash returns this fingerprint and hash_of() in one pass.
+  static std::uint64_t fingerprint(const char *p, std::size_t n) {
+    std::uint64_t a, b;
+    lanes(p, n, a, b);
+    return mix(a) ^ mix(b ^ 0x5851f42d4c957f2dULL);
+  }
+  static void fp_and_hash(const char *p, std::size_t n, std::uint64_t &fp,
+                          std::uint64_t &h) {
+    std::uint64_t a, b;
+    lanes(p, n, a, b);
+    fp = mix(a) ^ mix(b ^ 0x5851f42d4c957f2dULL);
+    h = mix(a ^ b);
+  }
+
+ private:
+  static void lanes(const char *p, std::size_t n, std::uint64_t &a_out,
+                    std::uint64_t &b_out) {
     const std::uint64_t C1 = 0x9e3779b97f4a7c15ULL;
     const std::uint64_t C2 = 0xc4ceb9fe1a85ec53ULL;
     std::uint64_t a = C1 ^ (n * C1), b = C2;
@@ -213,7 +243,8 @@ private:
       std::memcpy(&tail, p + i, n - i);
       b = (b ^ tail) * C2;
     }
-    return mix(a ^ b);
+    a_out = a;
+    b_out = b;
   }
 
   static constexpr std::size_t KSTRIDE = 80;  // > max key (75, see

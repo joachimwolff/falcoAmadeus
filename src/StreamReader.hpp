@@ -22,6 +22,10 @@
 #include <cmath>
 #include <bitset>
 #include <vector>
+#include <functional>
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -75,6 +79,92 @@ get_truncate_point(const std::size_t read_pos) {
 // are tiny -- kind 1: a=trunc_length, b=trunc_gc, both <= SHORT_READ_THRESHOLD
 // (500); kind 2: a = the GC percentage bin (0..100), which is all the discrete
 // path needs (it just does ++gc_count[a]); so 15 bits each is ample.
+struct GCRecord;
+using GCRecordPacked = GCRecord;
+
+// [FalcoAmadeus] Native paired-end mode reads each mate once: the FASTQ parse
+// drivers (memory-mapped and streamed, tile-less, read_step 1) fill these per
+// read, in file order, when FalcoConfig::paired_hooks is set, and set `used`.
+// Other paths leave `used` false and the caller falls back to separate passes.
+struct PairedHooks {
+  // Fingerprints in file order, as consecutive chunks (one per parse range;
+  // moved, not copied, out of the parser). Names are compared only with the
+  // other mate's name at the same index, so 32 bits suffice.
+  std::vector<std::vector<std::uint32_t>> name_chunks;
+  std::vector<std::vector<std::uint64_t>> key_chunks;
+  std::size_t num_reads = 0;
+  bool ends_with_newline = true;  // last byte of the stream is '\n'
+  // First mate: called once with its duplication map as soon as the map
+  // holds every tracked sequence (100k distinct), or with nullptr at the end
+  // of the read if it never does. From then on the map's key set is fixed.
+  std::function<void(DupHashMap *)> on_comb_map;
+  // Second mate, combined view. Either live (the first mate has finished):
+  // GC contributions are also added to gc2 in read order and every read's key
+  // is counted into comb_map; or deferred (mates read concurrently):
+  // wait_comb_map blocks until the first mate's map is fixed and returns it
+  // (or nullptr), keys are counted into comb_counts (same indices), and the
+  // GC records are kept in read order (gc_records).
+  double *gc2 = nullptr;
+  DupHashMap *comb_map = nullptr;
+  std::function<DupHashMap *()> wait_comb_map;
+  std::vector<std::size_t> comb_counts;
+  bool keep_gc_records = false;
+  std::vector<GCRecordPacked> gc_records;
+  bool used = false;
+  bool failed = false;  // a driver restarted the file: contents unusable
+
+  // Called by a driver, in file order, for each parsed range.
+  void take_range(std::vector<std::uint32_t> &names,
+                  std::vector<std::uint64_t> &keys) {
+    name_chunks.emplace_back();
+    name_chunks.back().swap(names);
+    num_reads += keys.size();
+    key_chunks.emplace_back();
+    key_chunks.back().swap(keys);
+  }
+};
+
+// Fingerprints of a FASTQ record for the pairing check and the exact paired
+// duplication counts. The name runs from after '@' to the first whitespace,
+// without a trailing "\r" and without a /1, /2, .1 or .2 mate suffix; the key
+// is the duplication key (first 50 bases of reads longer than 75).
+inline std::uint64_t
+pair_name_fp(const char *rec, const char *end) {
+  const char *b = rec + (rec < end && *rec == '@' ? 1 : 0);
+  const char *e = b;
+#if defined(__SSE2__)
+  // 16 bytes at a time while a full block lies inside the buffer
+  const __m128i sp = _mm_set1_epi8(' '), tb = _mm_set1_epi8('\t'),
+                nl = _mm_set1_epi8('\n');
+  for (;;) {
+    if (end - e < 16) {
+      while (e < end && *e != ' ' && *e != '\t' && *e != '\n')
+        ++e;
+      break;
+    }
+    const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i *>(e));
+    const int m = _mm_movemask_epi8(_mm_or_si128(
+      _mm_or_si128(_mm_cmpeq_epi8(v, sp), _mm_cmpeq_epi8(v, tb)),
+      _mm_cmpeq_epi8(v, nl)));
+    if (m != 0) {
+      e += __builtin_ctz(static_cast<unsigned>(m));
+      break;
+    }
+    e += 16;
+  }
+#else
+  while (e < end && *e != ' ' && *e != '\t' && *e != '\n')
+    ++e;
+#endif
+  if ((e == end || *e == '\n') && e > b && e[-1] == '\r')
+    --e;
+  if (e - b >= 2 && (e[-2] == '/' || e[-2] == '.') &&
+      (e[-1] == '1' || e[-1] == '2'))
+    e -= 2;
+  return DupHashMap::fingerprint(b, static_cast<std::size_t>(e - b)) ^
+         0x9e3779b97f4a7c15ULL;
+}
+
 struct GCRecord {
   // 0 = no contribution (empty read or GC module off)
   // 1 = short read, cached gc model at (a=trunc_length, b=trunc_gc)
@@ -83,6 +173,12 @@ struct GCRecord {
   uint32_t a : 15;
   uint32_t kind : 2;
 };
+
+// Adds the GC model contributions of `recs`, in order, to gc (101 bins):
+// the same operations as the drivers' ordered replay.
+void
+replay_gc_records(const std::vector<GCRecord> &recs, double *gc);
+
 
 // Generic class that does as much as possible without assuming file format
 class StreamReader{

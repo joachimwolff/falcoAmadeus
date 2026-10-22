@@ -43,13 +43,19 @@
 #include <exception>
 #include <string_view>
 #include <thread>
+#include <condition_variable>
+#include <mutex>
 #include <chrono>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <cstdlib>
 #include <unistd.h>
 
 #include <zlib.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 // Function to get seconds elapsed in program
 static std::size_t
@@ -358,9 +364,19 @@ summarize_dup(const DupCounterT<Key> &c) {
 
   // FastQC corrected extrapolation (note: stored back into a size_t map, so the
   // double is truncated - this matches summarize_module byte-for-byte)
-  for (auto v : counts_by_freq)
-    counts_by_freq[v.first] =
-      get_corrected_count(c.count_at_limit, c.num_reads, v.first, v.second);
+  {
+    // batch form of get_corrected_count (bit-identical per element)
+    std::vector<std::size_t> lvl, obs;
+    for (const auto &v : counts_by_freq) {
+      lvl.push_back(v.first);
+      obs.push_back(v.second);
+    }
+    std::vector<double> corr(lvl.size());
+    get_corrected_counts(c.count_at_limit, c.num_reads, lvl.data(), obs.data(),
+                         corr.data(), lvl.size());
+    for (std::size_t i = 0; i < lvl.size(); ++i)
+      counts_by_freq[lvl[i]] = corr[i];
+  }
 
   for (auto v : counts_by_freq) {
     std::size_t dup_slot = v.first - 1;
@@ -498,12 +514,6 @@ fp_finalize(std::uint64_t x) {  // splitmix64 finalizer
   return x;
 }
 
-static inline std::uint64_t
-fp_bytes(const char *p, std::size_t n) {
-  return fp_finalize(std::hash<std::string_view>{}(std::string_view(p, n)) ^
-                     (0x9e3779b97f4a7c15ULL * (n + 1)));
-}
-
 // Decompressed byte source for the fingerprint scan: ISA-L inflate for gzip
 // input when available, zlib otherwise (gzread is transparent for plain
 // files), filling large blocks rather than reading line by line.
@@ -593,18 +603,11 @@ fingerprint_mate(const std::string &file) {
       if (!line(beg, h_e, h_n) || !line(h_n, s_e, s_n) ||
           !line(s_n, p_e, p_n) || !line(p_n, q_e, q_n))
         break;
-      // canonical name: drop '@', cut at whitespace, drop a /1 or /2 (or
-      // .1 or .2) mate suffix, as canonical_name does
-      std::size_t nb = beg + (buf[beg] == '@' ? 1 : 0), ne = nb;
-      while (ne < h_e && buf[ne] != ' ' && buf[ne] != '\t')
-        ++ne;
-      if (ne - nb >= 2 && (buf[ne - 2] == '/' || buf[ne - 2] == '.') &&
-          (buf[ne - 1] == '1' || buf[ne - 1] == '2'))
-        ne -= 2;
+      // the same fingerprints the parse drivers compute (PairedHooks)
       const std::size_t slen = s_e - h_n;
-      m.name_fp.push_back(fp_bytes(buf.data() + nb, ne - nb));
+      m.name_fp.push_back(pair_name_fp(buf.data() + beg, buf.data() + h_e));
       m.key_fp.push_back(
-        fp_bytes(buf.data() + h_n, get_truncate_point(slen)));
+        DupHashMap::fingerprint(buf.data() + h_n, get_truncate_point(slen)));
       beg = q_n;
     }
     if (at_eof) {
@@ -626,10 +629,10 @@ fingerprint_mate(const std::string &file) {
   return m;
 }
 
-// Exact duplication over ALL records: sorts the fingerprints in place and
-// returns the number of distinct keys plus the copy-number histogram in the
-// 16 FastQC duplication-level bins (counts of distinct keys per bin, and of
-// reads per bin). Independent of read order, unlike the FastQC estimator.
+// Exact duplication over ALL records: the number of distinct keys plus the
+// copy-number histogram in the 16 FastQC duplication-level bins (counts of
+// distinct keys per bin, and of reads per bin). Independent of read order,
+// unlike the FastQC estimator.
 struct ExactDup {
   std::size_t total = 0;
   std::size_t distinct = 0;
@@ -654,36 +657,288 @@ dup_level_slot(const std::size_t copies) {
   return copies - 1;
 }
 
+
+// Work deferred off the critical path (releasing large structures); joined
+// at exit at the latest.
+struct DeferredWork {
+  std::vector<std::thread> threads;
+  template <class F>
+  void add(F &&f) {
+    threads.emplace_back(std::forward<F>(f));
+  }
+  ~DeferredWork() {
+    for (auto &t : threads)
+      if (t.joinable())
+        t.join();
+  }
+};
+static DeferredWork g_deferred;
+
+// Allocator that leaves trivially constructible elements uninitialised, so a
+// large fingerprint array is first touched by the (parallel) code that fills
+// it instead of being zeroed on one thread.
+template <class T>
+struct NoInitAlloc : std::allocator<T> {
+  template <class U>
+  struct rebind {
+    using other = NoInitAlloc<U>;
+  };
+  NoInitAlloc() = default;
+  template <class U>
+  NoInitAlloc(const NoInitAlloc<U> &) {}
+  template <class U>
+  void construct(U *p) noexcept {
+    ::new (static_cast<void *>(p)) U;
+  }
+  template <class U, class... Args>
+  void construct(U *p, Args &&...args) {
+    ::new (static_cast<void *>(p)) U(std::forward<Args>(args)...);
+  }
+};
+using FpVec = std::vector<std::uint64_t, NoInitAlloc<std::uint64_t>>;
+
+// Fingerprints in file order, held as the parser's chunks (never
+// concatenated): element i is found through the chunk start offsets.
+template <class T>
+struct ChunkView {
+  std::vector<std::vector<T>> c;
+  std::vector<std::size_t> off{0};  // off[k] = index of chunk k's first element
+  ChunkView() = default;
+  explicit ChunkView(std::vector<std::vector<T>> &&chunks) : c(std::move(chunks)) {
+    off.resize(c.size() + 1);
+    for (std::size_t k = 0; k < c.size(); ++k)
+      off[k + 1] = off[k] + c[k].size();
+  }
+  std::size_t size() const { return off.back(); }
+  // position (chunk, offset) of element i
+  void locate(std::size_t i, std::size_t &k, std::size_t &p) const {
+    k = static_cast<std::size_t>(std::upper_bound(off.begin(), off.end(), i) -
+                                 off.begin()) - 1;
+    p = i - off[k];
+  }
+  // f(T &) for elements [lo, hi) in order
+  template <class F>
+  void each(std::size_t lo, std::size_t hi, F f) {
+    if (lo >= hi)
+      return;
+    std::size_t k, p;
+    locate(lo, k, p);
+    for (std::size_t i = lo; i < hi;) {
+      while (p >= c[k].size()) {
+        ++k;
+        p = 0;
+      }
+      const std::size_t take = std::min(hi - i, c[k].size() - p);
+      T *const d = c[k].data() + p;
+      for (std::size_t j = 0; j < take; ++j)
+        f(d[j]);
+      i += take;
+      p += take;
+    }
+  }
+  void clear() {
+    std::vector<std::vector<T>>().swap(c);
+    off.assign(1, 0);
+  }
+};
+
+// f(a_i, b_i) for i in [lo, hi), over two views of equal length
+template <class A, class B, class F>
+static void
+zip_views(ChunkView<A> &a, ChunkView<B> &b, std::size_t lo, std::size_t hi,
+          F f) {
+  if (lo >= hi)
+    return;
+  std::size_t ka, pa, kb, pb;
+  a.locate(lo, ka, pa);
+  b.locate(lo, kb, pb);
+  for (std::size_t i = lo; i < hi; ++i) {
+    while (pa >= a.c[ka].size()) {
+      ++ka;
+      pa = 0;
+    }
+    while (pb >= b.c[kb].size()) {
+      ++kb;
+      pb = 0;
+    }
+    f(a.c[ka][pa++], b.c[kb][pb++]);
+  }
+}
+
+// FastQC-style duplicate rate of a fingerprint sequence. The counter takes
+// keys in order until it tracks 100k distinct keys; after that it only counts
+// further occurrences of tracked keys, which commute, so that remainder is
+// counted in parallel (per-thread counts over a flat index of the tracked
+// keys) and added to the counter. Same counts as DupCounterT::add on every key.
+static double
+fastqc_style_rate(ChunkView<std::uint64_t> &keys, const std::size_t nthreads) {
+  DupCounterT<std::uint64_t> c;
+  std::size_t i = 0;
+  const std::size_t n = keys.size();
+  for (std::size_t k = 0; k < keys.c.size() && c.continue_storing; ++k)
+    for (std::size_t p = 0; p < keys.c[k].size() && c.continue_storing; ++p) {
+      c.add(keys.c[k][p]);
+      ++i;
+    }
+  if (i < n) {
+    // flat index of the tracked keys (fingerprints are uniformly distributed)
+    std::vector<std::uint64_t *> slot_val;  // per tracked key, its count
+    std::vector<std::uint64_t> slot_key;
+    std::size_t nslots = 1;
+    while (nslots < 4 * c.sequence_count.size() + 4)
+      nslots <<= 1;
+    const std::size_t mask = nslots - 1;
+    std::vector<std::uint32_t> table(nslots, 0);  // index + 1, 0 = empty
+    slot_val.reserve(c.sequence_count.size());
+    slot_key.reserve(c.sequence_count.size());
+    for (auto &kv : c.sequence_count) {
+      std::size_t h = (kv.first ^ (kv.first >> 29)) & mask;
+      while (table[h] != 0)
+        h = (h + 1) & mask;
+      slot_key.push_back(kv.first);
+      slot_val.push_back(&kv.second);
+      table[h] = static_cast<std::uint32_t>(slot_key.size());
+    }
+    const std::size_t nk = slot_key.size();
+    std::vector<std::vector<std::uint32_t>> cnt(nthreads);
+    const std::size_t lo0 = i;
+#ifdef _OPENMP
+#pragma omp parallel num_threads(nthreads)
+#endif
+    {
+#ifdef _OPENMP
+      const std::size_t t = static_cast<std::size_t>(omp_get_thread_num());
+      const std::size_t nt = static_cast<std::size_t>(omp_get_num_threads());
+#else
+      const std::size_t t = 0, nt = 1;
+#endif
+      std::vector<std::uint32_t> &my = cnt[t];
+      my.assign(nk, 0);
+      const std::size_t lo = lo0 + (n - lo0) * t / nt;
+      const std::size_t hi = lo0 + (n - lo0) * (t + 1) / nt;
+      keys.each(lo, hi, [&](const std::uint64_t k) {
+        std::size_t h = (k ^ (k >> 29)) & mask;
+        for (;;) {
+          const std::uint32_t e = table[h];
+          if (e == 0)
+            break;
+          if (slot_key[e - 1] == k) {
+            ++my[e - 1];
+            break;
+          }
+          h = (h + 1) & mask;
+        }
+      });
+    }
+    for (const auto &my : cnt)
+      for (std::size_t e = 0; e < my.size(); ++e)
+        *slot_val[e] += my[e];
+    c.num_reads += n - lo0;  // count_at_limit no longer changes past the cap
+  }
+  return 100.0 - summarize_dup(c).total_deduplicated_pct;
+}
+
+// Exact duplication counts: the fingerprints are partitioned by their top
+// bits (equal values land in the same bucket), each bucket is sorted and its
+// runs counted, in parallel. The bins hold whole numbers, so their sums do not
+// depend on the order of addition.
 static ExactDup
-exact_duplication(std::vector<std::uint64_t> &fps) {
+exact_duplication_parallel(ChunkView<std::uint64_t> &fps,
+                           const std::size_t nthreads, FpVec &tmp) {
+  constexpr unsigned BITS = 12;
+  constexpr std::size_t B = std::size_t(1) << BITS;
+  const std::size_t n = fps.size();
+  std::vector<std::size_t> hist(nthreads * B, 0), off(nthreads * B, 0);
+  if (tmp.size() < n)
+    tmp.resize(n);  // scratch, reused by the caller across calls
+#ifdef _OPENMP
+#pragma omp parallel num_threads(nthreads)
+#endif
+  {
+#ifdef _OPENMP
+    const std::size_t t = static_cast<std::size_t>(omp_get_thread_num());
+    const std::size_t nt = static_cast<std::size_t>(omp_get_num_threads());
+#else
+    const std::size_t t = 0, nt = 1;
+#endif
+    const std::size_t lo = n * t / nt, hi = n * (t + 1) / nt;
+    std::size_t *const h = &hist[t * B];
+    fps.each(lo, hi, [&](const std::uint64_t v) { ++h[v >> (64 - BITS)]; });
+#ifdef _OPENMP
+#pragma omp barrier
+#pragma omp single
+#endif
+    {
+      std::size_t acc = 0;
+      for (std::size_t b = 0; b < B; ++b)
+        for (std::size_t u = 0; u < nt; ++u) {
+          off[u * B + b] = acc;
+          acc += hist[u * B + b];
+        }
+    }
+    std::size_t *const o = &off[t * B];
+    fps.each(lo, hi,
+             [&](const std::uint64_t v) { tmp[o[v >> (64 - BITS)]++] = v; });
+  }
+  // bucket b spans [start of b for thread 0, start of b + 1 for thread 0)
+  std::vector<std::size_t> bstart(B + 1, n);
+  {
+    std::size_t acc = 0;
+    for (std::size_t b = 0; b < B; ++b) {
+      bstart[b] = acc;
+      for (std::size_t u = 0; u < nthreads; ++u)
+        acc += hist[u * B + b];
+    }
+    bstart[B] = acc;
+  }
+  std::vector<std::array<std::size_t, 33>> part(nthreads);
+#ifdef _OPENMP
+#pragma omp parallel num_threads(nthreads)
+#endif
+  {
+#ifdef _OPENMP
+    const std::size_t t = static_cast<std::size_t>(omp_get_thread_num());
+#else
+    const std::size_t t = 0;
+#endif
+    std::array<std::size_t, 33> &pt = part[t];  // [0..15] distinct, [16..31] reads, [32] distinct total
+    pt.fill(0);
+#ifdef _OPENMP
+#pragma omp for schedule(dynamic, 8)
+#endif
+    for (std::size_t b = 0; b < B; ++b) {
+      std::uint64_t *const lo = tmp.data() + bstart[b];
+      std::uint64_t *const hi = tmp.data() + bstart[b + 1];
+      std::sort(lo, hi);
+      for (std::uint64_t *p = lo; p < hi;) {
+        std::uint64_t *q = p + 1;
+        while (q < hi && *q == *p)
+          ++q;
+        const std::size_t copies = static_cast<std::size_t>(q - p);
+        const std::size_t sl = dup_level_slot(copies);
+        ++pt[sl];
+        pt[16 + sl] += copies;
+        ++pt[32];
+        p = q;
+      }
+    }
+  }
   ExactDup r;
-  r.total = fps.size();
-  std::sort(fps.begin(), fps.end());
-  for (std::size_t i = 0; i < fps.size();) {
-    std::size_t j = i + 1;
-    while (j < fps.size() && fps[j] == fps[i])
-      ++j;
-    const std::size_t copies = j - i;
-    ++r.distinct;
-    const std::size_t s = dup_level_slot(copies);
-    r.dedup_bins[s] += 1.0;
-    r.total_bins[s] += static_cast<double>(copies);
-    i = j;
+  r.total = n;
+  std::array<std::size_t, 33> sum{};
+  for (const auto &pt : part)
+    for (std::size_t k = 0; k < 33; ++k)
+      sum[k] += pt[k];
+  r.distinct = sum[32];
+  for (std::size_t sl = 0; sl < 16; ++sl) {
+    r.dedup_bins[sl] = static_cast<double>(sum[sl]);
+    r.total_bins[sl] = static_cast<double>(sum[16 + sl]);
   }
   for (auto &v : r.dedup_bins)
     v = 100.0 * v / std::max<double>(1.0, static_cast<double>(r.distinct));
   for (auto &v : r.total_bins)
     v = 100.0 * v / std::max<double>(1.0, static_cast<double>(r.total));
   return r;
-}
-
-template <class Key>
-static double
-fastqc_style_rate(const std::vector<Key> &keys) {
-  DupCounterT<Key> c;
-  for (const Key &k : keys)
-    c.add(k);
-  return 100.0 - summarize_dup(c).total_deduplicated_pct;
 }
 
 // [FalcoAmadeus] paired-end read-pairing summary.
@@ -693,9 +948,19 @@ struct PairStats {
 };
 
 PairStats
+paired_duplication_report(ChunkView<std::uint64_t> &k1,
+                          ChunkView<std::uint64_t> &k2,
+                          const std::size_t matching,
+                          const std::string &r1_file,
+                          const std::string &r2_file,
+                          const std::string &out_file,
+                          const bool allow_unmatched, const bool quiet,
+                          const std::size_t nthreads);
+
+PairStats
 run_paired_duplication(const std::string &r1_file, const std::string &r2_file,
                        const std::string &out_file, const bool allow_unmatched,
-                       const bool quiet) {
+                       const bool quiet, const std::size_t nthreads) {
   // The two mates are independent until they are paired up, so scan them on
   // two threads (halves the wall time of this pass).
   static const bool fa_times = std::getenv("FA_TIMES") != nullptr;
@@ -729,18 +994,51 @@ run_paired_duplication(const std::string &r1_file, const std::string &r2_file,
   if (err2)
     std::rethrow_exception(err2);
   lap("scan");
+  std::size_t matching = 0;
+  if (m1.name_fp.size() == m2.name_fp.size())
+    for (std::size_t i = 0; i < m1.name_fp.size(); ++i)
+      matching += (m1.name_fp[i] == m2.name_fp[i]);
+  { std::vector<std::uint64_t>().swap(m1.name_fp); }
+  { std::vector<std::uint64_t>().swap(m2.name_fp); }
+  std::vector<std::vector<std::uint64_t>> c1(1), c2(1);
+  c1[0].swap(m1.key_fp);
+  c2[0].swap(m2.key_fp);
+  ChunkView<std::uint64_t> k1(std::move(c1)), k2(std::move(c2));
+  return paired_duplication_report(k1, k2, matching, r1_file, r2_file,
+                                   out_file, allow_unmatched, quiet, nthreads);
+}
 
-  const std::size_t num_pairs = m1.key_fp.size();
-  if (m2.key_fp.size() != num_pairs)
+// Pairing check and paired duplication report from the two mates'
+// fingerprints (consumed). Throws when the mates do not correspond.
+PairStats
+paired_duplication_report(ChunkView<std::uint64_t> &k1,
+                          ChunkView<std::uint64_t> &k2,
+                          const std::size_t matching,
+                          const std::string &r1_file,
+                          const std::string &r2_file,
+                          const std::string &out_file,
+                          const bool allow_unmatched, const bool quiet,
+                          const std::size_t nthreads) {
+  static const bool fa_times = std::getenv("FA_TIMES") != nullptr;
+  auto tmark = std::chrono::steady_clock::now();
+  auto lap = [&](const char *what) {
+    if (!fa_times)
+      return;
+    const auto now = std::chrono::steady_clock::now();
+    std::fprintf(stderr, "[FA_TIMES pairs] %s %.3f\n", what,
+                 std::chrono::duration<double>(now - tmark).count());
+    tmark = now;
+  };
+  const std::size_t num_pairs = k1.size();
+  if (k2.size() != num_pairs)
     throw std::runtime_error(
       "paired-end inputs have different numbers of reads: " + r1_file + " (" +
       std::to_string(num_pairs) + ") and " + r2_file + " (" +
-      std::to_string(m2.key_fp.size()) + ")");
+      std::to_string(k2.size()) + ")");
 
   PairStats pstats;
   pstats.pairs = num_pairs;
-  for (std::size_t i = 0; i < num_pairs; ++i)
-    pstats.matching += (m1.name_fp[i] == m2.name_fp[i]);
+  pstats.matching = matching;
   // Mates in different order (or from different runs) silently invalidate
   // every paired statistic, so refuse unless explicitly overridden.
   if (pstats.matching != num_pairs && !allow_unmatched)
@@ -751,32 +1049,68 @@ run_paired_duplication(const std::string &r1_file, const std::string &r2_file,
       "). The mates are not in matching order, so paired-end statistics would "
       "be meaningless. Re-pair the files (e.g. sort both by read name) or pass "
       "--allow-unmatched-pairs to proceed anyway.");
-  { std::vector<std::uint64_t>().swap(m1.name_fp); }
-  { std::vector<std::uint64_t>().swap(m2.name_fp); }
-
-  // Pair key: both truncated mates (an ordered combination, so (a,b) and (b,a)
-  // stay distinct).
-  std::vector<std::uint64_t> pair_fp(num_pairs);
-  for (std::size_t i = 0; i < num_pairs; ++i)
-    pair_fp[i] = fp_finalize(m1.key_fp[i] * 0x9e3779b97f4a7c15ULL ^
-                             fp_finalize(m2.key_fp[i] + 0x632be59bd9b4e019ULL));
-
-  // FastQC-style estimates need the original read order; compute them first.
-  const double fq_pair = fastqc_style_rate(pair_fp);
-  const double fq_r1 = fastqc_style_rate(m1.key_fp);
-  const double fq_r2 = fastqc_style_rate(m2.key_fp);
-  lap("fastqc-style");
-
-  // Exact counts (sorting; the three sorts are independent).
-  ExactDup ex_pair, ex_r1, ex_r2;
-  {
-    std::thread ta([&] { ex_r1 = exact_duplication(m1.key_fp); });
-    std::thread tb([&] { ex_r2 = exact_duplication(m2.key_fp); });
-    ex_pair = exact_duplication(pair_fp);
-    ta.join();
+  // FastQC-style estimates (read order matters) and exact counts per mate,
+  // then for the pair key: both truncated mates (an ordered combination, so
+  // (a,b) and (b,a) stay distinct), computed in place over R1's keys.
+  // Exact counts per mate and for the pair key: both truncated mates (an
+  // ordered combination, so (a,b) and (b,a) stay distinct), computed in place
+  // over R1's keys once R1's own counts are done. The FastQC-style rates
+  // (read order matters; mostly a serial prefix) run on helper threads
+  // meanwhile, the pair's after the pair keys exist.
+  double fq_r1 = 0, fq_r2 = 0, fq_pair = 0;
+  ExactDup ex_r1, ex_r2, ex_pair;
+  FpVec scratch;
+  auto make_pair_keys = [&] {
+#ifdef _OPENMP
+#pragma omp parallel num_threads(nthreads)
+#endif
+    {
+#ifdef _OPENMP
+      const std::size_t t = static_cast<std::size_t>(omp_get_thread_num());
+      const std::size_t nt = static_cast<std::size_t>(omp_get_num_threads());
+#else
+      const std::size_t t = 0, nt = 1;
+#endif
+      zip_views(k1, k2, num_pairs * t / nt, num_pairs * (t + 1) / nt,
+                [](std::uint64_t &a, const std::uint64_t b) {
+                  a = fp_finalize(a * 0x9e3779b97f4a7c15ULL ^
+                                  fp_finalize(b + 0x632be59bd9b4e019ULL));
+                });
+    }
+  };
+  if (nthreads >= 2) {
+    const std::size_t nh = std::max<std::size_t>(1, nthreads / 8);
+    std::thread ta([&] { fq_r1 = fastqc_style_rate(k1, nh); });
+    std::thread tb([&] { fq_r2 = fastqc_style_rate(k2, nh); });
+    ex_r1 = exact_duplication_parallel(k1, nthreads, scratch);
+    ex_r2 = exact_duplication_parallel(k2, nthreads, scratch);
+    ta.join();  // k1 is overwritten next
+    make_pair_keys();
+    std::thread tc([&] { fq_pair = fastqc_style_rate(k1, nh); });
+    ex_pair = exact_duplication_parallel(k1, nthreads, scratch);
     tb.join();
+    tc.join();
   }
-  lap("exact");
+  else {
+    fq_r1 = fastqc_style_rate(k1, nthreads);
+    fq_r2 = fastqc_style_rate(k2, nthreads);
+    ex_r1 = exact_duplication_parallel(k1, nthreads, scratch);
+    ex_r2 = exact_duplication_parallel(k2, nthreads, scratch);
+    make_pair_keys();
+    fq_pair = fastqc_style_rate(k1, nthreads);
+    ex_pair = exact_duplication_parallel(k1, nthreads, scratch);
+  }
+  // the fingerprint chunks were allocated by the parse threads; freeing them
+  // (tens of thousands of blocks) runs beside the report writing
+  g_deferred.add([c1 = std::move(k1.c), c2 = std::move(k2.c),
+                  sc = std::move(scratch)]() mutable {
+    std::vector<std::vector<std::uint64_t>>().swap(c1);
+    std::vector<std::vector<std::uint64_t>>().swap(c2);
+    FpVec().swap(sc);
+  });
+  k1.clear();
+  k2.clear();
+  lap("duplication counts");
 
   std::ofstream os(out_file, std::ofstream::binary);
   if (!os.good())
@@ -890,25 +1224,14 @@ derive_mate_stems(const std::string &r1_file, const std::string &r2_file,
   }
 }
 
-// [FalcoAmadeus] Analyze one sequence file end-to-end and write its three
-// standard outputs (fastqc_data.txt, summary.txt, fastqc_report.html) into
-// `out_dir` with `file_prefix`. Factored out of the main loop so paired mode
-// can run the identical single-file pipeline once per mate without duplicating
-// the module pipeline. `display_suffix` (e.g. " (forward)") is appended to the
-// internal Filename field ONLY, keeping the real basename while giving MultiQC
-// an unambiguous sample name. `forbid_sam_bam` rejects a SAM/BAM input (used in
-// paired mode, which is FASTQ-only).
+// [FalcoAmadeus] The three stages of analyze_and_write, callable separately so
+// native paired mode can read both mates before writing anything.
 static void
-analyze_and_write(FalcoConfig &falco_config, const std::string &filename,
-                  const std::string &forced_file_format,
-                  const std::string &out_dir, const std::string &file_prefix,
-                  const std::string &summary_filename,
-                  const std::string &data_filename,
-                  const std::string &report_filename, const bool skip_text,
-                  const bool skip_html, const bool skip_short_summary,
-                  const bool do_call, const bool forbid_sam_bam,
-                  const std::string &display_suffix,
-                  const std::string &paired_mate = std::string{}) {
+prepare_file_config(FalcoConfig &falco_config, const std::string &filename,
+                    const std::string &forced_file_format,
+                    const bool forbid_sam_bam,
+                    const std::string &display_suffix,
+                    const std::string &paired_mate) {
   falco_config.filename = filename;
   falco_config.paired_mate = paired_mate;
 
@@ -931,11 +1254,12 @@ analyze_and_write(FalcoConfig &falco_config, const std::string &filename,
   // name only); the real basename is preserved as the prefix of this string.
   if (!display_suffix.empty())
     falco_config.filename_stripped += display_suffix;
+}
 
-  /****************** END PROCESSING CONFIG *******************/
+static void
+read_file_into(FalcoConfig &falco_config, FastqStats &stats) {
   if (!falco_config.quiet)
     log_process("Started reading file " + falco_config.filename);
-  FastqStats stats(falco_config.do_kmer);  // allocate all space to summarize data
 
   // Initializes a reader given the file format. The parallel mmap/temp-file/
   // fused paths need a seekable regular file; a pipe/stdin (seekable_input ==
@@ -1036,6 +1360,16 @@ analyze_and_write(FalcoConfig &falco_config, const std::string &filename,
   if (!falco_config.quiet) {
     log_process("Finished reading file");
   }
+}
+
+static void
+summarize_and_write(FalcoConfig &falco_config, FastqStats &stats,
+                    const std::string &out_dir, const std::string &file_prefix,
+                    const std::string &summary_filename,
+                    const std::string &data_filename,
+                    const std::string &report_filename, const bool skip_text,
+                    const bool skip_html, const bool skip_short_summary,
+                    const bool do_call) {
 
   static const bool fa_times = std::getenv("FA_TIMES") != nullptr;
   const auto t0 = std::chrono::steady_clock::now();
@@ -1052,6 +1386,241 @@ analyze_and_write(FalcoConfig &falco_config, const std::string &filename,
                  std::chrono::duration<double>(t1 - t0).count(),
                  std::chrono::duration<double>(t2 - t1).count());
   }
+}
+
+// [FalcoAmadeus] Native paired mode with one read of each mate: both mates'
+// configurations and statistics, their pairing fingerprints, and the combined
+// view's statistics when they can be derived from the mates (comb).
+struct PairedFused {
+  std::optional<FalcoConfig> c1, c2;
+  std::unique_ptr<FastqStats> s1, s2, comb;
+  PairedHooks h1, h2;
+  ChunkView<std::uint64_t> k1, k2;  // R1 and R2 keys
+};
+
+
+// Reads R1 and R2 with the parse drivers' paired hooks. Returns false
+// (leaving falco_config untouched) when the inputs need the separate passes:
+// tiled or SAM/BAM input, read_step > 1, a pipe, the K-mer module, a build
+// without ISA-L, or a driver that could not honour the hooks. The combined view
+// is the pooled analysis of R1 followed by R2; it is derived from the mates
+// (comb) when R1 fills the duplication tracker (100k distinct sequences) and
+// ends with a newline: its integer counters are the sums of the mates', its GC
+// distribution continues R1's with R2's contributions in read order, and R2's
+// reads are counted against R1's tracked sequences -- exactly what the pooled
+// pass computes.
+// Uncompressed mates are read one after the other with all threads, R2
+// continuing the combined view as it is read. Gzipped mates, whose reads are
+// bound by one serial inflater each, are read concurrently with half of the
+// threads each: R2 then starts counting once R1's tracked set is complete
+// (early in R1; R1's later updates touch only counts, not the keys R2 looks
+// up) and its GC records are added to the combined view afterwards.
+static bool
+paired_fused_read(const FalcoConfig &falco_config, const std::string &r1,
+                  const std::string &r2, const std::string &forced_file_format,
+                  const std::string &r1_base, const std::string &r2_base,
+                  PairedFused &pf, std::size_t &matching) {
+  pf.c1.emplace(falco_config);
+  prepare_file_config(*pf.c1, r1, forced_file_format, true, " (forward)",
+                      r2_base);
+  if (pf.c1->read_step != 1 || !pf.c1->seekable_input || pf.c1->do_kmer ||
+      !(pf.c1->is_fastq || pf.c1->is_fastq_gz) ||
+      !pooled_stream_supported(*pf.c1, r1))
+    return false;
+  // The R2 pass of the separate flow starts from the state R1 leaves; the
+  // read changes only do_tile, which setup() resets, so R2 can be set up
+  // from the same starting state.
+  pf.c2.emplace(falco_config);
+  prepare_file_config(*pf.c2, r2, forced_file_format, true, " (reverse)",
+                      r1_base);
+  if (pf.c2->read_step != 1 || !pf.c2->seekable_input || pf.c2->do_kmer ||
+      !(pf.c2->is_fastq || pf.c2->is_fastq_gz))
+    return false;
+  const bool hashing = pf.c1->do_duplication || pf.c1->do_overrepresented;
+  const std::size_t nt = falco_config.threads;
+  const bool concurrent = nt >= 2 && pf.c1->is_fastq_gz && pf.c2->is_fastq_gz;
+
+  // R1 publishes its tracked set (used by the concurrent read)
+  std::mutex mx;
+  std::condition_variable cv;
+  bool published = false;
+  DupHashMap *r1_map = nullptr;
+  auto publish = [&](DupHashMap *m) {
+    std::lock_guard<std::mutex> lk(mx);
+    if (!published) {
+      published = true;
+      r1_map = m;
+    }
+    cv.notify_all();
+  };
+  pf.h1.on_comb_map = publish;
+  pf.c1->paired_hooks = &pf.h1;
+  pf.c2->paired_hooks = &pf.h2;
+  pf.s1.reset(new FastqStats(pf.c1->do_kmer));
+  pf.s2.reset(new FastqStats(pf.c2->do_kmer));
+  std::exception_ptr err1;
+  auto read_r1 = [&] {
+    try {
+      read_file_into(*pf.c1, *pf.s1);
+    }
+    catch (...) {
+      err1 = std::current_exception();
+    }
+    publish(nullptr);  // no effect if the driver already published
+  };
+
+  if (concurrent) {
+    if (hashing)
+      pf.h2.wait_comb_map = [&]() -> DupHashMap * {
+        std::unique_lock<std::mutex> lk(mx);
+        cv.wait(lk, [&] { return published; });
+        return r1_map;
+      };
+    pf.h2.keep_gc_records = true;
+    pf.c1->threads = (nt + 1) / 2;
+    pf.c2->threads = nt / 2;
+    std::thread t1(read_r1);
+    try {
+      read_file_into(*pf.c2, *pf.s2);
+    }
+    catch (...) {
+      publish(nullptr);
+      t1.join();
+      throw;
+    }
+    t1.join();
+    if (err1)
+      std::rethrow_exception(err1);
+    pf.c1->threads = nt;
+    pf.c2->threads = nt;
+  }
+  else {
+    read_r1();
+    if (err1)
+      std::rethrow_exception(err1);
+    if (!pf.h1.used || pf.h1.failed)
+      return false;
+    if (pf.h1.ends_with_newline && (!hashing || r1_map != nullptr)) {
+      pf.comb.reset(new FastqStats(*pf.s1));
+      pf.h2.gc2 = pf.comb->gc_count.data();
+      if (hashing)
+        pf.h2.comb_map = &pf.comb->sequence_count;
+    }
+    read_file_into(*pf.c2, *pf.s2);
+  }
+  pf.c1->paired_hooks = nullptr;
+  pf.c2->paired_hooks = nullptr;
+  if (!pf.h1.used || pf.h1.failed || !pf.h2.used || pf.h2.failed)
+    return false;
+
+  {
+    // pairing: names compared at equal read index
+    ChunkView<std::uint32_t> n1(std::move(pf.h1.name_chunks)),
+      n2(std::move(pf.h2.name_chunks));
+    const std::size_t n = std::min(n1.size(), n2.size());
+    std::size_t m = 0;
+#ifdef _OPENMP
+#pragma omp parallel num_threads(nt) reduction(+ : m)
+#endif
+    {
+#ifdef _OPENMP
+      const std::size_t t = static_cast<std::size_t>(omp_get_thread_num());
+      const std::size_t tn = static_cast<std::size_t>(omp_get_num_threads());
+#else
+      const std::size_t t = 0, tn = 1;
+#endif
+      zip_views(n1, n2, n * t / tn, n * (t + 1) / tn,
+                [&m](const std::uint32_t a, const std::uint32_t b) {
+                  m += (a == b);
+                });
+    }
+    matching = m;
+  }
+  if (concurrent) {
+    // combined view from the mates
+    if (pf.h1.ends_with_newline && (!hashing || r1_map != nullptr)) {
+      pf.comb.reset(new FastqStats(*pf.s1));
+      if (hashing) {
+        auto it = pf.comb->sequence_count.begin();
+        for (std::size_t i = 0; i < pf.h2.comb_counts.size(); ++i)
+          (it + i)->second += pf.h2.comb_counts[i];
+      }
+      replay_gc_records(pf.h2.gc_records, pf.comb->gc_count.data());
+    }
+    std::vector<GCRecord>().swap(pf.h2.gc_records);
+    std::vector<std::size_t>().swap(pf.h2.comb_counts);
+  }
+  pf.k1 = ChunkView<std::uint64_t>(std::move(pf.h1.key_chunks));
+  pf.k2 = ChunkView<std::uint64_t>(std::move(pf.h2.key_chunks));
+  return true;
+}
+
+// Adds R2's counters to the combined view (a copy of R1's statistics taken
+// before R1 was written). GC and duplication counts were continued during the
+// R2 read (PairedHooks::gc2, comb_map).
+static void
+merge_mate_stats(FastqStats &comb, FastqStats &s2) {
+  auto add_arr = [](auto &dst, const auto &src) {
+    for (std::size_t i = 0; i < dst.size(); ++i)
+      dst[i] += src[i];
+  };
+  auto add_vec = [](std::vector<std::size_t> &dst,
+                    const std::vector<std::size_t> &src) {
+    if (dst.size() < src.size())
+      dst.resize(src.size(), 0);
+    for (std::size_t i = 0; i < src.size(); ++i)
+      dst[i] += src[i];
+  };
+  comb.flush_soa();
+  comb.flush_qtile();
+  s2.flush_soa();
+  s2.flush_qtile();
+  add_arr(comb.base_count, s2.base_count);
+  add_arr(comb.n_base_count, s2.n_base_count);
+  add_arr(comb.position_quality_count, s2.position_quality_count);
+  add_arr(comb.quality_count, s2.quality_count);
+  add_arr(comb.read_length_freq, s2.read_length_freq);
+  add_arr(comb.pos_kmer_count, s2.pos_kmer_count);
+  add_arr(comb.pos_adapter_count, s2.pos_adapter_count);
+  comb.total_bases += s2.total_bases;
+  comb.total_gc += s2.total_gc;
+  comb.empty_reads += s2.empty_reads;
+  comb.num_reads += s2.num_reads;
+  comb.max_read_length = std::max(comb.max_read_length, s2.max_read_length);
+  comb.lowest_char = std::min(comb.lowest_char, s2.lowest_char);
+  add_vec(comb.long_base_count, s2.long_base_count);
+  add_vec(comb.long_n_base_count, s2.long_n_base_count);
+  add_vec(comb.long_position_quality_count, s2.long_position_quality_count);
+  add_vec(comb.long_read_length_freq, s2.long_read_length_freq);
+  comb.num_extra_bases = std::max(comb.num_extra_bases, s2.num_extra_bases);
+}
+
+// [FalcoAmadeus] Analyze one sequence file end-to-end and write its three
+// standard outputs (fastqc_data.txt, summary.txt, fastqc_report.html) into
+// `out_dir` with `file_prefix`. Factored out of the main loop so paired mode
+// can run the identical single-file pipeline once per mate without duplicating
+// the module pipeline. `display_suffix` (e.g. " (forward)") is appended to the
+// internal Filename field ONLY, keeping the real basename while giving MultiQC
+// an unambiguous sample name. `forbid_sam_bam` rejects a SAM/BAM input (used in
+// paired mode, which is FASTQ-only).
+static void
+analyze_and_write(FalcoConfig &falco_config, const std::string &filename,
+                  const std::string &forced_file_format,
+                  const std::string &out_dir, const std::string &file_prefix,
+                  const std::string &summary_filename,
+                  const std::string &data_filename,
+                  const std::string &report_filename, const bool skip_text,
+                  const bool skip_html, const bool skip_short_summary,
+                  const bool do_call, const bool forbid_sam_bam,
+                  const std::string &display_suffix,
+                  const std::string &paired_mate = std::string{}) {
+  prepare_file_config(falco_config, filename, forced_file_format,
+                      forbid_sam_bam, display_suffix, paired_mate);
+  FastqStats stats(falco_config.do_kmer);  // allocate all space to summarize data
+  read_file_into(falco_config, stats);
+  summarize_and_write(falco_config, stats, out_dir, file_prefix,
+                      summary_filename, data_filename, report_filename,
+                      skip_text, skip_html, skip_short_summary, do_call);
 }
 
 // [FalcoAmadeus] read an entire file into a string (for embedding mate reports).
@@ -1662,13 +2231,17 @@ main(int argc, char *argv[]) {
         const std::string fwd_dir = cur_outdir + "/" + fwd_stem;
         const std::string rev_dir = cur_outdir + "/" + rev_stem;
 
-        // [FalcoAmadeus] Pairing + duplication pass FIRST: it validates that
-        // the mates are in matching order (failing fast before any per-mate
-        // work), and the combined view reports its pair counts.
+        // [FalcoAmadeus] The pairing check runs before any output is written
+        // (mates in the wrong order fail fast), and the combined view reports
+        // its pair counts. With paired_fused_read each mate is read once:
+        // the parse collects the pairing fingerprints and the combined view
+        // is derived from the two mates. Otherwise a separate pairing pass
+        // scans both files first and the combined view re-reads them.
         const std::string paired_out = cur_outdir + "/paired_duplication.txt";
-        if (!falco_config.quiet)
-          log_process("Running paired-end pairing/duplication pass with " +
-                      paired_with_file);
+        const std::string r1_base =
+          std::filesystem::path(filename).filename().string();
+        const std::string r2_base =
+          std::filesystem::path(paired_with_file).filename().string();
         static const bool fa_times = std::getenv("FA_TIMES") != nullptr;
         auto pmark = std::chrono::steady_clock::now();
         auto plap = [&](const char *what) {
@@ -1679,10 +2252,33 @@ main(int argc, char *argv[]) {
                        std::chrono::duration<double>(now - pmark).count());
           pmark = now;
         };
-        const PairStats ps = run_paired_duplication(
-          filename, paired_with_file, paired_out,
-          falco_config.allow_unmatched_pairs, falco_config.quiet);
-        plap("pairing pass");
+        PairedFused pf;
+        std::size_t fused_matching = 0;
+        const bool fused =
+          paired_fused_read(falco_config, filename, paired_with_file,
+                            forced_file_format, r1_base, r2_base, pf,
+                            fused_matching);
+        plap(fused ? "read both mates" : "single read not applicable");
+        PairStats ps;
+        if (fused) {
+          ps = paired_duplication_report(pf.k1, pf.k2, fused_matching,
+                                         filename, paired_with_file,
+                                         paired_out,
+                                         falco_config.allow_unmatched_pairs,
+                                         falco_config.quiet,
+                                         falco_config.threads);
+          pf.k1.clear();
+          pf.k2.clear();
+        }
+        else {
+          if (!falco_config.quiet)
+            log_process("Running paired-end pairing/duplication pass with " +
+                        paired_with_file);
+          ps = run_paired_duplication(filename, paired_with_file, paired_out,
+                                      falco_config.allow_unmatched_pairs,
+                                      falco_config.quiet, falco_config.threads);
+        }
+        plap("pairing report");
 
         std::error_code ec;
         std::filesystem::create_directories(fwd_dir, ec);
@@ -1696,26 +2292,35 @@ main(int argc, char *argv[]) {
 
         // Standard names within each subdir; custom -D/-R/-S are ignored in
         // paired mode (two outputs, so single-file names cannot apply).
-        const std::string r1_base =
-          std::filesystem::path(filename).filename().string();
-        const std::string r2_base =
-          std::filesystem::path(paired_with_file).filename().string();
         // [FalcoAmadeus] Which per-sample data files to write for MultiQC.
         const bool want_mate_data = (falco_config.paired_data != "combined");
         const bool want_comb_data = (falco_config.paired_data != "mates");
         const bool mate_skip_text = skip_text || !want_mate_data;
 
 
-        analyze_and_write(falco_config, filename, forced_file_format, fwd_dir,
-                          std::string{}, std::string{}, std::string{},
-                          std::string{}, mate_skip_text, skip_html,
-                          mate_skip_text, do_call, true, " (forward)",
-                          r2_base);
-        analyze_and_write(falco_config, paired_with_file, forced_file_format,
-                          rev_dir, std::string{}, std::string{}, std::string{},
-                          std::string{}, mate_skip_text, skip_html,
-                          mate_skip_text, do_call, true, " (reverse)",
-                          r1_base);
+        if (fused) {
+          summarize_and_write(*pf.c1, *pf.s1, fwd_dir, std::string{},
+                              std::string{}, std::string{}, std::string{},
+                              mate_skip_text, skip_html, mate_skip_text,
+                              do_call);
+          summarize_and_write(*pf.c2, *pf.s2, rev_dir, std::string{},
+                              std::string{}, std::string{}, std::string{},
+                              mate_skip_text, skip_html, mate_skip_text,
+                              do_call);
+          falco_config = *pf.c2;  // the state the separate passes leave
+        }
+        else {
+          analyze_and_write(falco_config, filename, forced_file_format, fwd_dir,
+                            std::string{}, std::string{}, std::string{},
+                            std::string{}, mate_skip_text, skip_html,
+                            mate_skip_text, do_call, true, " (forward)",
+                            r2_base);
+          analyze_and_write(falco_config, paired_with_file, forced_file_format,
+                            rev_dir, std::string{}, std::string{}, std::string{},
+                            std::string{}, mate_skip_text, skip_html,
+                            mate_skip_text, do_call, true, " (reverse)",
+                            r1_base);
+        }
         plap("forward + reverse");
 
         // [FalcoAmadeus] Merge the mate reports into ONE combined HTML with
@@ -1781,12 +2386,26 @@ main(int argc, char *argv[]) {
             "pool both mates, so \"Total Sequences\" counts all " + nreads +
             " sequenced ends.</p></div>";
 
-          analyze_and_write(falco_config, pooled_in, forced_file_format,
-                            comb_dir, std::string{}, std::string{},
-                            std::string{}, std::string{},
-                            /*skip_text=*/!want_comb_data, skip_html,
-                            /*skip_short_summary=*/!want_comb_data, do_call, true,
-                            " (combined)");
+          if (fused && pf.comb && stream_pooled) {
+            prepare_file_config(falco_config, pooled_in, forced_file_format,
+                                true, " (combined)", std::string{});
+            falco_config.do_tile = false;  // as the pooled read of tile-less input
+            merge_mate_stats(*pf.comb, *pf.s2);
+            summarize_and_write(falco_config, *pf.comb, comb_dir,
+                                std::string{}, std::string{}, std::string{},
+                                std::string{}, /*skip_text=*/!want_comb_data,
+                                skip_html,
+                                /*skip_short_summary=*/!want_comb_data,
+                                do_call);
+          }
+          else {
+            analyze_and_write(falco_config, pooled_in, forced_file_format,
+                              comb_dir, std::string{}, std::string{},
+                              std::string{}, std::string{},
+                              /*skip_text=*/!want_comb_data, skip_html,
+                              /*skip_short_summary=*/!want_comb_data, do_call,
+                              true, " (combined)");
+          }
           plap("combined view");
           falco_config.combined_note.clear();  // don't leak to other reports
           falco_config.pooled_inputs.clear();

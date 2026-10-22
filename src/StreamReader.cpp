@@ -63,6 +63,7 @@ class RapidgzipSource {
 #include <mutex>
 #include <condition_variable>
 #include <deque>
+#include <type_traits>
 #include <unordered_map>
 #ifdef _OPENMP
 #include <omp.h>
@@ -2571,18 +2572,52 @@ class DupDeltas32 {
     }
     since_ += max_records;
   }
+  // Fold into sink[i] instead of the map entries (counts kept apart from the
+  // map they index; paired mode's combined view).
+  void set_sink(std::vector<std::size_t> *sink) { sink_ = sink; }
   void fold(DupHashMap::iterator mbegin) {
     for (auto &v : d_)
       for (std::size_t i = 0; i < v.size(); ++i) {
-        (mbegin + i)->second += v[i];
+        if (sink_)
+          (*sink_)[i] += v[i];
+        else
+          (mbegin + i)->second += v[i];
         v[i] = 0;
       }
   }
 
  private:
   std::vector<std::vector<std::uint32_t>> d_;
+  std::vector<std::size_t> *sink_ = nullptr;
   std::size_t since_ = 0;
 };
+
+// [FalcoAmadeus] Native paired mode, per read: the name and key
+// fingerprints (see PairedHooks), and for the second mate the occurrence of
+// its duplication key in the first mate's map (the combined view).
+inline void
+pair_fingerprints(const char *rec, const char *end, const char *key,
+                  std::size_t seqlen, std::vector<std::uint32_t> &nfv,
+                  std::vector<std::uint64_t> &kfv, DupHashMap *cm,
+                  std::uint32_t *crow, DupHashMap::iterator cmbegin) {
+  const std::uint64_t nf = pair_name_fp(rec, end);
+  nfv.push_back(static_cast<std::uint32_t>(nf ^ (nf >> 32)));
+  std::size_t sl = seqlen;
+  if (sl && key[sl - 1] == '\r')
+    --sl;
+  const std::size_t kl = get_truncate_point(sl);
+  std::uint64_t kfp, h;
+  DupHashMap::fp_and_hash(key, kl, kfp, h);
+  kfv.push_back(kfp);
+  if (cm) {
+    const std::size_t klen = get_truncate_point(seqlen);
+    if (klen != kl)
+      h = DupHashMap::hash_of(key, klen);
+    const auto it = cm->find_hashed(h, key, klen);
+    if (it != cm->end())
+      ++crow[static_cast<std::size_t>(it - cmbegin)];
+  }
+}
 
 // [FalcoAmadeus] A range's GC record vector, moved onto the parsing
 // thread's stack for the duration of the range. The vectors of neighbouring
@@ -2604,6 +2639,19 @@ struct LocalGCBuf {
   std::vector<GCRecord> &shared_;
 };
 
+void
+replay_gc_records(const std::vector<GCRecord> &recs, double *gc) {
+  for (const GCRecord &gr : recs) {
+    if (gr.kind == 1) {
+      for (const auto &v : FastqStats::gc_models[gr.a].models[gr.b])
+        gc[v.percent] += v.increment;
+    }
+    else if (gr.kind == 2) {
+      ++gc[gr.a];
+    }
+  }
+}
+
 class GCReplayer {
 public:
   GCReplayer(FastqStats &master, std::size_t nbufs) : master_(master) {
@@ -2614,6 +2662,11 @@ public:
   // The buffer set the NEXT parse phase may write: never the in-flight one
   // (submit() below only returns once the other set has fully replayed).
   std::vector<std::vector<GCRecord>> &parse_bufs() { return bufs_[cur_]; }
+  // Also append every replayed record, in replay order, to sink (paired
+  // mode's combined view). Set before the first submit().
+  void set_record_sink(std::vector<GCRecord> *sink) { sink_ = sink; }
+  // Also add every contribution to gc2, in the same order.
+  void set_gc2(double *gc2) { gc2_ = gc2; }
   // Hand the first `nused` vectors of the just-parsed set to the replay
   // thread (vectors past nused may hold a previous slice's records -- they
   // are NOT replayed). Blocks until the PREVIOUS submission finished
@@ -2682,6 +2735,10 @@ private:
             ++master_.gc_count[gr.a];
           }
         }
+        if (gc2_)
+          replay_gc_records(gc, gc2_);
+        if (sink_)
+          sink_->insert(sink_->end(), gc.begin(), gc.end());
       }
       if (after)
         after();  // e.g. drop the slice's pages, off the serial path
@@ -2693,6 +2750,8 @@ private:
     }
   }
   FastqStats &master_;
+  std::vector<GCRecord> *sink_ = nullptr;
+  double *gc2_ = nullptr;
   std::array<std::vector<std::vector<GCRecord>>, 2> bufs_;  // [set][range]
   int cur_ = 0;        // set the next parse phase writes
   int inflight_ = -1;  // set queued/being replayed, -1 = none
@@ -2806,6 +2865,40 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
   // shared per-slice state written inside `omp single` blocks; the implicit
   // barrier ending each single/for publishes the writes to all threads.
   GCReplayer replayer(master, R_MAX);
+  // native paired mode (FASTQ only): per-read fingerprints and the combined
+  // view's continuation, see PairedHooks
+  PairedHooks *H = nullptr;
+  DupHashMap *cm = nullptr;
+  DupDeltas32 dd2(nthreads);
+  DupHashMap::iterator cmbegin{};
+  if constexpr (std::is_same<P, FastqPolicy>::value) {
+    H = config.paired_hooks;
+    if (H) {
+      H->used = true;
+      H->ends_with_newline = (size == 0 || base[size - 1] == '\n');
+      if (H->keep_gc_records)
+        replayer.set_record_sink(&H->gc_records);
+      replayer.set_gc2(H->gc2);
+      if (do_hash && H->comb_map) {
+        cm = H->comb_map;
+        cmbegin = cm->begin();
+        dd2.init(cm->size());
+      }
+      else if (do_hash && H->wait_comb_map) {
+        cm = H->wait_comb_map();
+        if (cm) {
+          cmbegin = cm->begin();
+          dd2.init(cm->size());
+          H->comb_counts.assign(cm->size(), 0);
+          dd2.set_sink(&H->comb_counts);
+        }
+      }
+    }
+  }
+  std::vector<std::vector<std::uint32_t>> rnf(H ? R_MAX : 0);
+  std::vector<std::vector<std::uint64_t>> rkf(H ? R_MAX : 0);
+  std::vector<double> bpr(nthreads, 0.0);  // bytes per record, per thread
+  bool comb_notified = false;
   std::size_t off = P::find_start(base, size, 0);
   std::size_t dropped = 0;
   std::size_t plimit = 0, dup_stop = 0, nranges = 0;
@@ -2869,6 +2962,9 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
         if (slice_open) {
           for (std::size_t r = 0; r < nranges; ++r)
             total += counts[r];
+          if (H)
+            for (std::size_t r = 0; r < nranges; ++r)
+              H->take_range(rnf[r], rkf[r]);
           // Replay + page drop both run on the replay thread while the next
           // slice parses: the replay reads only its GCRecords, and the pages
           // dropped are the fully parsed previous slice (nothing reads them
@@ -2980,9 +3076,15 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
             nent = master.sequence_count.size();
             mbegin = master.sequence_count.begin();
             dd.init(nent);
+            if (H && H->on_comb_map) {
+              H->on_comb_map(&master.sequence_count);
+              comb_notified = true;
+            }
           }
           if (count_dup)
             dd.reserve(sbytes, mbegin);
+          if (cm)
+            dd2.reserve(sbytes, cmbegin);
           slice_open = true;
           ++n_slices;
         }
@@ -3045,6 +3147,25 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
         const char *pp = nullptr;
         std::size_t pn = 0;
         bool pv = false;
+        // this range's fingerprints, appended on the thread's stack (see
+        // LocalGCBuf) and moved back below
+        std::vector<std::uint32_t> nfv;
+        std::vector<std::uint64_t> kfv;
+        if (H) {
+          nfv.swap(rnf[r]);
+          kfv.swap(rkf[r]);
+          nfv.clear();
+          kfv.clear();
+          // size from this thread's bytes per record so far (chunks keep
+          // their capacity until they are concatenated)
+          if (bpr[tid] > 0) {
+            const std::size_t est =
+              static_cast<std::size_t>((pend - p) / bpr[tid] * 1.05) + 16;
+            nfv.reserve(est);
+            kfv.reserve(est);
+          }
+        }
+        const std::size_t p_first = p;
         while (p < pend) {
           const std::size_t rec_start = p;
           std::size_t seqlen = 0, tile_cur = 0;
@@ -3054,6 +3175,10 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
                            tail, seqlen, tile_cur, key);
           ++g;
           ++n;
+          if (H)
+            pair_fingerprints(base + rec_start, base + plimit, key, seqlen,
+                              nfv, kfv, cm, cm ? dd2.row(tid) : nullptr,
+                              cmbegin);
           if (count_dup && rec_start >= dup_stop) {
             const std::size_t klen = get_truncate_point(seqlen);
             const std::uint64_t h = DupHashMap::hash_of(key, klen);
@@ -3075,6 +3200,12 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
           if (it != master.sequence_count.end())
             ++dd.row(tid)[static_cast<std::size_t>(it - mbegin)];
         }
+        if (H) {
+          if (n > 0)
+            bpr[tid] = static_cast<double>(p - p_first) / static_cast<double>(n);
+          rnf[r].swap(nfv);
+          rkf[r].swap(kfv);
+        }
         counts[r] = n;  // == the count pass's value on well-formed input
         if (lazy)
           plimit = p;  // one thread, one range: the slice ends here
@@ -3094,6 +3225,10 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
   const bool count_dup_final = do_hash && !dup_cont;
   if (count_dup_final)
     dd.fold(mbegin);
+  if (cm)
+    dd2.fold(cmbegin);
+  if (H && H->on_comb_map && !comb_notified)
+    H->on_comb_map(nullptr);
   merge_worker_stats(config, master, nthreads, total, wstats, empty_gc, deltas,
                      tilerecs, gstart, count_dup_final,
                      /*tile_ignore=*/true, /*skip_gc=*/true);
@@ -3231,6 +3366,37 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
   auto nodrop = [](std::size_t, std::size_t) {};
 
   GCReplayer replayer(master, R_MAX);
+  // native paired mode: per-read fingerprints and the combined view's
+  // continuation, see PairedHooks
+  PairedHooks *const H = config.paired_hooks;
+  DupHashMap *cm = nullptr;
+  DupDeltas32 dd2(nthreads);
+  DupHashMap::iterator cmbegin{};
+  char last_byte = '\n';
+  if (H) {
+    H->used = true;
+    if (H->keep_gc_records)
+      replayer.set_record_sink(&H->gc_records);
+    replayer.set_gc2(H->gc2);
+    if (do_hash && H->comb_map) {
+      cm = H->comb_map;
+      cmbegin = cm->begin();
+      dd2.init(cm->size());
+    }
+    else if (do_hash && H->wait_comb_map) {
+      cm = H->wait_comb_map();
+      if (cm) {
+        cmbegin = cm->begin();
+        dd2.init(cm->size());
+        H->comb_counts.assign(cm->size(), 0);
+        dd2.set_sink(&H->comb_counts);
+      }
+    }
+  }
+  std::vector<std::vector<std::uint32_t>> rnf(H ? R_MAX : 0);
+  std::vector<std::vector<std::uint64_t>> rkf(H ? R_MAX : 0);
+  std::vector<double> bpr(nthreads, 0.0);  // bytes per record, per thread
+  bool comb_notified = false;
   // shared per-chunk state, written in `single` blocks (barriers publish it)
   std::size_t filled_end = 0, plimit = 0, dup_stop = 0, nranges = 0;
   std::size_t ntasks = 0;          // production items for the NEXT chunk
@@ -3274,6 +3440,9 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
           if (slice_open) {
             for (std::size_t r = 0; r < nranges; ++r)
               total += counts[r];
+            if (H)
+              for (std::size_t r = 0; r < nranges; ++r)
+                H->take_range(rnf[r], rkf[r]);
             replayer.submit(nranges);  // replays while this chunk parses
           }
           left = carry;
@@ -3302,6 +3471,8 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
         if (left)
           std::memcpy(buf, prev + (filled_end - left), left);
         filled_end = left + got;
+        if (filled_end > 0)
+          last_byte = buf[filled_end - 1];
 
         // ---- queue production of the next chunk into the other buffer ----
         ntasks = 0;
@@ -3384,9 +3555,15 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
               nent = master.sequence_count.size();
               mbegin = master.sequence_count.begin();
               dd.init(nent);
+              if (H && H->on_comb_map) {
+                H->on_comb_map(&master.sequence_count);
+                comb_notified = true;
+              }
             }
             if (count_dup)
               dd.reserve(plimit, mbegin);
+            if (cm)
+              dd2.reserve(plimit, cmbegin);
             slice_open = true;
           }
           else if (eof) {
@@ -3472,6 +3649,23 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
         // pending probe is flushed before this range ends.
         std::uint64_t ph = 0; const char *pp = nullptr; std::size_t pn = 0;
         bool pv = false;
+        std::vector<std::uint32_t> nfv;  // see read_bytes_fused
+        std::vector<std::uint64_t> kfv;
+        if (H) {
+          nfv.swap(rnf[r]);
+          kfv.swap(rkf[r]);
+          nfv.clear();
+          kfv.clear();
+          // size from this thread's bytes per record so far (chunks keep
+          // their capacity until they are concatenated)
+          if (bpr[tid] > 0) {
+            const std::size_t est =
+              static_cast<std::size_t>((pend - p) / bpr[tid] * 1.05) + 16;
+            nfv.reserve(est);
+            kfv.reserve(est);
+          }
+        }
+        const std::size_t p_first = p;
         while (p < pend) {
           const std::size_t rec_start = p;
           std::size_t seqlen = 0, tile_cur = 0;
@@ -3481,6 +3675,9 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
                                      tile_ignore, tail, seqlen, tile_cur, key);
           ++g;
           ++n;
+          if (H)
+            pair_fingerprints(buf + rec_start, buf + plimit, key, seqlen, nfv,
+                              kfv, cm, cm ? dd2.row(tid) : nullptr, cmbegin);
           if (count_dup && rec_start >= dup_stop) {
             const std::size_t klen = get_truncate_point(seqlen);
             const std::uint64_t h = DupHashMap::hash_of(key, klen);
@@ -3498,6 +3695,12 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
           if (f != master.sequence_count.end())
             ++dd.row(tid)[static_cast<std::size_t>(f - mbegin)];
         }
+        if (H) {
+          if (n > 0)
+            bpr[tid] = static_cast<double>(p - p_first) / static_cast<double>(n);
+          rnf[r].swap(nfv);
+          rkf[r].swap(kfv);
+        }
         counts[r] = n;  // == the count pass's value on well-formed input
       }  // barrier: counts[] complete, next chunk produced
     }
@@ -3510,6 +3713,12 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
   const bool count_dup_final = do_hash && !dup_cont;
   if (count_dup_final)
     dd.fold(mbegin);
+  if (cm)
+    dd2.fold(cmbegin);
+  if (H && H->on_comb_map && !comb_notified)
+    H->on_comb_map(nullptr);
+  if (H)
+    H->ends_with_newline = (last_byte == '\n');
   merge_worker_stats(config, master, nthreads, total, wstats, empty_gc, deltas,
                      tilerecs, gstart, count_dup_final,
                      /*tile_ignore=*/true, /*skip_gc=*/true);
@@ -5356,6 +5565,8 @@ read_bgzf_fastq_fused(FalcoConfig &config, FastqStats &master,
   close(fd);
   if (invalid) {  // not BGZF after all: discard and use the plain-gzip path
     master = FastqStats(config.do_kmer);
+    if (config.paired_hooks)
+      config.paired_hooks->failed = true;
     return false;
   }
   return true;
