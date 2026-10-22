@@ -130,6 +130,37 @@ public:
     emplace(key.data(), key.size(), value);
   }
 
+  // Look up a key and insert it with `value` when absent, hashing and
+  // probing once. Linear probing inserts at the first empty slot of the
+  // key's probe sequence, which is where the lookup stops, so the table is
+  // identical to find() followed by emplace(). Returns {entry, inserted}.
+  std::pair<iterator, bool> find_or_emplace(const char *p, std::size_t n,
+                                            std::size_t value) {
+    if (slots_.empty())
+      allocate();
+    const std::uint64_t hh = hash_key(p, n);
+    const std::uint32_t tag = (static_cast<std::uint32_t>(hh >> 56) | 1u) << 24;
+    std::size_t h = static_cast<std::size_t>(hh) & mask_;
+    for (;;) {
+      const std::uint32_t s = slots_[h];
+      if (s == 0)
+        break;
+      if ((s & 0xff000000u) == tag) {
+        const std::size_t idx = (s & 0x00ffffffu) - 1;
+        if (klen_[idx] == n &&
+            std::memcmp(keys_.data() + idx * KSTRIDE, p, n) == 0)
+          return {entries_.data() + idx, false};
+      }
+      h = (h + 1) & mask_;
+    }
+    const std::size_t idx = entries_.size();
+    slots_[h] = tag | static_cast<std::uint32_t>(idx + 1);
+    std::memcpy(keys_.data() + idx * KSTRIDE, p, n);
+    klen_[idx] = static_cast<std::uint8_t>(n);
+    entries_.emplace_back(std::string(p, n), value);
+    return {entries_.data() + idx, true};
+  }
+
 private:
   // Deferred constructor body: build the slot table (with its mask), reserve
   // the entry storage and zero the shadow key store. Runs at most once, before

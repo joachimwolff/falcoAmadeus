@@ -2178,9 +2178,9 @@ dup_prefix_scan(FastqStats &master, std::size_t start, NextKey next_key,
   std::size_t seen = 0, p = start, next = 0, klen = 0;
   const char *key = nullptr;
   while (continue_storing && next_key(p, key, klen, next)) {
-    const auto it = master.sequence_count.find(key, klen);
-    if (it == master.sequence_count.end()) {
-      master.sequence_count.emplace(key, klen, 1);
+    const auto fe = master.sequence_count.find_or_emplace(key, klen, 1);
+    const auto it = fe.first;
+    if (fe.second) {
       master.count_at_limit = seen;
       ++master.num_unique_seen;
       if (master.num_unique_seen == Constants::unique_reads_stop_counting) {
@@ -2865,9 +2865,9 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
               const char *key;
               std::size_t klen;
               const std::size_t next = P::dup_key(base, plimit, p, key, klen);
-              const auto it = master.sequence_count.find(key, klen);
-              if (it == master.sequence_count.end()) {
-                master.sequence_count.emplace(key, klen, 1);
+              const auto fe = master.sequence_count.find_or_emplace(key, klen, 1);
+              const auto it = fe.first;
+              if (fe.second) {
                 master.count_at_limit = dup_seen;
                 ++master.num_unique_seen;
                 if (master.num_unique_seen ==
@@ -3239,9 +3239,9 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
                 std::size_t klen;
                 const std::size_t next =
                   FastqPolicy::dup_key(buf, plimit, p, key, klen);
-                const auto it = master.sequence_count.find(key, klen);
-                if (it == master.sequence_count.end()) {
-                  master.sequence_count.emplace(key, klen, 1);
+                const auto fe = master.sequence_count.find_or_emplace(key, klen, 1);
+                const auto it = fe.first;
+                if (fe.second) {
                   master.count_at_limit = dup_seen;
                   ++master.num_unique_seen;
                   if (master.num_unique_seen ==
