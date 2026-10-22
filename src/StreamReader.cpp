@@ -2536,6 +2536,26 @@ read_bytesplit_core(FalcoConfig &config, FastqStats &master,
 // worker stats, the read-only duplication map and the deltas; the dup-prefix
 // continuation touches master.sequence_count/num_unique_seen/count_at_limit
 // -- all disjoint from gc_count).
+// [FalcoAmadeus] A range's GC record vector, moved onto the parsing
+// thread's stack for the duration of the range. The vectors of neighbouring
+// ranges are adjacent 24-byte objects, so appending through the shared array
+// wrote a cache line that the threads parsing the next and previous ranges
+// were writing too, once per read. The buffer (and its capacity) moves back
+// when the range ends, so the replayer sees exactly the same records.
+struct LocalGCBuf {
+  explicit LocalGCBuf(std::vector<GCRecord> &shared) : shared_(shared) {
+    v.swap(shared_);
+    v.clear();
+  }
+  ~LocalGCBuf() { shared_.swap(v); }
+  LocalGCBuf(const LocalGCBuf &) = delete;
+  LocalGCBuf &operator=(const LocalGCBuf &) = delete;
+  std::vector<GCRecord> v;
+
+ private:
+  std::vector<GCRecord> &shared_;
+};
+
 class GCReplayer {
 public:
   GCReplayer(FastqStats &master, std::size_t nbufs) : master_(master) {
@@ -2954,8 +2974,8 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
         // range asynchronously warms the one that will be parsed soon
         if (r + 2 * nthreads < nranges)
           warm_range(bound(r + 2 * nthreads), bound(r + 2 * nthreads + 1));
-        std::vector<GCRecord> &gc = replayer.parse_bufs()[r];
-        gc.clear();  // capacity persists across slices
+        LocalGCBuf gcl(replayer.parse_bufs()[r]);  // capacity persists
+        std::vector<GCRecord> &gc = gcl.v;
         typename P::Worker &w = *workers[tid];
         FastqStats &ws = *wstats[tid];
         // can_be_last for EVERY record of the tail range is equivalent to the
@@ -3372,8 +3392,8 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
 #else
         const std::size_t tid = 0;
 #endif
-        std::vector<GCRecord> &gc = replayer.parse_bufs()[r];
-        gc.clear();  // capacity persists across chunks
+        LocalGCBuf gcl(replayer.parse_bufs()[r]);  // capacity persists
+        std::vector<GCRecord> &gc = gcl.v;
         ParallelWorker &w = *workers[tid];
         w.hard_end = buf + filled_end;  // bounds SIMD quality loads (buf moves)
         FastqStats &ws = *wstats[tid];
@@ -5447,8 +5467,8 @@ read_bam_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads) {
         else {
           FastqStats &ws = *wstats[tid];
           BamReader &w = *bw[tid];
-          std::vector<GCRecord> &gc = replayer.parse_bufs()[r];
-          gc.clear();
+          LocalGCBuf gcl(replayer.parse_bufs()[r]);
+          std::vector<GCRecord> &gc = gcl.v;
           const std::vector<std::size_t> &offs = offs2[s];
           char *const bp = bufs2[s];
           for (std::size_t j = lo; j < hi; ++j) {
