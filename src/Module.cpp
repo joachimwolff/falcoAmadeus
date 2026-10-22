@@ -2151,7 +2151,8 @@ ModuleOverrepresentedSequences::summarize_module(FastqStats &stats) {
   for (auto it = std::cbegin(stats.sequence_count);
        it != std::cend(stats.sequence_count); ++it) {
     if (it->second > num_reads * min_fraction_to_overrepresented) {
-      overrep_sequences.push_back(*it);
+      overrep_sequences.emplace_back(stats.sequence_count.key_of(it),
+                                     it->second);
     }
   }
   // Sort by frequency, breaking ties by the sequence itself. This is a

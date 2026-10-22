@@ -16,7 +16,9 @@
  *
  * It exposes just the subset of the map interface the callers use: find(),
  * end()/cend(), emplace(), and forward iteration (the duplication and
- * overrepresented modules iterate the entries).
+ * overrepresented modules iterate the entries). An entry holds the count; its
+ * key is kept only in the flat key store and read with key_of(), so filling
+ * the tracker allocates no per-key string.
  */
 #ifndef DUP_HASH_MAP_HPP
 #define DUP_HASH_MAP_HPP
@@ -24,13 +26,17 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
 class DupHashMap {
 public:
-  using value_type = std::pair<std::string, std::size_t>;
+  // the count of a key (named like the mapped value of a std::map entry)
+  struct value_type {
+    std::size_t second;
+  };
   using iterator = value_type *;
   using const_iterator = const value_type *;
 
@@ -55,6 +61,11 @@ public:
   const_iterator cbegin() const { return entries_.data(); }
   const_iterator cend() const { return entries_.data() + entries_.size(); }
   std::size_t size() const { return entries_.size(); }
+  // the key of an entry
+  std::string key_of(const_iterator it) const {
+    const std::size_t idx = static_cast<std::size_t>(it - entries_.data());
+    return std::string(keys_.get() + idx * KSTRIDE, klen_[idx]);
+  }
 
   // Look up a key given as a raw byte range (the read's sequence buffer). This
   // avoids constructing a std::string for every one of the ~2M lookups per
@@ -83,9 +94,8 @@ public:
   // hash bits (forced odd, so a payload is never 0) checked before touching
   // the entry: equal keys hash equally, so a tag mismatch proves a key
   // mismatch and skips the compare -- identical find results, fewer dependent
-  // cache misses. Key bytes for the compare come from a flat shadow array
-  // (keys_, fixed 80-byte stride >= the 75-byte max key) instead of chasing
-  // each entry's heap std::string: one load chain shorter per probe.
+  // cache misses. Key bytes for the compare come from the flat key store
+  // (keys_, fixed 80-byte stride >= the 75-byte max key).
   iterator find_hashed(std::uint64_t hh, const char *p, std::size_t n) {
     if (slots_.empty())  // never-emplaced map holds nothing: no alloc, no UB
       return end();
@@ -98,7 +108,7 @@ public:
       if ((s & 0xff000000u) == tag) {
         const std::size_t idx = (s & 0x00ffffffu) - 1;
         if (klen_[idx] == n &&
-            std::memcmp(keys_.data() + idx * KSTRIDE, p, n) == 0)
+            std::memcmp(keys_.get() + idx * KSTRIDE, p, n) == 0)
           return entries_.data() + idx;
       }
       h = (h + 1) & mask_;
@@ -122,9 +132,9 @@ public:
       h = (h + 1) & mask_;
     const std::size_t idx = entries_.size();
     slots_[h] = tag | static_cast<std::uint32_t>(idx + 1);
-    std::memcpy(keys_.data() + idx * KSTRIDE, p, n);
+    std::memcpy(keys_.get() + idx * KSTRIDE, p, n);
     klen_[idx] = static_cast<std::uint8_t>(n);
-    entries_.emplace_back(std::string(p, n), value);
+    entries_.push_back(value_type{value});
   }
   void emplace(const std::string &key, std::size_t value) {
     emplace(key.data(), key.size(), value);
@@ -148,16 +158,16 @@ public:
       if ((s & 0xff000000u) == tag) {
         const std::size_t idx = (s & 0x00ffffffu) - 1;
         if (klen_[idx] == n &&
-            std::memcmp(keys_.data() + idx * KSTRIDE, p, n) == 0)
+            std::memcmp(keys_.get() + idx * KSTRIDE, p, n) == 0)
           return {entries_.data() + idx, false};
       }
       h = (h + 1) & mask_;
     }
     const std::size_t idx = entries_.size();
     slots_[h] = tag | static_cast<std::uint32_t>(idx + 1);
-    std::memcpy(keys_.data() + idx * KSTRIDE, p, n);
+    std::memcpy(keys_.get() + idx * KSTRIDE, p, n);
     klen_[idx] = static_cast<std::uint8_t>(n);
-    entries_.emplace_back(std::string(p, n), value);
+    entries_.push_back(value_type{value});
     return {entries_.data() + idx, true};
   }
 
@@ -172,7 +182,9 @@ private:
     slots_.assign(nslots, 0);
     mask_ = nslots - 1;
     entries_.reserve(cap_);
-    keys_.assign(cap_ * KSTRIDE, 0);
+    // written before it is read (a slot points to an entry only after its
+    // key bytes are stored), so it is left uninitialised
+    keys_.reset(new char[cap_ * KSTRIDE]);
     klen_.assign(cap_, 0);
   }
 
@@ -252,7 +264,7 @@ private:
   // All four containers are empty until the first emplace() (see allocate())
   std::vector<value_type> entries_;   // contiguous, reserved to cap (stable)
   std::vector<std::uint32_t> slots_;  // (tag<<24)|(idx+1); 0 = empty
-  std::vector<char> keys_;            // shadow key bytes, KSTRIDE apart
+  std::unique_ptr<char[]> keys_;      // key bytes, KSTRIDE apart
   std::vector<std::uint8_t> klen_;    // shadow key lengths
   std::size_t mask_ = 0;
   std::size_t cap_ = 0;
