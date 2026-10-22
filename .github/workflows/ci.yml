@@ -46,6 +46,9 @@ jobs:
       - name: Run test suite (make check)
         run: make check
 
+      - name: Paired-end duplication and pairing tests
+        run: test/paired/run_paired_tests.sh ./falcoAmadeus
+
       - name: Show test log on failure
         if: failure()
         run: |

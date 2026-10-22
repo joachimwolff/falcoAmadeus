@@ -39,6 +39,12 @@
 #include <array>
 #include <unordered_map>
 #include <stdexcept>
+#include <cstdint>
+#include <exception>
+#include <string_view>
+#include <thread>
+#include <cstring>
+#include <memory>
 
 #include <zlib.h>
 
@@ -298,15 +304,16 @@ namespace {
 // the numbers stay consistent with the single-end module. num_reads is
 // incremented AFTER the counting logic, matching the single-end code where
 // stats.num_reads is bumped only after postprocess runs.
-struct PairedDupCounter {
-  std::unordered_map<std::string, std::size_t> sequence_count;
+template <class Key>
+struct DupCounterT {
+  std::unordered_map<Key, std::size_t> sequence_count;
   std::size_t num_reads = 0;
   std::size_t num_unique_seen = 0;
   std::size_t count_at_limit = 0;
   bool continue_storing = true;
 
   void
-  add(const std::string &key) {
+  add(const Key &key) {
     const auto it = sequence_count.find(key);
     if (it == sequence_count.end()) {
       if (continue_storing) {
@@ -334,8 +341,9 @@ struct DupResult {
   std::array<double, 16> percentage_total{};
 };
 
+template <class Key>
 DupResult
-summarize_dup(const PairedDupCounter &c) {
+summarize_dup(const DupCounterT<Key> &c) {
   DupResult r;
   double seq_total = 0.0;
   double seq_dedup = 0.0;
@@ -466,6 +474,212 @@ struct GzFastqPairReader {
   }
 };
 
+// [FalcoAmadeus] Per-record fingerprints of one FASTQ file: a 64-bit hash of
+// the canonical read name (pairing check) and of the FastQC-truncated
+// sequence key (duplication). Holding 16 bytes per record instead of the
+// reads lets both mates be scanned concurrently and counted exactly.
+struct MateFingerprints {
+  std::vector<std::uint64_t> name_fp;
+  std::vector<std::uint64_t> key_fp;
+};
+
+static inline std::uint64_t
+fp_finalize(std::uint64_t x) {  // splitmix64 finalizer
+  x ^= x >> 30;
+  x *= 0xbf58476d1ce4e5b9ULL;
+  x ^= x >> 27;
+  x *= 0x94d049bb133111ebULL;
+  x ^= x >> 31;
+  return x;
+}
+
+static inline std::uint64_t
+fp_bytes(const char *p, std::size_t n) {
+  return fp_finalize(std::hash<std::string_view>{}(std::string_view(p, n)) ^
+                     (0x9e3779b97f4a7c15ULL * (n + 1)));
+}
+
+// Decompressed byte source for the fingerprint scan: ISA-L inflate for gzip
+// input when available, zlib otherwise (gzread is transparent for plain
+// files), filling large blocks rather than reading line by line.
+class FastqByteSource {
+ public:
+  explicit FastqByteSource(const std::string &path) : path_(path) {
+#ifdef USE_ISAL
+    unsigned char magic[2] = {0, 0};
+    if (FILE *f = std::fopen(path.c_str(), "rb")) {
+      const std::size_t got = std::fread(magic, 1, 2, f);
+      std::fclose(f);
+      if (got == 2 && magic[0] == 0x1f && magic[1] == 0x8b)
+        isal_.reset(new IsalInflater(path));
+    }
+    if (isal_)
+      return;
+#endif
+    gz_ = gzopen(path.c_str(), "rb");
+    if (gz_ == nullptr)
+      throw std::runtime_error("cannot open paired-end input file: " + path);
+    gzbuffer(gz_, 1u << 20);
+  }
+  ~FastqByteSource() {
+    if (gz_ != nullptr)
+      gzclose(gz_);
+  }
+  FastqByteSource(const FastqByteSource &) = delete;
+  FastqByteSource &operator=(const FastqByteSource &) = delete;
+
+  // Returns bytes written (0 at EOF); throws on a decompression error.
+  std::size_t fill(char *out, std::size_t cap) {
+#ifdef USE_ISAL
+    if (isal_)
+      return isal_->fill(out, cap);
+#endif
+    const int n = gzread(gz_, out, static_cast<unsigned>(cap));
+    if (n < 0)
+      throw std::runtime_error("read error in file: " + path_);
+    return static_cast<std::size_t>(n);
+  }
+
+ private:
+  std::string path_;
+  gzFile gz_ = nullptr;
+#ifdef USE_ISAL
+  std::unique_ptr<IsalInflater> isal_;
+#endif
+};
+
+static MateFingerprints
+fingerprint_mate(const std::string &file) {
+  FastqByteSource src(file);
+  MateFingerprints m;
+  const std::size_t BLOCK = std::size_t(4) << 20;
+  std::vector<char> buf(BLOCK);
+  std::size_t beg = 0, end = 0;
+  bool at_eof = false;
+  // Locate the end of the line starting at q; returns line end (exclusive of
+  // '\n', with a trailing '\r' removed) and sets next past the newline, or
+  // false when the buffer holds no complete line from q.
+  auto line = [&](std::size_t q, std::size_t &le, std::size_t &next) {
+    const char *nl = static_cast<const char *>(
+      std::memchr(buf.data() + q, '\n', end - q));
+    if (nl == nullptr) {
+      if (!at_eof || q >= end)
+        return false;
+      le = next = end;  // final line without a trailing newline
+    }
+    else {
+      le = static_cast<std::size_t>(nl - buf.data());
+      next = le + 1;
+    }
+    if (le > q && buf[le - 1] == '\r')
+      --le;
+    return true;
+  };
+  for (;;) {
+    // parse every complete record in [beg, end)
+    for (;;) {
+      std::size_t h_e, h_n, s_e, s_n, p_e, p_n, q_e, q_n;
+      if (beg >= end)
+        break;
+      if (buf[beg] == '\n') {  // blank line (tolerated at end of file)
+        ++beg;
+        continue;
+      }
+      if (!line(beg, h_e, h_n) || !line(h_n, s_e, s_n) ||
+          !line(s_n, p_e, p_n) || !line(p_n, q_e, q_n))
+        break;
+      // canonical name: drop '@', cut at whitespace, drop a /1 or /2 suffix
+      std::size_t nb = beg + (buf[beg] == '@' ? 1 : 0), ne = nb;
+      while (ne < h_e && buf[ne] != ' ' && buf[ne] != '\t')
+        ++ne;
+      if (ne - nb >= 2 && buf[ne - 2] == '/' &&
+          (buf[ne - 1] == '1' || buf[ne - 1] == '2'))
+        ne -= 2;
+      const std::size_t slen = s_e - h_n;
+      m.name_fp.push_back(fp_bytes(buf.data() + nb, ne - nb));
+      m.key_fp.push_back(
+        fp_bytes(buf.data() + h_n, get_truncate_point(slen)));
+      beg = q_n;
+    }
+    if (at_eof) {
+      if (beg < end)
+        throw std::runtime_error("truncated FASTQ record in file: " + file);
+      break;
+    }
+    // keep the partial record, then refill (grow if one record > buffer)
+    std::memmove(buf.data(), buf.data() + beg, end - beg);
+    end -= beg;
+    beg = 0;
+    if (end == buf.size())
+      buf.resize(buf.size() * 2);
+    const std::size_t got = src.fill(buf.data() + end, buf.size() - end);
+    if (got == 0)
+      at_eof = true;
+    end += got;
+  }
+  return m;
+}
+
+// Exact duplication over ALL records: sorts the fingerprints in place and
+// returns the number of distinct keys plus the copy-number histogram in the
+// 16 FastQC duplication-level bins (counts of distinct keys per bin, and of
+// reads per bin). Independent of read order, unlike the FastQC estimator.
+struct ExactDup {
+  std::size_t total = 0;
+  std::size_t distinct = 0;
+  std::array<double, 16> dedup_bins{};
+  std::array<double, 16> total_bins{};
+  double duplicate_rate() const {  // % of reads that are extra copies
+    return total ? 100.0 * static_cast<double>(total - distinct) /
+                     static_cast<double>(total)
+                 : 0.0;
+  }
+};
+
+static std::size_t
+dup_level_slot(const std::size_t copies) {
+  if (copies >= 10000) return 15;
+  if (copies >= 5000) return 14;
+  if (copies >= 1000) return 13;
+  if (copies >= 500) return 12;
+  if (copies >= 100) return 11;
+  if (copies >= 50) return 10;
+  if (copies >= 10) return 9;
+  return copies - 1;
+}
+
+static ExactDup
+exact_duplication(std::vector<std::uint64_t> &fps) {
+  ExactDup r;
+  r.total = fps.size();
+  std::sort(fps.begin(), fps.end());
+  for (std::size_t i = 0; i < fps.size();) {
+    std::size_t j = i + 1;
+    while (j < fps.size() && fps[j] == fps[i])
+      ++j;
+    const std::size_t copies = j - i;
+    ++r.distinct;
+    const std::size_t s = dup_level_slot(copies);
+    r.dedup_bins[s] += 1.0;
+    r.total_bins[s] += static_cast<double>(copies);
+    i = j;
+  }
+  for (auto &v : r.dedup_bins)
+    v = 100.0 * v / std::max<double>(1.0, static_cast<double>(r.distinct));
+  for (auto &v : r.total_bins)
+    v = 100.0 * v / std::max<double>(1.0, static_cast<double>(r.total));
+  return r;
+}
+
+template <class Key>
+static double
+fastqc_style_rate(const std::vector<Key> &keys) {
+  DupCounterT<Key> c;
+  for (const Key &k : keys)
+    c.add(k);
+  return 100.0 - summarize_dup(c).total_deduplicated_pct;
+}
+
 // [FalcoAmadeus] paired-end read-pairing summary.
 struct PairStats {
   std::size_t pairs = 0;
@@ -474,46 +688,76 @@ struct PairStats {
 
 PairStats
 run_paired_duplication(const std::string &r1_file, const std::string &r2_file,
-                       const std::string &out_file, const bool quiet) {
-  GzFastqPairReader r1(r1_file);
-  GzFastqPairReader r2(r2_file);
+                       const std::string &out_file, const bool allow_unmatched,
+                       const bool quiet) {
+  // The two mates are independent until they are paired up, so scan them on
+  // two threads (halves the wall time of this pass).
+  MateFingerprints m1, m2;
+  std::exception_ptr err2;
+  std::thread t2([&] {
+    try {
+      m2 = fingerprint_mate(r2_file);
+    }
+    catch (...) {
+      err2 = std::current_exception();
+    }
+  });
+  try {
+    m1 = fingerprint_mate(r1_file);
+  }
+  catch (...) {
+    t2.join();
+    throw;
+  }
+  t2.join();
+  if (err2)
+    std::rethrow_exception(err2);
 
-  PairedDupCounter pair_ctr;  // correct: key = R1_trunc \0 R2_trunc
-  PairedDupCounter r1_ctr;    // naive single-end estimate on R1 only
-  PairedDupCounter r2_ctr;    // naive single-end estimate on R2 only
+  const std::size_t num_pairs = m1.key_fp.size();
+  if (m2.key_fp.size() != num_pairs)
+    throw std::runtime_error(
+      "paired-end inputs have different numbers of reads: " + r1_file + " (" +
+      std::to_string(num_pairs) + ") and " + r2_file + " (" +
+      std::to_string(m2.key_fp.size()) + ")");
 
   PairStats pstats;
-  std::string s1, s2, n1s, n2s, k1, k2, pair_key;
-  std::size_t num_pairs = 0;
-  while (true) {
-    const bool got1 = r1.next_record(n1s, s1);
-    const bool got2 = r2.next_record(n2s, s2);
-    if (got1 != got2)
-      throw std::runtime_error(
-        "paired-end inputs have different numbers of reads: " + r1_file +
-        " and " + r2_file);
-    if (!got1)
-      break;
+  pstats.pairs = num_pairs;
+  for (std::size_t i = 0; i < num_pairs; ++i)
+    pstats.matching += (m1.name_fp[i] == m2.name_fp[i]);
+  // Mates in different order (or from different runs) silently invalidate
+  // every paired statistic, so refuse unless explicitly overridden.
+  if (pstats.matching != num_pairs && !allow_unmatched)
+    throw std::runtime_error(
+      "R1/R2 read identifiers disagree for " +
+      std::to_string(num_pairs - pstats.matching) + " of " +
+      std::to_string(num_pairs) + " read pairs (" + r1_file + ", " + r2_file +
+      "). The mates are not in matching order, so paired-end statistics would "
+      "be meaningless. Re-pair the files (e.g. sort both by read name) or pass "
+      "--allow-unmatched-pairs to proceed anyway.");
+  { std::vector<std::uint64_t>().swap(m1.name_fp); }
+  { std::vector<std::uint64_t>().swap(m2.name_fp); }
 
-    if (n1s == n2s)
-      ++pstats.matching;  // R1/R2 identifiers agree -> a real, matched pair
+  // Pair key: both truncated mates (an ordered combination, so (a,b) and (b,a)
+  // stay distinct).
+  std::vector<std::uint64_t> pair_fp(num_pairs);
+  for (std::size_t i = 0; i < num_pairs; ++i)
+    pair_fp[i] = fp_finalize(m1.key_fp[i] * 0x9e3779b97f4a7c15ULL ^
+                             fp_finalize(m2.key_fp[i] + 0x632be59bd9b4e019ULL));
 
-    k1.assign(s1, 0, get_truncate_point(s1.size()));
-    k2.assign(s2, 0, get_truncate_point(s2.size()));
-    pair_key.clear();
-    pair_key.append(k1);
-    pair_key.push_back('\0');
-    pair_key.append(k2);
+  // FastQC-style estimates need the original read order; compute them first.
+  const double fq_pair = fastqc_style_rate(pair_fp);
+  const double fq_r1 = fastqc_style_rate(m1.key_fp);
+  const double fq_r2 = fastqc_style_rate(m2.key_fp);
 
-    pair_ctr.add(pair_key);
-    r1_ctr.add(k1);
-    r2_ctr.add(k2);
-    ++num_pairs;
+  // Exact counts (sorting; the three sorts are independent).
+  ExactDup ex_pair, ex_r1, ex_r2;
+  {
+    std::thread ta([&] { ex_r1 = exact_duplication(m1.key_fp); });
+    std::thread tb([&] { ex_r2 = exact_duplication(m2.key_fp); });
+    ex_pair = exact_duplication(pair_fp);
+    ta.join();
+    tb.join();
   }
-
-  const DupResult pe = summarize_dup(pair_ctr);
-  const DupResult n1 = summarize_dup(r1_ctr);
-  const DupResult n2 = summarize_dup(r2_ctr);
 
   std::ofstream os(out_file, std::ofstream::binary);
   if (!os.good())
@@ -526,44 +770,36 @@ run_paired_duplication(const std::string &r1_file, const std::string &r2_file,
   os << "Total read pairs\t" << num_pairs << "\n";
   os << "Matching read pairs (R1/R2 identifiers agree)\t" << pstats.matching
      << "\n";
-
-  // Explicit PCR-duplicate rate (= 100 - deduplicated%); LOWER is better. The
-  // paired value is the correct one; the naive single-end values OVERESTIMATE
-  // duplication because they collapse fragments that share only one mate. (The
-  // FastQC-style "Total Deduplicated Percentage" below -- the fraction of reads
-  // that are UNIQUE, i.e. 100 - duplicate rate -- is reported for compatibility.)
-  os << "#PCR duplicate rate (%), lower is better:\n";
-  os << "Paired-end (correct)\t" << (100.0 - pe.total_deduplicated_pct) << "\n";
-  os << "Naive Read1-only (overestimate)\t"
-     << (100.0 - n1.total_deduplicated_pct) << "\n";
-  os << "Naive Read2-only (overestimate)\t"
-     << (100.0 - n2.total_deduplicated_pct) << "\n";
-
-  os << "#Paired-end (correct) Total Deduplicated Percentage\t"
-     << pe.total_deduplicated_pct << "\n";
+  os << "#Sequence duplicate rate (%): fraction of reads (pairs) that are "
+        "additional copies of an earlier identical sequence. Sequences are "
+        "keyed as in FastQC (reads longer than 75 bp on their first 50 bp). "
+        "A pair is a copy only when BOTH mates match. Counted exactly over all "
+        "reads; independent of read order. Reflects PCR duplication AND "
+        "natural sequence redundancy (coverage depth, highly expressed or "
+        "enriched loci).\n";
+  os << "Paired-end exact\t" << ex_pair.duplicate_rate() << "\n";
+  os << "Read1-only exact\t" << ex_r1.duplicate_rate() << "\n";
+  os << "Read2-only exact\t" << ex_r2.duplicate_rate() << "\n";
+  os << "#FastQC-style estimates (%): the FastQC/falco duplication estimator "
+        "(tracks the first 100,000 distinct sequences and extrapolates), "
+        "applied to the same keys. Comparable to FastQC/falco output; depends "
+        "on read order.\n";
+  os << "Paired-end FastQC-style\t" << fq_pair << "\n";
+  os << "Read1-only FastQC-style\t" << fq_r1 << "\n";
+  os << "Read2-only FastQC-style\t" << fq_r2 << "\n";
+  os << "#Paired-end exact duplication levels\n";
   os << "#Duplication Level\tPercentage of deduplicated\t"
      << "Percentage of total\n";
   static const char *labels[16] = {"1",   "2",   "3",    "4",   "5",  "6",
-                                    "7",   "8",   "9",    ">10", ">50", ">100",
-                                    ">500", ">1k", ">5k", ">10k+"};
+                                   "7",   "8",   "9",    ">10", ">50", ">100",
+                                   ">500", ">1k", ">5k", ">10k+"};
   for (std::size_t i = 0; i < 16; ++i)
-    os << labels[i] << "\t" << pe.percentage_deduplicated[i] << "\t"
-       << pe.percentage_total[i] << "\n";
-
-  // Note: this paired pass always scans every pair, so these naive figures use
-  // read_step == 1 even if --subsample was set for the single-end run; they are
-  // a like-for-like comparison against the paired estimate above.
-  os << "#Naive single-end estimates (overcount PCR duplication):\n";
-  os << "Read1-only Total Deduplicated Percentage\t" << n1.total_deduplicated_pct
-     << "\n";
-  os << "Read2-only Total Deduplicated Percentage\t" << n2.total_deduplicated_pct
-     << "\n";
+    os << labels[i] << "\t" << ex_pair.dedup_bins[i] << "\t"
+       << ex_pair.total_bins[i] << "\n";
 
   if (!quiet)
     std::cerr << "[paired-end duplication] wrote " << out_file << " ("
               << num_pairs << " pairs, " << pstats.matching << " matching)\n";
-
-  pstats.pairs = num_pairs;
   return pstats;
 }
 
@@ -1158,11 +1394,20 @@ main(int argc, char *argv[]) {
       "-paired-with", '\0',
       "[FalcoAmadeus] Path to the mate (R2) FASTQ/FASTQ.gz file. The primary "
       "positional input is treated as R1 and analysed single-end exactly as "
-      "usual; ADDITIONALLY a lockstep pass over R1+R2 writes a corrected "
-      "paired-end PCR-duplication report to <outdir>/<prefix>paired_duplication"
-      ".txt. A pair is a duplicate only if BOTH mates match, avoiding the "
-      "overcounting of naive single-end dedup. SAM/BAM not supported.",
+      "usual; ADDITIONALLY a pass over R1+R2 checks that the mates are in "
+      "matching order (same read identifiers; mismatches are rejected) and "
+      "writes <outdir>/paired_duplication.txt with the sequence duplicate rate "
+      "counted exactly over all reads, where a pair is a copy only if BOTH "
+      "mates match, next to the per-mate rates and the FastQC-style estimates. "
+      "SAM/BAM not supported.",
       false, paired_with_file);
+
+    opt_parse.add_opt(
+      "-allow-unmatched-pairs", '\0',
+      "[FalcoAmadeus] With --paired-with, proceed even when R1/R2 read "
+      "identifiers disagree. By default such inputs are rejected, because "
+      "mates that are out of order make every paired statistic meaningless.",
+      false, falco_config.allow_unmatched_pairs);
 
     std::vector<std::string> leftover_args;
     opt_parse.parse(argc, argv, leftover_args);
@@ -1359,6 +1604,17 @@ main(int argc, char *argv[]) {
         const std::string fwd_dir = cur_outdir + "/" + fwd_stem;
         const std::string rev_dir = cur_outdir + "/" + rev_stem;
 
+        // [FalcoAmadeus] Pairing + duplication pass FIRST: it validates that
+        // the mates are in matching order (failing fast before any per-mate
+        // work), and the combined view reports its pair counts.
+        const std::string paired_out = cur_outdir + "/paired_duplication.txt";
+        if (!falco_config.quiet)
+          log_process("Running paired-end pairing/duplication pass with " +
+                      paired_with_file);
+        const PairStats ps = run_paired_duplication(
+          filename, paired_with_file, paired_out,
+          falco_config.allow_unmatched_pairs, falco_config.quiet);
+
         std::error_code ec;
         std::filesystem::create_directories(fwd_dir, ec);
         if (ec)
@@ -1380,6 +1636,7 @@ main(int argc, char *argv[]) {
         const bool want_comb_data = (falco_config.paired_data != "mates");
         const bool mate_skip_text = skip_text || !want_mate_data;
 
+
         analyze_and_write(falco_config, filename, forced_file_format, fwd_dir,
                           std::string{}, std::string{}, std::string{},
                           std::string{}, mate_skip_text, skip_html,
@@ -1390,15 +1647,6 @@ main(int argc, char *argv[]) {
                           std::string{}, mate_skip_text, skip_html,
                           mate_skip_text, do_call, true, " (reverse)",
                           r1_base);
-
-        // [FalcoAmadeus] Pairing + duplication pass FIRST, so the combined view
-        // can report the true read-PAIR count and how many R1/R2 reads match.
-        const std::string paired_out = cur_outdir + "/paired_duplication.txt";
-        if (!falco_config.quiet)
-          log_process("Running paired-end pairing/duplication pass with " +
-                      paired_with_file);
-        const PairStats ps = run_paired_duplication(
-          filename, paired_with_file, paired_out, falco_config.quiet);
 
         // [FalcoAmadeus] Merge the mate reports into ONE combined HTML with
         // three tabs: Combined (R1+R2 pooled, the default), Forward, Reverse.

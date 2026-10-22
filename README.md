@@ -21,16 +21,21 @@ original.
 
 ## What FalcoAmadeus does differently
 
-- **Correct paired-end analysis** (`--paired-with R2`). FastQC and falco only
-  process one file at a time, so paired-end PCR-duplicate rates are
-  overestimated. FalcoAmadeus analyses the pair together and writes **one
-  combined HTML report** with **Combined / Forward / Reverse** tabs, where
-  *Combined* pools R1+R2 as a single dataset (GC, adapters, content, quality
-  measured over all reads at once, not two independent files). It reports the
-  **corrected paired PCR-duplicate rate** — a pair counts as a duplicate only
-  when *both* mates are duplicates — and how many R1/R2 reads **actually match**
-  into pairs (by read identifier). Per-mate `fastqc_data.txt` files are kept for
-  MultiQC, alongside a `paired_duplication.txt` summary.
+- **Paired-end analysis** (`--paired-with R2`). FastQC and falco process one
+  file at a time, so sequence duplication is assessed per mate: two fragments
+  that share only one end count as duplicates. FalcoAmadeus analyses the pair
+  together and writes **one combined HTML report** with **Combined / Forward /
+  Reverse** tabs, where *Combined* pools R1+R2 as a single dataset (GC,
+  adapters, content, quality measured over all reads at once). It first checks
+  that the mates are in matching order (identical read identifiers) and
+  rejects inputs where they are not (`--allow-unmatched-pairs` overrides).
+  `paired_duplication.txt` reports the **paired sequence duplicate rate**,
+  where a pair is a copy only when *both* mates match, counted exactly over
+  all reads and therefore independent of read order, next to the per-mate
+  rates and the FastQC-style estimates for comparison with FastQC/falco.
+  Sequence duplication reflects PCR duplicates as well as natural redundancy
+  (deep coverage, highly expressed or enriched loci). Per-mate
+  `fastqc_data.txt` files are kept for MultiQC.
 
 - **Assay-aware QC** (`--assay <type>`). Tunes each module's pass/warn/fail
   expectations to the library type (`rnaseq`, `amplicon`, `wgbs` bisulfite/EM,
@@ -276,7 +281,8 @@ FalcoAmadeus-specific options:
 
 | Option | Description |
 | --- | --- |
-| `--paired-with R2` | Analyse the R2 mate together with the R1 positional input; write one combined report and `paired_duplication.txt`. |
+| `--paired-with R2` | Analyse the R2 mate together with the R1 positional input; write one combined report and `paired_duplication.txt`. Rejects mates whose read identifiers disagree. |
+| `--allow-unmatched-pairs` | With `--paired-with`, proceed even when R1/R2 read identifiers disagree. |
 | `--paired-data mates\|combined\|both` | With `--paired-with`, which `fastqc_data.txt` files to emit for MultiQC: separate mates (default), a single pooled sample, or both. |
 | `--assay TYPE` | Assay-aware pass/warn/fail grading (`rnaseq`, `amplicon`, `wgbs`/`emseq`/`rrbs`, `chipseq`, `atac`, `smallrna`, `wgs`, …; default `generic` is byte-identical to falco). |
 | `--conversion-residual F` | For bisulfite assays, the residual unmethylated-base fraction (0–1) above which a possible incomplete-conversion warning is emitted. |

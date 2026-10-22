@@ -83,8 +83,8 @@ HtmlMaker::put_file_details(const FalcoConfig &falco_config) {
       "<p class=\"module-desc\"><b>Paired-end run.</b> The mate of this file is "
       "<b>" + falco_config.paired_mate +
       "</b>. The level shown here is computed per mate (single-end). The "
-      "corrected paired PCR-duplicate rate, where a read pair counts as a "
-      "duplicate only when both mates are duplicates, is written to "
+      "paired sequence duplicate rate, where a read pair counts as a "
+      "copy only when both mates match, is written to "
       "<code>paired_duplication.txt</code> in the parent directory.</p>";
   }
   std::regex paired_re(left_tag + "pairednote"s + right_tag);

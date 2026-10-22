@@ -186,6 +186,10 @@ struct FalcoConfig {
   // writes: "mates" = per-mate forward+reverse fastqc_data.txt (default),
   // "combined" = a single pooled R1+R2 fastqc_data.txt only, "both" = all.
   std::string paired_data = "mates";
+  // [FalcoAmadeus] --paired-with refuses to run when R1/R2 read identifiers
+  // disagree (mates out of order or files from different runs), since every
+  // paired statistic would be meaningless. This overrides that check.
+  bool allow_unmatched_pairs = false;
 
   /*********** FUNCTIONS TO READ FILES *************/
   void define_file_format();
