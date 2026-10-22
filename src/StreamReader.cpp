@@ -3163,11 +3163,17 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
   };
   bool count_dup = false;
 
-  // produce the first chunk up front (nothing to overlap it with)
+  // produce the first chunk up front (nothing to overlap it with; a
+  // multi-item source still produces it in parallel)
   {
     const std::size_t n = src.plan(CHUNK);
+    char *const dst0 = bufs[0].data() + FRONT;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic) num_threads(nthreads) \
+  if (nthreads > 1 && n > 1)
+#endif
     for (std::size_t i = 0; i < n; ++i)
-      src.run(i, bufs[0].data() + FRONT);
+      src.run(i, dst0);
   }
 
 #ifdef _OPENMP
@@ -5025,29 +5031,35 @@ class BgzfParallelSource {
     eof_ = (last == nb);
     if (b1_ == b0_)
       return 0;
-    // read the compressed bytes of the whole run once (sequential I/O)
+    // the compressed bytes of the run are read by the work items themselves,
+    // each its own group, so no thread reads the whole run serially
     const size_t c0 = ix_.coff[b0_];
     const size_t clen = ix_.coff[b1_ - 1] + ix_.clen[b1_ - 1] - c0;
     if (cbuf_.size() < clen)
       cbuf_.resize(clen);
-    size_t done = 0;
-    while (done < clen) {
-      const ssize_t n = pread(ix_.fd, cbuf_.data() + done, clen - done,
-                              static_cast<off_t>(c0 + done));
-      if (n <= 0)
-        throw std::runtime_error("read error in BGZF file");
-      done += static_cast<size_t>(n);
-    }
     return (b1_ - b0_ + GROUP - 1) / GROUP;
   }
 
-  // Inflate block group i of the planned run into dst (the chunk start).
-  // Errors are recorded and raised by the next produced() call, since an
-  // exception must not leave an OpenMP worksharing loop.
+  // Read and inflate block group i of the planned run into dst (the chunk
+  // start). Errors are recorded and raised by the next produced() call, since
+  // an exception must not leave an OpenMP worksharing loop.
   void run(size_t i, char *dst) {
     const size_t g0 = b0_ + i * GROUP;
     const size_t g1 = std::min(b1_, g0 + GROUP);
     const size_t c0 = ix_.coff[b0_], u0 = ix_.uoff[b0_];
+    {
+      const size_t ca = ix_.coff[g0], cb = ix_.coff[g1 - 1] + ix_.clen[g1 - 1];
+      size_t done = ca;
+      while (done < cb) {
+        const ssize_t n = pread(ix_.fd, cbuf_.data() + (done - c0), cb - done,
+                                static_cast<off_t>(done));
+        if (n <= 0) {
+          failed_.store(true, std::memory_order_relaxed);
+          return;
+        }
+        done += static_cast<size_t>(n);
+      }
+    }
     thread_local libdeflate_decompressor *d = nullptr;
     if (d == nullptr)
       d = libdeflate_alloc_decompressor();
@@ -5065,7 +5077,7 @@ class BgzfParallelSource {
 
   size_t produced() const {
     if (failed_.load(std::memory_order_relaxed))
-      throw std::runtime_error("BGZF block failed to decompress");
+      throw std::runtime_error("BGZF block failed to read or decompress");
     return produced_;
   }
   bool at_eof() const { return eof_; }
