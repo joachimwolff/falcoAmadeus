@@ -2457,7 +2457,10 @@ read_bytesplit_core(FalcoConfig &config, FastqStats &master,
     std::vector<std::size_t> &d = deltas[t];
     if (count_dup)
       d.assign(nent, 0);
-    std::vector<std::pair<std::uint32_t, std::uint32_t>> &tr = tilerecs[t];
+    // appended on this thread's stack, moved back below: the per-thread
+    // vectors are adjacent objects (see LocalGCBuf)
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> tr;
+    tr.swap(tilerecs[t]);
     if (!tile_ignore)
       tr.reserve(n);
     const std::size_t g0 = gstart[t];
@@ -2503,6 +2506,7 @@ read_bytesplit_core(FalcoConfig &config, FastqStats &master,
       if (it != master.sequence_count.end())
         ++d[static_cast<std::size_t>(it - mbegin)];
     }
+    tilerecs[t].swap(tr);
   }
 
   // Phase 2 is done, so the input bytes (mmap / decompressed buffer) are no
@@ -5758,7 +5762,10 @@ read_bam_chunked(FalcoConfig &config, FastqStats &master,
       const std::size_t n = counts[t], g0 = gstart[t];
       gcrec[t].assign(n, GCRecord{0, 0, 0});
       if (count_dup) deltas[t].assign(nent, 0);
-      tilerecs[t].reserve(n);
+      // appended on this thread's stack, then moved back: the per-thread
+      // vectors are adjacent objects (see LocalGCBuf)
+      std::vector<std::pair<std::uint32_t, std::uint32_t>> trec;
+      trec.reserve(n);
       std::size_t q = choff[t], jdrop = choff[t];
       for (std::size_t j = 0; j < n; ++j) {
         const std::size_t bsz = rd_bsz(q);
@@ -5772,11 +5779,12 @@ read_bam_chunked(FalcoConfig &config, FastqStats &master,
           if (it != master.sequence_count.end())
             ++deltas[t][static_cast<std::size_t>(it - mbegin)];
         }
-        tilerecs[t].push_back({static_cast<std::uint32_t>(seqlen),
-                               static_cast<std::uint32_t>(tile_cur)});
+        trec.push_back({static_cast<std::uint32_t>(seqlen),
+                        static_cast<std::uint32_t>(tile_cur)});
         q += 4 + bsz;
         if (q - jdrop >= (std::size_t(512) << 10)) { bdrop(jdrop, q); jdrop = q; }
       }
+      tilerecs[t].swap(trec);
     }
     (void)nent; (void)mbegin;
     merge_worker_stats(config, master, nthreads, total, wstats, gcrec, deltas,
