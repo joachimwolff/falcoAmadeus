@@ -1,7 +1,7 @@
 name: falco1 parity
 
 # Verify the project's core claim on every push and pull request: default
-# single-end output is byte-identical to upstream falco 1.3.1, modulo two
+# single-end output is byte-identical to upstream falco 1.3.2, modulo two
 # documented differences:
 #   1. line 1 of fastqc_data.txt names the tool and version;
 #   2. the Overrepresented Sequences section lists count-TIED entries in a
@@ -20,7 +20,7 @@ on:
 
 jobs:
   parity:
-    name: Output parity with upstream falco 1.3.1
+    name: Output parity with upstream falco 1.3.2
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -37,14 +37,14 @@ jobs:
           ./configure
           make -j"$(nproc)"
 
-      - name: Build upstream falco 1.3.1
+      - name: Build upstream falco 1.3.2
         run: |
-          curl -sL -o falco-1.3.1.tar.gz \
-            https://github.com/smithlabcode/falco/releases/download/v1.3.1/falco-1.3.1.tar.gz
-          echo "2086bc269b404817709751bbcc5ccbcc32ba8a0147202b653fca7cff54f86536  falco-1.3.1.tar.gz" \
+          curl -sL -o falco-1.3.2.tar.gz \
+            https://github.com/smithlabcode/falco/releases/download/v1.3.2/falco-1.3.2.tar.gz
+          echo "d8dbc7d98d1aafdbf8199f8df3d7f76503a4f6a8924a151c953eb23dd47d44a0  falco-1.3.2.tar.gz" \
             | sha256sum -c -
-          tar xzf falco-1.3.1.tar.gz
-          cd falco-1.3.1 && ./configure && make -j"$(nproc)"
+          tar xzf falco-1.3.2.tar.gz
+          cd falco-1.3.2 && ./configure && make -j"$(nproc)"
 
       - name: Compare outputs on the bundled test data
         run: |
@@ -88,7 +88,7 @@ jobs:
               esac
               rm -rf parity/out_f1 parity/out_fa
               mkdir -p parity/out_f1 parity/out_fa
-              ./falco-1.3.1/falco $CONF -o parity/out_f1 "$inp" > /dev/null 2>&1
+              ./falco-1.3.2/falco $CONF -o parity/out_f1 "$inp" > /dev/null 2>&1
               ./falcoAmadeus  $CONF $fa_args -o parity/out_fa "$inp" > /dev/null 2>&1
               if ! diff <(python3 parity/canon.py parity/out_f1/fastqc_data.txt) \
                         <(python3 parity/canon.py parity/out_fa/fastqc_data.txt) > /dev/null \
