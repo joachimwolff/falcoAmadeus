@@ -23,6 +23,7 @@
 
 #include "dup_hash_map.hpp"
 #include <array>
+#include <mutex>
 #include <cstdint>
 #include "FalcoConfig.hpp"
 // log of a power of two, to use in bit shifting for fast index acces
@@ -176,8 +177,25 @@ struct FastqStats {
   size_t num_extra_bases;  // number of bases outside of buffer
   size_t total_gc; // sum of all G+C bases in all reads
 
-  // Pre-calculated GC model increments
-  static const std::array<GCModel, SHORT_READ_THRESHOLD> gc_models;
+  // Pre-calculated GC model increments, built per read length on first use.
+  // Building all 500 lengths up front (~125k small vectors) cost ~9 ms at
+  // every program start while a file typically has one or a few lengths.
+  // Each length is built exactly once (call_once), so concurrent readers
+  // are safe and later lookups cost one atomic load.
+  class GCModelTable {
+   public:
+    const GCModel &operator[](size_t len) const {
+      std::call_once(flags_[len], [this, len] {
+        models_[len] = GCModel(static_cast<int>(len));
+      });
+      return models_[len];
+    }
+
+   private:
+    mutable std::array<std::once_flag, SHORT_READ_THRESHOLD> flags_;
+    mutable std::array<GCModel, SHORT_READ_THRESHOLD> models_;
+  };
+  static const GCModelTable gc_models;
 
   /*********************************************************
    *********** METRICS COLLECTED DURING IO *****************

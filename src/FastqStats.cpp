@@ -36,16 +36,6 @@ const size_t FastqStats::kBitShiftAdapter;
 const std::uint32_t FastqStats::kQualTileFlushReads;
 const std::uint32_t FastqStats::kBaseTileFlushReads;
 
-// To make the gc models static const
-static std::array<GCModel, FastqStats::SHORT_READ_THRESHOLD>
-make_gc_models() {
-  std::array<GCModel, FastqStats::SHORT_READ_THRESHOLD> ans;
-  for (size_t i = 0; i < FastqStats::SHORT_READ_THRESHOLD; ++i) {
-    ans[i] = GCModel(i);
-  }
-  return ans;
-}
-
 /****************************************************************/
 /******************** FASTQ STATS FUNCTIONS *********************/
 /****************************************************************/
@@ -128,9 +118,8 @@ FastqStats::FastqStats(bool need_kmer) {
       std::vector<size_t>(SHORT_READ_THRESHOLD * (Constants::kmer_mask + 1), 0);
 }
 
-// Initialize as many gc models as fast bases
-const std::array<GCModel, FastqStats::SHORT_READ_THRESHOLD>
-  FastqStats::gc_models = make_gc_models();
+// GC models are built lazily per read length (see FastqStats.hpp).
+const FastqStats::GCModelTable FastqStats::gc_models;
 
 // When we read new bases, dynamically allocate new space for their statistics
 void
