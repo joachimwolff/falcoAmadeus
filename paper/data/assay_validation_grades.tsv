@@ -1552,7 +1552,7 @@ wgbs	SRR9854758	clean	generic	Adapter Content	PASS
 wgbs	SRR9854758	clean	wgbs	Basic Statistics	PASS
 wgbs	SRR9854758	clean	wgbs	Per base sequence quality	PASS
 wgbs	SRR9854758	clean	wgbs	Per sequence quality scores	PASS
-wgbs	SRR9854758	clean	wgbs	Per base sequence content	WARN
+wgbs	SRR9854758	clean	wgbs	Per base sequence content	FAIL
 wgbs	SRR9854758	clean	wgbs	Per sequence GC content	PASS
 wgbs	SRR9854758	clean	wgbs	Per base N content	PASS
 wgbs	SRR9854758	clean	wgbs	Sequence Length Distribution	PASS
@@ -1592,7 +1592,7 @@ wgbs	SRR9854758	qualtail	generic	Adapter Content	PASS
 wgbs	SRR9854758	qualtail	wgbs	Basic Statistics	PASS
 wgbs	SRR9854758	qualtail	wgbs	Per base sequence quality	FAIL
 wgbs	SRR9854758	qualtail	wgbs	Per sequence quality scores	PASS
-wgbs	SRR9854758	qualtail	wgbs	Per base sequence content	WARN
+wgbs	SRR9854758	qualtail	wgbs	Per base sequence content	FAIL
 wgbs	SRR9854758	qualtail	wgbs	Per sequence GC content	PASS
 wgbs	SRR9854758	qualtail	wgbs	Per base N content	PASS
 wgbs	SRR9854758	qualtail	wgbs	Sequence Length Distribution	PASS
@@ -1612,7 +1612,7 @@ wgbs	SRR9854758	midbias	generic	Adapter Content	PASS
 wgbs	SRR9854758	midbias	wgbs	Basic Statistics	PASS
 wgbs	SRR9854758	midbias	wgbs	Per base sequence quality	PASS
 wgbs	SRR9854758	midbias	wgbs	Per sequence quality scores	PASS
-wgbs	SRR9854758	midbias	wgbs	Per base sequence content	WARN
+wgbs	SRR9854758	midbias	wgbs	Per base sequence content	FAIL
 wgbs	SRR9854758	midbias	wgbs	Per sequence GC content	PASS
 wgbs	SRR9854758	midbias	wgbs	Per base N content	PASS
 wgbs	SRR9854758	midbias	wgbs	Sequence Length Distribution	PASS
@@ -1672,7 +1672,7 @@ wgbs	SRR9854758	ncontent	generic	Adapter Content	PASS
 wgbs	SRR9854758	ncontent	wgbs	Basic Statistics	PASS
 wgbs	SRR9854758	ncontent	wgbs	Per base sequence quality	PASS
 wgbs	SRR9854758	ncontent	wgbs	Per sequence quality scores	PASS
-wgbs	SRR9854758	ncontent	wgbs	Per base sequence content	WARN
+wgbs	SRR9854758	ncontent	wgbs	Per base sequence content	FAIL
 wgbs	SRR9854758	ncontent	wgbs	Per sequence GC content	PASS
 wgbs	SRR9854758	ncontent	wgbs	Per base N content	FAIL
 wgbs	SRR9854758	ncontent	wgbs	Sequence Length Distribution	PASS
@@ -1804,7 +1804,7 @@ wgbs	SRR34103767	dupspike	wgbs	Basic Statistics	PASS
 wgbs	SRR34103767	dupspike	wgbs	Per base sequence quality	PASS
 wgbs	SRR34103767	dupspike	wgbs	Per tile sequence quality	PASS
 wgbs	SRR34103767	dupspike	wgbs	Per sequence quality scores	PASS
-wgbs	SRR34103767	dupspike	wgbs	Per base sequence content	FAIL
+wgbs	SRR34103767	dupspike	wgbs	Per base sequence content	WARN
 wgbs	SRR34103767	dupspike	wgbs	Per sequence GC content	WARN
 wgbs	SRR34103767	dupspike	wgbs	Per base N content	PASS
 wgbs	SRR34103767	dupspike	wgbs	Sequence Length Distribution	WARN
@@ -1826,7 +1826,7 @@ wgbs	SRR34103767	ncontent	wgbs	Basic Statistics	PASS
 wgbs	SRR34103767	ncontent	wgbs	Per base sequence quality	PASS
 wgbs	SRR34103767	ncontent	wgbs	Per tile sequence quality	PASS
 wgbs	SRR34103767	ncontent	wgbs	Per sequence quality scores	PASS
-wgbs	SRR34103767	ncontent	wgbs	Per base sequence content	PASS
+wgbs	SRR34103767	ncontent	wgbs	Per base sequence content	FAIL
 wgbs	SRR34103767	ncontent	wgbs	Per sequence GC content	WARN
 wgbs	SRR34103767	ncontent	wgbs	Per base N content	FAIL
 wgbs	SRR34103767	ncontent	wgbs	Sequence Length Distribution	WARN
@@ -1848,7 +1848,7 @@ wgbs	SRR20318450	clean	wgbs	Basic Statistics	PASS
 wgbs	SRR20318450	clean	wgbs	Per base sequence quality	PASS
 wgbs	SRR20318450	clean	wgbs	Per tile sequence quality	PASS
 wgbs	SRR20318450	clean	wgbs	Per sequence quality scores	PASS
-wgbs	SRR20318450	clean	wgbs	Per base sequence content	WARN
+wgbs	SRR20318450	clean	wgbs	Per base sequence content	PASS
 wgbs	SRR20318450	clean	wgbs	Per sequence GC content	WARN
 wgbs	SRR20318450	clean	wgbs	Per base N content	PASS
 wgbs	SRR20318450	clean	wgbs	Sequence Length Distribution	PASS
@@ -1892,7 +1892,7 @@ wgbs	SRR20318450	qualtail	wgbs	Basic Statistics	PASS
 wgbs	SRR20318450	qualtail	wgbs	Per base sequence quality	FAIL
 wgbs	SRR20318450	qualtail	wgbs	Per tile sequence quality	PASS
 wgbs	SRR20318450	qualtail	wgbs	Per sequence quality scores	PASS
-wgbs	SRR20318450	qualtail	wgbs	Per base sequence content	WARN
+wgbs	SRR20318450	qualtail	wgbs	Per base sequence content	PASS
 wgbs	SRR20318450	qualtail	wgbs	Per sequence GC content	WARN
 wgbs	SRR20318450	qualtail	wgbs	Per base N content	PASS
 wgbs	SRR20318450	qualtail	wgbs	Sequence Length Distribution	PASS
@@ -1958,7 +1958,7 @@ wgbs	SRR20318450	dupspike	wgbs	Basic Statistics	PASS
 wgbs	SRR20318450	dupspike	wgbs	Per base sequence quality	PASS
 wgbs	SRR20318450	dupspike	wgbs	Per tile sequence quality	PASS
 wgbs	SRR20318450	dupspike	wgbs	Per sequence quality scores	PASS
-wgbs	SRR20318450	dupspike	wgbs	Per base sequence content	FAIL
+wgbs	SRR20318450	dupspike	wgbs	Per base sequence content	WARN
 wgbs	SRR20318450	dupspike	wgbs	Per sequence GC content	WARN
 wgbs	SRR20318450	dupspike	wgbs	Per base N content	PASS
 wgbs	SRR20318450	dupspike	wgbs	Sequence Length Distribution	PASS
@@ -2112,7 +2112,7 @@ emseq	SRR34743778	dupspike	emseq	Basic Statistics	PASS
 emseq	SRR34743778	dupspike	emseq	Per base sequence quality	FAIL
 emseq	SRR34743778	dupspike	emseq	Per tile sequence quality	PASS
 emseq	SRR34743778	dupspike	emseq	Per sequence quality scores	PASS
-emseq	SRR34743778	dupspike	emseq	Per base sequence content	FAIL
+emseq	SRR34743778	dupspike	emseq	Per base sequence content	WARN
 emseq	SRR34743778	dupspike	emseq	Per sequence GC content	WARN
 emseq	SRR34743778	dupspike	emseq	Per base N content	FAIL
 emseq	SRR34743778	dupspike	emseq	Sequence Length Distribution	PASS
@@ -2156,7 +2156,7 @@ emseq	SRR37887786	clean	emseq	Basic Statistics	PASS
 emseq	SRR37887786	clean	emseq	Per base sequence quality	PASS
 emseq	SRR37887786	clean	emseq	Per tile sequence quality	PASS
 emseq	SRR37887786	clean	emseq	Per sequence quality scores	PASS
-emseq	SRR37887786	clean	emseq	Per base sequence content	FAIL
+emseq	SRR37887786	clean	emseq	Per base sequence content	PASS
 emseq	SRR37887786	clean	emseq	Per sequence GC content	WARN
 emseq	SRR37887786	clean	emseq	Per base N content	PASS
 emseq	SRR37887786	clean	emseq	Sequence Length Distribution	PASS
@@ -2200,7 +2200,7 @@ emseq	SRR37887786	qualtail	emseq	Basic Statistics	PASS
 emseq	SRR37887786	qualtail	emseq	Per base sequence quality	FAIL
 emseq	SRR37887786	qualtail	emseq	Per tile sequence quality	PASS
 emseq	SRR37887786	qualtail	emseq	Per sequence quality scores	PASS
-emseq	SRR37887786	qualtail	emseq	Per base sequence content	FAIL
+emseq	SRR37887786	qualtail	emseq	Per base sequence content	PASS
 emseq	SRR37887786	qualtail	emseq	Per sequence GC content	WARN
 emseq	SRR37887786	qualtail	emseq	Per base N content	PASS
 emseq	SRR37887786	qualtail	emseq	Sequence Length Distribution	PASS
@@ -2244,7 +2244,7 @@ emseq	SRR37887786	gccontam	emseq	Basic Statistics	PASS
 emseq	SRR37887786	gccontam	emseq	Per base sequence quality	PASS
 emseq	SRR37887786	gccontam	emseq	Per tile sequence quality	PASS
 emseq	SRR37887786	gccontam	emseq	Per sequence quality scores	PASS
-emseq	SRR37887786	gccontam	emseq	Per base sequence content	FAIL
+emseq	SRR37887786	gccontam	emseq	Per base sequence content	WARN
 emseq	SRR37887786	gccontam	emseq	Per sequence GC content	WARN
 emseq	SRR37887786	gccontam	emseq	Per base N content	PASS
 emseq	SRR37887786	gccontam	emseq	Sequence Length Distribution	PASS
@@ -2266,7 +2266,7 @@ emseq	SRR37887786	dupspike	emseq	Basic Statistics	PASS
 emseq	SRR37887786	dupspike	emseq	Per base sequence quality	PASS
 emseq	SRR37887786	dupspike	emseq	Per tile sequence quality	PASS
 emseq	SRR37887786	dupspike	emseq	Per sequence quality scores	PASS
-emseq	SRR37887786	dupspike	emseq	Per base sequence content	FAIL
+emseq	SRR37887786	dupspike	emseq	Per base sequence content	WARN
 emseq	SRR37887786	dupspike	emseq	Per sequence GC content	WARN
 emseq	SRR37887786	dupspike	emseq	Per base N content	PASS
 emseq	SRR37887786	dupspike	emseq	Sequence Length Distribution	PASS
@@ -2308,7 +2308,7 @@ emseq	SRR23020114	clean	generic	Adapter Content	PASS
 emseq	SRR23020114	clean	emseq	Basic Statistics	PASS
 emseq	SRR23020114	clean	emseq	Per base sequence quality	PASS
 emseq	SRR23020114	clean	emseq	Per sequence quality scores	PASS
-emseq	SRR23020114	clean	emseq	Per base sequence content	WARN
+emseq	SRR23020114	clean	emseq	Per base sequence content	PASS
 emseq	SRR23020114	clean	emseq	Per sequence GC content	WARN
 emseq	SRR23020114	clean	emseq	Per base N content	PASS
 emseq	SRR23020114	clean	emseq	Sequence Length Distribution	PASS
@@ -2348,7 +2348,7 @@ emseq	SRR23020114	qualtail	generic	Adapter Content	PASS
 emseq	SRR23020114	qualtail	emseq	Basic Statistics	PASS
 emseq	SRR23020114	qualtail	emseq	Per base sequence quality	FAIL
 emseq	SRR23020114	qualtail	emseq	Per sequence quality scores	PASS
-emseq	SRR23020114	qualtail	emseq	Per base sequence content	WARN
+emseq	SRR23020114	qualtail	emseq	Per base sequence content	PASS
 emseq	SRR23020114	qualtail	emseq	Per sequence GC content	WARN
 emseq	SRR23020114	qualtail	emseq	Per base N content	PASS
 emseq	SRR23020114	qualtail	emseq	Sequence Length Distribution	PASS
@@ -2408,7 +2408,7 @@ emseq	SRR23020114	dupspike	generic	Adapter Content	WARN
 emseq	SRR23020114	dupspike	emseq	Basic Statistics	PASS
 emseq	SRR23020114	dupspike	emseq	Per base sequence quality	FAIL
 emseq	SRR23020114	dupspike	emseq	Per sequence quality scores	PASS
-emseq	SRR23020114	dupspike	emseq	Per base sequence content	FAIL
+emseq	SRR23020114	dupspike	emseq	Per base sequence content	WARN
 emseq	SRR23020114	dupspike	emseq	Per sequence GC content	WARN
 emseq	SRR23020114	dupspike	emseq	Per base N content	FAIL
 emseq	SRR23020114	dupspike	emseq	Sequence Length Distribution	PASS
@@ -2428,7 +2428,7 @@ emseq	SRR23020114	ncontent	generic	Adapter Content	PASS
 emseq	SRR23020114	ncontent	emseq	Basic Statistics	PASS
 emseq	SRR23020114	ncontent	emseq	Per base sequence quality	PASS
 emseq	SRR23020114	ncontent	emseq	Per sequence quality scores	PASS
-emseq	SRR23020114	ncontent	emseq	Per base sequence content	WARN
+emseq	SRR23020114	ncontent	emseq	Per base sequence content	FAIL
 emseq	SRR23020114	ncontent	emseq	Per sequence GC content	WARN
 emseq	SRR23020114	ncontent	emseq	Per base N content	FAIL
 emseq	SRR23020114	ncontent	emseq	Sequence Length Distribution	PASS
@@ -2538,7 +2538,7 @@ rrbs	SRR35488094	gccontam	rrbs	Basic Statistics	PASS
 rrbs	SRR35488094	gccontam	rrbs	Per base sequence quality	PASS
 rrbs	SRR35488094	gccontam	rrbs	Per tile sequence quality	PASS
 rrbs	SRR35488094	gccontam	rrbs	Per sequence quality scores	PASS
-rrbs	SRR35488094	gccontam	rrbs	Per base sequence content	FAIL
+rrbs	SRR35488094	gccontam	rrbs	Per base sequence content	WARN
 rrbs	SRR35488094	gccontam	rrbs	Per sequence GC content	WARN
 rrbs	SRR35488094	gccontam	rrbs	Per base N content	PASS
 rrbs	SRR35488094	gccontam	rrbs	Sequence Length Distribution	PASS
@@ -2565,7 +2565,7 @@ rrbs	SRR35488094	dupspike	rrbs	Per sequence GC content	WARN
 rrbs	SRR35488094	dupspike	rrbs	Per base N content	WARN
 rrbs	SRR35488094	dupspike	rrbs	Sequence Length Distribution	PASS
 rrbs	SRR35488094	dupspike	rrbs	Sequence Duplication Levels	WARN
-rrbs	SRR35488094	dupspike	rrbs	Overrepresented sequences	FAIL
+rrbs	SRR35488094	dupspike	rrbs	Overrepresented sequences	WARN
 rrbs	SRR35488094	dupspike	rrbs	Adapter Content	FAIL
 rrbs	SRR35488094	ncontent	generic	Basic Statistics	PASS
 rrbs	SRR35488094	ncontent	generic	Per base sequence quality	PASS
@@ -2692,7 +2692,7 @@ rrbs	SRR35168607	gccontam	rrbs	Basic Statistics	PASS
 rrbs	SRR35168607	gccontam	rrbs	Per base sequence quality	PASS
 rrbs	SRR35168607	gccontam	rrbs	Per tile sequence quality	FAIL
 rrbs	SRR35168607	gccontam	rrbs	Per sequence quality scores	PASS
-rrbs	SRR35168607	gccontam	rrbs	Per base sequence content	FAIL
+rrbs	SRR35168607	gccontam	rrbs	Per base sequence content	WARN
 rrbs	SRR35168607	gccontam	rrbs	Per sequence GC content	WARN
 rrbs	SRR35168607	gccontam	rrbs	Per base N content	WARN
 rrbs	SRR35168607	gccontam	rrbs	Sequence Length Distribution	WARN
@@ -2719,7 +2719,7 @@ rrbs	SRR35168607	dupspike	rrbs	Per sequence GC content	WARN
 rrbs	SRR35168607	dupspike	rrbs	Per base N content	WARN
 rrbs	SRR35168607	dupspike	rrbs	Sequence Length Distribution	WARN
 rrbs	SRR35168607	dupspike	rrbs	Sequence Duplication Levels	WARN
-rrbs	SRR35168607	dupspike	rrbs	Overrepresented sequences	FAIL
+rrbs	SRR35168607	dupspike	rrbs	Overrepresented sequences	WARN
 rrbs	SRR35168607	dupspike	rrbs	Adapter Content	PASS
 rrbs	SRR35168607	ncontent	generic	Basic Statistics	PASS
 rrbs	SRR35168607	ncontent	generic	Per base sequence quality	PASS
@@ -2758,7 +2758,7 @@ rrbs	SRR35082581	clean	rrbs	Basic Statistics	PASS
 rrbs	SRR35082581	clean	rrbs	Per base sequence quality	PASS
 rrbs	SRR35082581	clean	rrbs	Per tile sequence quality	PASS
 rrbs	SRR35082581	clean	rrbs	Per sequence quality scores	PASS
-rrbs	SRR35082581	clean	rrbs	Per base sequence content	FAIL
+rrbs	SRR35082581	clean	rrbs	Per base sequence content	WARN
 rrbs	SRR35082581	clean	rrbs	Per sequence GC content	WARN
 rrbs	SRR35082581	clean	rrbs	Per base N content	PASS
 rrbs	SRR35082581	clean	rrbs	Sequence Length Distribution	PASS
@@ -2802,7 +2802,7 @@ rrbs	SRR35082581	qualtail	rrbs	Basic Statistics	PASS
 rrbs	SRR35082581	qualtail	rrbs	Per base sequence quality	FAIL
 rrbs	SRR35082581	qualtail	rrbs	Per tile sequence quality	PASS
 rrbs	SRR35082581	qualtail	rrbs	Per sequence quality scores	PASS
-rrbs	SRR35082581	qualtail	rrbs	Per base sequence content	FAIL
+rrbs	SRR35082581	qualtail	rrbs	Per base sequence content	WARN
 rrbs	SRR35082581	qualtail	rrbs	Per sequence GC content	WARN
 rrbs	SRR35082581	qualtail	rrbs	Per base N content	PASS
 rrbs	SRR35082581	qualtail	rrbs	Sequence Length Distribution	PASS
@@ -2846,7 +2846,7 @@ rrbs	SRR35082581	gccontam	rrbs	Basic Statistics	PASS
 rrbs	SRR35082581	gccontam	rrbs	Per base sequence quality	PASS
 rrbs	SRR35082581	gccontam	rrbs	Per tile sequence quality	PASS
 rrbs	SRR35082581	gccontam	rrbs	Per sequence quality scores	PASS
-rrbs	SRR35082581	gccontam	rrbs	Per base sequence content	FAIL
+rrbs	SRR35082581	gccontam	rrbs	Per base sequence content	WARN
 rrbs	SRR35082581	gccontam	rrbs	Per sequence GC content	WARN
 rrbs	SRR35082581	gccontam	rrbs	Per base N content	PASS
 rrbs	SRR35082581	gccontam	rrbs	Sequence Length Distribution	PASS
@@ -2873,7 +2873,7 @@ rrbs	SRR35082581	dupspike	rrbs	Per sequence GC content	WARN
 rrbs	SRR35082581	dupspike	rrbs	Per base N content	FAIL
 rrbs	SRR35082581	dupspike	rrbs	Sequence Length Distribution	PASS
 rrbs	SRR35082581	dupspike	rrbs	Sequence Duplication Levels	WARN
-rrbs	SRR35082581	dupspike	rrbs	Overrepresented sequences	FAIL
+rrbs	SRR35082581	dupspike	rrbs	Overrepresented sequences	WARN
 rrbs	SRR35082581	dupspike	rrbs	Adapter Content	FAIL
 rrbs	SRR35082581	ncontent	generic	Basic Statistics	PASS
 rrbs	SRR35082581	ncontent	generic	Per base sequence quality	PASS
@@ -6258,7 +6258,7 @@ wgbs	SRR35230503	clean	wgbs	Basic Statistics	PASS
 wgbs	SRR35230503	clean	wgbs	Per base sequence quality	PASS
 wgbs	SRR35230503	clean	wgbs	Per tile sequence quality	PASS
 wgbs	SRR35230503	clean	wgbs	Per sequence quality scores	PASS
-wgbs	SRR35230503	clean	wgbs	Per base sequence content	FAIL
+wgbs	SRR35230503	clean	wgbs	Per base sequence content	WARN
 wgbs	SRR35230503	clean	wgbs	Per sequence GC content	WARN
 wgbs	SRR35230503	clean	wgbs	Per base N content	PASS
 wgbs	SRR35230503	clean	wgbs	Sequence Length Distribution	PASS
@@ -6302,7 +6302,7 @@ wgbs	SRR35230503	qualtail	wgbs	Basic Statistics	PASS
 wgbs	SRR35230503	qualtail	wgbs	Per base sequence quality	FAIL
 wgbs	SRR35230503	qualtail	wgbs	Per tile sequence quality	PASS
 wgbs	SRR35230503	qualtail	wgbs	Per sequence quality scores	PASS
-wgbs	SRR35230503	qualtail	wgbs	Per base sequence content	FAIL
+wgbs	SRR35230503	qualtail	wgbs	Per base sequence content	WARN
 wgbs	SRR35230503	qualtail	wgbs	Per sequence GC content	WARN
 wgbs	SRR35230503	qualtail	wgbs	Per base N content	PASS
 wgbs	SRR35230503	qualtail	wgbs	Sequence Length Distribution	PASS
@@ -6412,7 +6412,7 @@ wgbs	SRR38846081	clean	wgbs	Basic Statistics	PASS
 wgbs	SRR38846081	clean	wgbs	Per base sequence quality	PASS
 wgbs	SRR38846081	clean	wgbs	Per tile sequence quality	PASS
 wgbs	SRR38846081	clean	wgbs	Per sequence quality scores	PASS
-wgbs	SRR38846081	clean	wgbs	Per base sequence content	WARN
+wgbs	SRR38846081	clean	wgbs	Per base sequence content	PASS
 wgbs	SRR38846081	clean	wgbs	Per sequence GC content	WARN
 wgbs	SRR38846081	clean	wgbs	Per base N content	PASS
 wgbs	SRR38846081	clean	wgbs	Sequence Length Distribution	PASS
@@ -6456,7 +6456,7 @@ wgbs	SRR38846081	qualtail	wgbs	Basic Statistics	PASS
 wgbs	SRR38846081	qualtail	wgbs	Per base sequence quality	FAIL
 wgbs	SRR38846081	qualtail	wgbs	Per tile sequence quality	PASS
 wgbs	SRR38846081	qualtail	wgbs	Per sequence quality scores	PASS
-wgbs	SRR38846081	qualtail	wgbs	Per base sequence content	WARN
+wgbs	SRR38846081	qualtail	wgbs	Per base sequence content	PASS
 wgbs	SRR38846081	qualtail	wgbs	Per sequence GC content	WARN
 wgbs	SRR38846081	qualtail	wgbs	Per base N content	PASS
 wgbs	SRR38846081	qualtail	wgbs	Sequence Length Distribution	PASS
@@ -6522,7 +6522,7 @@ wgbs	SRR38846081	dupspike	wgbs	Basic Statistics	PASS
 wgbs	SRR38846081	dupspike	wgbs	Per base sequence quality	PASS
 wgbs	SRR38846081	dupspike	wgbs	Per tile sequence quality	PASS
 wgbs	SRR38846081	dupspike	wgbs	Per sequence quality scores	PASS
-wgbs	SRR38846081	dupspike	wgbs	Per base sequence content	FAIL
+wgbs	SRR38846081	dupspike	wgbs	Per base sequence content	WARN
 wgbs	SRR38846081	dupspike	wgbs	Per sequence GC content	WARN
 wgbs	SRR38846081	dupspike	wgbs	Per base N content	WARN
 wgbs	SRR38846081	dupspike	wgbs	Sequence Length Distribution	PASS
@@ -6544,7 +6544,7 @@ wgbs	SRR38846081	ncontent	wgbs	Basic Statistics	PASS
 wgbs	SRR38846081	ncontent	wgbs	Per base sequence quality	PASS
 wgbs	SRR38846081	ncontent	wgbs	Per tile sequence quality	PASS
 wgbs	SRR38846081	ncontent	wgbs	Per sequence quality scores	PASS
-wgbs	SRR38846081	ncontent	wgbs	Per base sequence content	WARN
+wgbs	SRR38846081	ncontent	wgbs	Per base sequence content	FAIL
 wgbs	SRR38846081	ncontent	wgbs	Per sequence GC content	WARN
 wgbs	SRR38846081	ncontent	wgbs	Per base N content	FAIL
 wgbs	SRR38846081	ncontent	wgbs	Sequence Length Distribution	PASS
@@ -6566,7 +6566,7 @@ wgbs	SRR27696466	clean	wgbs	Basic Statistics	PASS
 wgbs	SRR27696466	clean	wgbs	Per base sequence quality	PASS
 wgbs	SRR27696466	clean	wgbs	Per tile sequence quality	PASS
 wgbs	SRR27696466	clean	wgbs	Per sequence quality scores	PASS
-wgbs	SRR27696466	clean	wgbs	Per base sequence content	WARN
+wgbs	SRR27696466	clean	wgbs	Per base sequence content	PASS
 wgbs	SRR27696466	clean	wgbs	Per sequence GC content	WARN
 wgbs	SRR27696466	clean	wgbs	Per base N content	PASS
 wgbs	SRR27696466	clean	wgbs	Sequence Length Distribution	PASS
@@ -6610,7 +6610,7 @@ wgbs	SRR27696466	qualtail	wgbs	Basic Statistics	PASS
 wgbs	SRR27696466	qualtail	wgbs	Per base sequence quality	FAIL
 wgbs	SRR27696466	qualtail	wgbs	Per tile sequence quality	PASS
 wgbs	SRR27696466	qualtail	wgbs	Per sequence quality scores	PASS
-wgbs	SRR27696466	qualtail	wgbs	Per base sequence content	WARN
+wgbs	SRR27696466	qualtail	wgbs	Per base sequence content	PASS
 wgbs	SRR27696466	qualtail	wgbs	Per sequence GC content	WARN
 wgbs	SRR27696466	qualtail	wgbs	Per base N content	PASS
 wgbs	SRR27696466	qualtail	wgbs	Sequence Length Distribution	PASS
@@ -6698,7 +6698,7 @@ wgbs	SRR27696466	ncontent	wgbs	Basic Statistics	PASS
 wgbs	SRR27696466	ncontent	wgbs	Per base sequence quality	PASS
 wgbs	SRR27696466	ncontent	wgbs	Per tile sequence quality	PASS
 wgbs	SRR27696466	ncontent	wgbs	Per sequence quality scores	PASS
-wgbs	SRR27696466	ncontent	wgbs	Per base sequence content	WARN
+wgbs	SRR27696466	ncontent	wgbs	Per base sequence content	FAIL
 wgbs	SRR27696466	ncontent	wgbs	Per sequence GC content	WARN
 wgbs	SRR27696466	ncontent	wgbs	Per base N content	FAIL
 wgbs	SRR27696466	ncontent	wgbs	Sequence Length Distribution	PASS
@@ -6852,7 +6852,7 @@ emseq	SRR13051271	ncontent	emseq	Basic Statistics	PASS
 emseq	SRR13051271	ncontent	emseq	Per base sequence quality	PASS
 emseq	SRR13051271	ncontent	emseq	Per tile sequence quality	FAIL
 emseq	SRR13051271	ncontent	emseq	Per sequence quality scores	PASS
-emseq	SRR13051271	ncontent	emseq	Per base sequence content	PASS
+emseq	SRR13051271	ncontent	emseq	Per base sequence content	FAIL
 emseq	SRR13051271	ncontent	emseq	Per sequence GC content	PASS
 emseq	SRR13051271	ncontent	emseq	Per base N content	FAIL
 emseq	SRR13051271	ncontent	emseq	Sequence Length Distribution	PASS
@@ -6874,7 +6874,7 @@ emseq	SRR35858135	clean	emseq	Basic Statistics	PASS
 emseq	SRR35858135	clean	emseq	Per base sequence quality	PASS
 emseq	SRR35858135	clean	emseq	Per tile sequence quality	FAIL
 emseq	SRR35858135	clean	emseq	Per sequence quality scores	PASS
-emseq	SRR35858135	clean	emseq	Per base sequence content	WARN
+emseq	SRR35858135	clean	emseq	Per base sequence content	PASS
 emseq	SRR35858135	clean	emseq	Per sequence GC content	WARN
 emseq	SRR35858135	clean	emseq	Per base N content	PASS
 emseq	SRR35858135	clean	emseq	Sequence Length Distribution	PASS
@@ -6918,7 +6918,7 @@ emseq	SRR35858135	qualtail	emseq	Basic Statistics	PASS
 emseq	SRR35858135	qualtail	emseq	Per base sequence quality	FAIL
 emseq	SRR35858135	qualtail	emseq	Per tile sequence quality	FAIL
 emseq	SRR35858135	qualtail	emseq	Per sequence quality scores	PASS
-emseq	SRR35858135	qualtail	emseq	Per base sequence content	WARN
+emseq	SRR35858135	qualtail	emseq	Per base sequence content	PASS
 emseq	SRR35858135	qualtail	emseq	Per sequence GC content	WARN
 emseq	SRR35858135	qualtail	emseq	Per base N content	PASS
 emseq	SRR35858135	qualtail	emseq	Sequence Length Distribution	PASS
@@ -7028,7 +7028,7 @@ emseq	SRR23020321	clean	emseq	Basic Statistics	PASS
 emseq	SRR23020321	clean	emseq	Per base sequence quality	PASS
 emseq	SRR23020321	clean	emseq	Per tile sequence quality	PASS
 emseq	SRR23020321	clean	emseq	Per sequence quality scores	PASS
-emseq	SRR23020321	clean	emseq	Per base sequence content	WARN
+emseq	SRR23020321	clean	emseq	Per base sequence content	PASS
 emseq	SRR23020321	clean	emseq	Per sequence GC content	WARN
 emseq	SRR23020321	clean	emseq	Per base N content	PASS
 emseq	SRR23020321	clean	emseq	Sequence Length Distribution	PASS
@@ -7072,7 +7072,7 @@ emseq	SRR23020321	qualtail	emseq	Basic Statistics	PASS
 emseq	SRR23020321	qualtail	emseq	Per base sequence quality	FAIL
 emseq	SRR23020321	qualtail	emseq	Per tile sequence quality	PASS
 emseq	SRR23020321	qualtail	emseq	Per sequence quality scores	PASS
-emseq	SRR23020321	qualtail	emseq	Per base sequence content	WARN
+emseq	SRR23020321	qualtail	emseq	Per base sequence content	PASS
 emseq	SRR23020321	qualtail	emseq	Per sequence GC content	WARN
 emseq	SRR23020321	qualtail	emseq	Per base N content	PASS
 emseq	SRR23020321	qualtail	emseq	Sequence Length Distribution	PASS
@@ -7138,7 +7138,7 @@ emseq	SRR23020321	dupspike	emseq	Basic Statistics	PASS
 emseq	SRR23020321	dupspike	emseq	Per base sequence quality	FAIL
 emseq	SRR23020321	dupspike	emseq	Per tile sequence quality	PASS
 emseq	SRR23020321	dupspike	emseq	Per sequence quality scores	PASS
-emseq	SRR23020321	dupspike	emseq	Per base sequence content	FAIL
+emseq	SRR23020321	dupspike	emseq	Per base sequence content	WARN
 emseq	SRR23020321	dupspike	emseq	Per sequence GC content	WARN
 emseq	SRR23020321	dupspike	emseq	Per base N content	FAIL
 emseq	SRR23020321	dupspike	emseq	Sequence Length Distribution	PASS
@@ -7160,7 +7160,7 @@ emseq	SRR23020321	ncontent	emseq	Basic Statistics	PASS
 emseq	SRR23020321	ncontent	emseq	Per base sequence quality	PASS
 emseq	SRR23020321	ncontent	emseq	Per tile sequence quality	PASS
 emseq	SRR23020321	ncontent	emseq	Per sequence quality scores	PASS
-emseq	SRR23020321	ncontent	emseq	Per base sequence content	WARN
+emseq	SRR23020321	ncontent	emseq	Per base sequence content	FAIL
 emseq	SRR23020321	ncontent	emseq	Per sequence GC content	WARN
 emseq	SRR23020321	ncontent	emseq	Per base N content	FAIL
 emseq	SRR23020321	ncontent	emseq	Sequence Length Distribution	PASS
@@ -7182,12 +7182,12 @@ rrbs	SRR34901922	clean	rrbs	Basic Statistics	PASS
 rrbs	SRR34901922	clean	rrbs	Per base sequence quality	PASS
 rrbs	SRR34901922	clean	rrbs	Per tile sequence quality	PASS
 rrbs	SRR34901922	clean	rrbs	Per sequence quality scores	PASS
-rrbs	SRR34901922	clean	rrbs	Per base sequence content	FAIL
+rrbs	SRR34901922	clean	rrbs	Per base sequence content	WARN
 rrbs	SRR34901922	clean	rrbs	Per sequence GC content	WARN
 rrbs	SRR34901922	clean	rrbs	Per base N content	PASS
 rrbs	SRR34901922	clean	rrbs	Sequence Length Distribution	PASS
 rrbs	SRR34901922	clean	rrbs	Sequence Duplication Levels	WARN
-rrbs	SRR34901922	clean	rrbs	Overrepresented sequences	FAIL
+rrbs	SRR34901922	clean	rrbs	Overrepresented sequences	WARN
 rrbs	SRR34901922	clean	rrbs	Adapter Content	FAIL
 rrbs	SRR34901922	adapter	generic	Basic Statistics	PASS
 rrbs	SRR34901922	adapter	generic	Per base sequence quality	PASS
@@ -7209,7 +7209,7 @@ rrbs	SRR34901922	adapter	rrbs	Per sequence GC content	WARN
 rrbs	SRR34901922	adapter	rrbs	Per base N content	PASS
 rrbs	SRR34901922	adapter	rrbs	Sequence Length Distribution	PASS
 rrbs	SRR34901922	adapter	rrbs	Sequence Duplication Levels	WARN
-rrbs	SRR34901922	adapter	rrbs	Overrepresented sequences	FAIL
+rrbs	SRR34901922	adapter	rrbs	Overrepresented sequences	WARN
 rrbs	SRR34901922	adapter	rrbs	Adapter Content	FAIL
 rrbs	SRR34901922	qualtail	generic	Basic Statistics	PASS
 rrbs	SRR34901922	qualtail	generic	Per base sequence quality	FAIL
@@ -7226,12 +7226,12 @@ rrbs	SRR34901922	qualtail	rrbs	Basic Statistics	PASS
 rrbs	SRR34901922	qualtail	rrbs	Per base sequence quality	FAIL
 rrbs	SRR34901922	qualtail	rrbs	Per tile sequence quality	PASS
 rrbs	SRR34901922	qualtail	rrbs	Per sequence quality scores	PASS
-rrbs	SRR34901922	qualtail	rrbs	Per base sequence content	FAIL
+rrbs	SRR34901922	qualtail	rrbs	Per base sequence content	WARN
 rrbs	SRR34901922	qualtail	rrbs	Per sequence GC content	WARN
 rrbs	SRR34901922	qualtail	rrbs	Per base N content	PASS
 rrbs	SRR34901922	qualtail	rrbs	Sequence Length Distribution	PASS
 rrbs	SRR34901922	qualtail	rrbs	Sequence Duplication Levels	WARN
-rrbs	SRR34901922	qualtail	rrbs	Overrepresented sequences	FAIL
+rrbs	SRR34901922	qualtail	rrbs	Overrepresented sequences	WARN
 rrbs	SRR34901922	qualtail	rrbs	Adapter Content	FAIL
 rrbs	SRR34901922	midbias	generic	Basic Statistics	PASS
 rrbs	SRR34901922	midbias	generic	Per base sequence quality	PASS
@@ -7253,7 +7253,7 @@ rrbs	SRR34901922	midbias	rrbs	Per sequence GC content	WARN
 rrbs	SRR34901922	midbias	rrbs	Per base N content	PASS
 rrbs	SRR34901922	midbias	rrbs	Sequence Length Distribution	PASS
 rrbs	SRR34901922	midbias	rrbs	Sequence Duplication Levels	PASS
-rrbs	SRR34901922	midbias	rrbs	Overrepresented sequences	FAIL
+rrbs	SRR34901922	midbias	rrbs	Overrepresented sequences	WARN
 rrbs	SRR34901922	midbias	rrbs	Adapter Content	FAIL
 rrbs	SRR34901922	gccontam	generic	Basic Statistics	PASS
 rrbs	SRR34901922	gccontam	generic	Per base sequence quality	PASS
@@ -7270,12 +7270,12 @@ rrbs	SRR34901922	gccontam	rrbs	Basic Statistics	PASS
 rrbs	SRR34901922	gccontam	rrbs	Per base sequence quality	PASS
 rrbs	SRR34901922	gccontam	rrbs	Per tile sequence quality	PASS
 rrbs	SRR34901922	gccontam	rrbs	Per sequence quality scores	PASS
-rrbs	SRR34901922	gccontam	rrbs	Per base sequence content	FAIL
+rrbs	SRR34901922	gccontam	rrbs	Per base sequence content	WARN
 rrbs	SRR34901922	gccontam	rrbs	Per sequence GC content	WARN
 rrbs	SRR34901922	gccontam	rrbs	Per base N content	PASS
 rrbs	SRR34901922	gccontam	rrbs	Sequence Length Distribution	PASS
 rrbs	SRR34901922	gccontam	rrbs	Sequence Duplication Levels	PASS
-rrbs	SRR34901922	gccontam	rrbs	Overrepresented sequences	FAIL
+rrbs	SRR34901922	gccontam	rrbs	Overrepresented sequences	WARN
 rrbs	SRR34901922	gccontam	rrbs	Adapter Content	FAIL
 rrbs	SRR34901922	dupspike	generic	Basic Statistics	PASS
 rrbs	SRR34901922	dupspike	generic	Per base sequence quality	FAIL
@@ -7292,12 +7292,12 @@ rrbs	SRR34901922	dupspike	rrbs	Basic Statistics	PASS
 rrbs	SRR34901922	dupspike	rrbs	Per base sequence quality	FAIL
 rrbs	SRR34901922	dupspike	rrbs	Per tile sequence quality	PASS
 rrbs	SRR34901922	dupspike	rrbs	Per sequence quality scores	PASS
-rrbs	SRR34901922	dupspike	rrbs	Per base sequence content	FAIL
+rrbs	SRR34901922	dupspike	rrbs	Per base sequence content	WARN
 rrbs	SRR34901922	dupspike	rrbs	Per sequence GC content	WARN
 rrbs	SRR34901922	dupspike	rrbs	Per base N content	FAIL
 rrbs	SRR34901922	dupspike	rrbs	Sequence Length Distribution	PASS
 rrbs	SRR34901922	dupspike	rrbs	Sequence Duplication Levels	WARN
-rrbs	SRR34901922	dupspike	rrbs	Overrepresented sequences	FAIL
+rrbs	SRR34901922	dupspike	rrbs	Overrepresented sequences	WARN
 rrbs	SRR34901922	dupspike	rrbs	Adapter Content	FAIL
 rrbs	SRR34901922	ncontent	generic	Basic Statistics	PASS
 rrbs	SRR34901922	ncontent	generic	Per base sequence quality	PASS
@@ -7314,12 +7314,12 @@ rrbs	SRR34901922	ncontent	rrbs	Basic Statistics	PASS
 rrbs	SRR34901922	ncontent	rrbs	Per base sequence quality	PASS
 rrbs	SRR34901922	ncontent	rrbs	Per tile sequence quality	PASS
 rrbs	SRR34901922	ncontent	rrbs	Per sequence quality scores	PASS
-rrbs	SRR34901922	ncontent	rrbs	Per base sequence content	FAIL
+rrbs	SRR34901922	ncontent	rrbs	Per base sequence content	WARN
 rrbs	SRR34901922	ncontent	rrbs	Per sequence GC content	WARN
 rrbs	SRR34901922	ncontent	rrbs	Per base N content	FAIL
 rrbs	SRR34901922	ncontent	rrbs	Sequence Length Distribution	PASS
 rrbs	SRR34901922	ncontent	rrbs	Sequence Duplication Levels	PASS
-rrbs	SRR34901922	ncontent	rrbs	Overrepresented sequences	FAIL
+rrbs	SRR34901922	ncontent	rrbs	Overrepresented sequences	WARN
 rrbs	SRR34901922	ncontent	rrbs	Adapter Content	FAIL
 rrbs	SRR36114657	clean	generic	Basic Statistics	PASS
 rrbs	SRR36114657	clean	generic	Per base sequence quality	PASS
@@ -7402,7 +7402,7 @@ rrbs	SRR36114657	midbias	rrbs	Basic Statistics	PASS
 rrbs	SRR36114657	midbias	rrbs	Per base sequence quality	PASS
 rrbs	SRR36114657	midbias	rrbs	Per tile sequence quality	PASS
 rrbs	SRR36114657	midbias	rrbs	Per sequence quality scores	PASS
-rrbs	SRR36114657	midbias	rrbs	Per base sequence content	WARN
+rrbs	SRR36114657	midbias	rrbs	Per base sequence content	FAIL
 rrbs	SRR36114657	midbias	rrbs	Per sequence GC content	PASS
 rrbs	SRR36114657	midbias	rrbs	Per base N content	PASS
 rrbs	SRR36114657	midbias	rrbs	Sequence Length Distribution	PASS
@@ -7424,7 +7424,7 @@ rrbs	SRR36114657	gccontam	rrbs	Basic Statistics	PASS
 rrbs	SRR36114657	gccontam	rrbs	Per base sequence quality	PASS
 rrbs	SRR36114657	gccontam	rrbs	Per tile sequence quality	PASS
 rrbs	SRR36114657	gccontam	rrbs	Per sequence quality scores	PASS
-rrbs	SRR36114657	gccontam	rrbs	Per base sequence content	FAIL
+rrbs	SRR36114657	gccontam	rrbs	Per base sequence content	WARN
 rrbs	SRR36114657	gccontam	rrbs	Per sequence GC content	WARN
 rrbs	SRR36114657	gccontam	rrbs	Per base N content	PASS
 rrbs	SRR36114657	gccontam	rrbs	Sequence Length Distribution	PASS
@@ -7446,12 +7446,12 @@ rrbs	SRR36114657	dupspike	rrbs	Basic Statistics	PASS
 rrbs	SRR36114657	dupspike	rrbs	Per base sequence quality	FAIL
 rrbs	SRR36114657	dupspike	rrbs	Per tile sequence quality	PASS
 rrbs	SRR36114657	dupspike	rrbs	Per sequence quality scores	PASS
-rrbs	SRR36114657	dupspike	rrbs	Per base sequence content	FAIL
+rrbs	SRR36114657	dupspike	rrbs	Per base sequence content	WARN
 rrbs	SRR36114657	dupspike	rrbs	Per sequence GC content	WARN
 rrbs	SRR36114657	dupspike	rrbs	Per base N content	WARN
 rrbs	SRR36114657	dupspike	rrbs	Sequence Length Distribution	PASS
 rrbs	SRR36114657	dupspike	rrbs	Sequence Duplication Levels	WARN
-rrbs	SRR36114657	dupspike	rrbs	Overrepresented sequences	FAIL
+rrbs	SRR36114657	dupspike	rrbs	Overrepresented sequences	WARN
 rrbs	SRR36114657	dupspike	rrbs	Adapter Content	WARN
 rrbs	SRR36114657	ncontent	generic	Basic Statistics	PASS
 rrbs	SRR36114657	ncontent	generic	Per base sequence quality	PASS
@@ -7468,7 +7468,7 @@ rrbs	SRR36114657	ncontent	rrbs	Basic Statistics	PASS
 rrbs	SRR36114657	ncontent	rrbs	Per base sequence quality	PASS
 rrbs	SRR36114657	ncontent	rrbs	Per tile sequence quality	PASS
 rrbs	SRR36114657	ncontent	rrbs	Per sequence quality scores	PASS
-rrbs	SRR36114657	ncontent	rrbs	Per base sequence content	WARN
+rrbs	SRR36114657	ncontent	rrbs	Per base sequence content	FAIL
 rrbs	SRR36114657	ncontent	rrbs	Per sequence GC content	PASS
 rrbs	SRR36114657	ncontent	rrbs	Per base N content	FAIL
 rrbs	SRR36114657	ncontent	rrbs	Sequence Length Distribution	PASS
@@ -7578,7 +7578,7 @@ rrbs	SRR36184713	gccontam	rrbs	Basic Statistics	PASS
 rrbs	SRR36184713	gccontam	rrbs	Per base sequence quality	PASS
 rrbs	SRR36184713	gccontam	rrbs	Per tile sequence quality	PASS
 rrbs	SRR36184713	gccontam	rrbs	Per sequence quality scores	PASS
-rrbs	SRR36184713	gccontam	rrbs	Per base sequence content	FAIL
+rrbs	SRR36184713	gccontam	rrbs	Per base sequence content	WARN
 rrbs	SRR36184713	gccontam	rrbs	Per sequence GC content	WARN
 rrbs	SRR36184713	gccontam	rrbs	Per base N content	PASS
 rrbs	SRR36184713	gccontam	rrbs	Sequence Length Distribution	PASS
@@ -7605,7 +7605,7 @@ rrbs	SRR36184713	dupspike	rrbs	Per sequence GC content	WARN
 rrbs	SRR36184713	dupspike	rrbs	Per base N content	FAIL
 rrbs	SRR36184713	dupspike	rrbs	Sequence Length Distribution	PASS
 rrbs	SRR36184713	dupspike	rrbs	Sequence Duplication Levels	WARN
-rrbs	SRR36184713	dupspike	rrbs	Overrepresented sequences	FAIL
+rrbs	SRR36184713	dupspike	rrbs	Overrepresented sequences	WARN
 rrbs	SRR36184713	dupspike	rrbs	Adapter Content	FAIL
 rrbs	SRR36184713	ncontent	generic	Basic Statistics	PASS
 rrbs	SRR36184713	ncontent	generic	Per base sequence quality	PASS
@@ -10820,7 +10820,7 @@ wgbs	SRR6742932	clean	generic	Adapter Content	PASS
 wgbs	SRR6742932	clean	wgbs	Basic Statistics	PASS
 wgbs	SRR6742932	clean	wgbs	Per base sequence quality	PASS
 wgbs	SRR6742932	clean	wgbs	Per sequence quality scores	PASS
-wgbs	SRR6742932	clean	wgbs	Per base sequence content	WARN
+wgbs	SRR6742932	clean	wgbs	Per base sequence content	FAIL
 wgbs	SRR6742932	clean	wgbs	Per sequence GC content	PASS
 wgbs	SRR6742932	clean	wgbs	Per base N content	PASS
 wgbs	SRR6742932	clean	wgbs	Sequence Length Distribution	PASS
@@ -10860,7 +10860,7 @@ wgbs	SRR6742932	qualtail	generic	Adapter Content	PASS
 wgbs	SRR6742932	qualtail	wgbs	Basic Statistics	PASS
 wgbs	SRR6742932	qualtail	wgbs	Per base sequence quality	FAIL
 wgbs	SRR6742932	qualtail	wgbs	Per sequence quality scores	PASS
-wgbs	SRR6742932	qualtail	wgbs	Per base sequence content	WARN
+wgbs	SRR6742932	qualtail	wgbs	Per base sequence content	FAIL
 wgbs	SRR6742932	qualtail	wgbs	Per sequence GC content	PASS
 wgbs	SRR6742932	qualtail	wgbs	Per base N content	PASS
 wgbs	SRR6742932	qualtail	wgbs	Sequence Length Distribution	PASS
@@ -10880,7 +10880,7 @@ wgbs	SRR6742932	midbias	generic	Adapter Content	PASS
 wgbs	SRR6742932	midbias	wgbs	Basic Statistics	PASS
 wgbs	SRR6742932	midbias	wgbs	Per base sequence quality	PASS
 wgbs	SRR6742932	midbias	wgbs	Per sequence quality scores	PASS
-wgbs	SRR6742932	midbias	wgbs	Per base sequence content	WARN
+wgbs	SRR6742932	midbias	wgbs	Per base sequence content	FAIL
 wgbs	SRR6742932	midbias	wgbs	Per sequence GC content	PASS
 wgbs	SRR6742932	midbias	wgbs	Per base N content	PASS
 wgbs	SRR6742932	midbias	wgbs	Sequence Length Distribution	PASS
@@ -10940,7 +10940,7 @@ wgbs	SRR6742932	ncontent	generic	Adapter Content	PASS
 wgbs	SRR6742932	ncontent	wgbs	Basic Statistics	PASS
 wgbs	SRR6742932	ncontent	wgbs	Per base sequence quality	PASS
 wgbs	SRR6742932	ncontent	wgbs	Per sequence quality scores	PASS
-wgbs	SRR6742932	ncontent	wgbs	Per base sequence content	WARN
+wgbs	SRR6742932	ncontent	wgbs	Per base sequence content	FAIL
 wgbs	SRR6742932	ncontent	wgbs	Per sequence GC content	PASS
 wgbs	SRR6742932	ncontent	wgbs	Per base N content	FAIL
 wgbs	SRR6742932	ncontent	wgbs	Sequence Length Distribution	PASS
@@ -10962,7 +10962,7 @@ wgbs	SRR32906428	clean	wgbs	Basic Statistics	PASS
 wgbs	SRR32906428	clean	wgbs	Per base sequence quality	PASS
 wgbs	SRR32906428	clean	wgbs	Per tile sequence quality	PASS
 wgbs	SRR32906428	clean	wgbs	Per sequence quality scores	PASS
-wgbs	SRR32906428	clean	wgbs	Per base sequence content	FAIL
+wgbs	SRR32906428	clean	wgbs	Per base sequence content	WARN
 wgbs	SRR32906428	clean	wgbs	Per sequence GC content	WARN
 wgbs	SRR32906428	clean	wgbs	Per base N content	PASS
 wgbs	SRR32906428	clean	wgbs	Sequence Length Distribution	PASS
@@ -11006,7 +11006,7 @@ wgbs	SRR32906428	qualtail	wgbs	Basic Statistics	PASS
 wgbs	SRR32906428	qualtail	wgbs	Per base sequence quality	FAIL
 wgbs	SRR32906428	qualtail	wgbs	Per tile sequence quality	PASS
 wgbs	SRR32906428	qualtail	wgbs	Per sequence quality scores	PASS
-wgbs	SRR32906428	qualtail	wgbs	Per base sequence content	FAIL
+wgbs	SRR32906428	qualtail	wgbs	Per base sequence content	WARN
 wgbs	SRR32906428	qualtail	wgbs	Per sequence GC content	WARN
 wgbs	SRR32906428	qualtail	wgbs	Per base N content	PASS
 wgbs	SRR32906428	qualtail	wgbs	Sequence Length Distribution	PASS
@@ -11226,7 +11226,7 @@ wgbs	SRR33438783	dupspike	wgbs	Basic Statistics	PASS
 wgbs	SRR33438783	dupspike	wgbs	Per base sequence quality	PASS
 wgbs	SRR33438783	dupspike	wgbs	Per tile sequence quality	PASS
 wgbs	SRR33438783	dupspike	wgbs	Per sequence quality scores	PASS
-wgbs	SRR33438783	dupspike	wgbs	Per base sequence content	FAIL
+wgbs	SRR33438783	dupspike	wgbs	Per base sequence content	WARN
 wgbs	SRR33438783	dupspike	wgbs	Per sequence GC content	WARN
 wgbs	SRR33438783	dupspike	wgbs	Per base N content	PASS
 wgbs	SRR33438783	dupspike	wgbs	Sequence Length Distribution	PASS
@@ -11248,7 +11248,7 @@ wgbs	SRR33438783	ncontent	wgbs	Basic Statistics	PASS
 wgbs	SRR33438783	ncontent	wgbs	Per base sequence quality	PASS
 wgbs	SRR33438783	ncontent	wgbs	Per tile sequence quality	WARN
 wgbs	SRR33438783	ncontent	wgbs	Per sequence quality scores	PASS
-wgbs	SRR33438783	ncontent	wgbs	Per base sequence content	WARN
+wgbs	SRR33438783	ncontent	wgbs	Per base sequence content	FAIL
 wgbs	SRR33438783	ncontent	wgbs	Per sequence GC content	WARN
 wgbs	SRR33438783	ncontent	wgbs	Per base N content	FAIL
 wgbs	SRR33438783	ncontent	wgbs	Sequence Length Distribution	PASS
@@ -11270,7 +11270,7 @@ emseq	ERR15943609	clean	emseq	Basic Statistics	PASS
 emseq	ERR15943609	clean	emseq	Per base sequence quality	PASS
 emseq	ERR15943609	clean	emseq	Per tile sequence quality	PASS
 emseq	ERR15943609	clean	emseq	Per sequence quality scores	PASS
-emseq	ERR15943609	clean	emseq	Per base sequence content	FAIL
+emseq	ERR15943609	clean	emseq	Per base sequence content	PASS
 emseq	ERR15943609	clean	emseq	Per sequence GC content	WARN
 emseq	ERR15943609	clean	emseq	Per base N content	PASS
 emseq	ERR15943609	clean	emseq	Sequence Length Distribution	WARN
@@ -11314,7 +11314,7 @@ emseq	ERR15943609	qualtail	emseq	Basic Statistics	PASS
 emseq	ERR15943609	qualtail	emseq	Per base sequence quality	FAIL
 emseq	ERR15943609	qualtail	emseq	Per tile sequence quality	PASS
 emseq	ERR15943609	qualtail	emseq	Per sequence quality scores	PASS
-emseq	ERR15943609	qualtail	emseq	Per base sequence content	FAIL
+emseq	ERR15943609	qualtail	emseq	Per base sequence content	PASS
 emseq	ERR15943609	qualtail	emseq	Per sequence GC content	WARN
 emseq	ERR15943609	qualtail	emseq	Per base N content	PASS
 emseq	ERR15943609	qualtail	emseq	Sequence Length Distribution	WARN
@@ -11358,7 +11358,7 @@ emseq	ERR15943609	gccontam	emseq	Basic Statistics	PASS
 emseq	ERR15943609	gccontam	emseq	Per base sequence quality	PASS
 emseq	ERR15943609	gccontam	emseq	Per tile sequence quality	PASS
 emseq	ERR15943609	gccontam	emseq	Per sequence quality scores	PASS
-emseq	ERR15943609	gccontam	emseq	Per base sequence content	FAIL
+emseq	ERR15943609	gccontam	emseq	Per base sequence content	WARN
 emseq	ERR15943609	gccontam	emseq	Per sequence GC content	WARN
 emseq	ERR15943609	gccontam	emseq	Per base N content	PASS
 emseq	ERR15943609	gccontam	emseq	Sequence Length Distribution	WARN
@@ -11380,7 +11380,7 @@ emseq	ERR15943609	dupspike	emseq	Basic Statistics	PASS
 emseq	ERR15943609	dupspike	emseq	Per base sequence quality	PASS
 emseq	ERR15943609	dupspike	emseq	Per tile sequence quality	PASS
 emseq	ERR15943609	dupspike	emseq	Per sequence quality scores	PASS
-emseq	ERR15943609	dupspike	emseq	Per base sequence content	FAIL
+emseq	ERR15943609	dupspike	emseq	Per base sequence content	WARN
 emseq	ERR15943609	dupspike	emseq	Per sequence GC content	WARN
 emseq	ERR15943609	dupspike	emseq	Per base N content	PASS
 emseq	ERR15943609	dupspike	emseq	Sequence Length Distribution	WARN
@@ -11522,7 +11522,7 @@ emseq	SRR30812846	dupspike	generic	Adapter Content	FAIL
 emseq	SRR30812846	dupspike	emseq	Basic Statistics	PASS
 emseq	SRR30812846	dupspike	emseq	Per base sequence quality	FAIL
 emseq	SRR30812846	dupspike	emseq	Per sequence quality scores	PASS
-emseq	SRR30812846	dupspike	emseq	Per base sequence content	FAIL
+emseq	SRR30812846	dupspike	emseq	Per base sequence content	WARN
 emseq	SRR30812846	dupspike	emseq	Per sequence GC content	WARN
 emseq	SRR30812846	dupspike	emseq	Per base N content	FAIL
 emseq	SRR30812846	dupspike	emseq	Sequence Length Distribution	PASS
@@ -11542,7 +11542,7 @@ emseq	SRR30812846	ncontent	generic	Adapter Content	FAIL
 emseq	SRR30812846	ncontent	emseq	Basic Statistics	PASS
 emseq	SRR30812846	ncontent	emseq	Per base sequence quality	PASS
 emseq	SRR30812846	ncontent	emseq	Per sequence quality scores	PASS
-emseq	SRR30812846	ncontent	emseq	Per base sequence content	PASS
+emseq	SRR30812846	ncontent	emseq	Per base sequence content	FAIL
 emseq	SRR30812846	ncontent	emseq	Per sequence GC content	WARN
 emseq	SRR30812846	ncontent	emseq	Per base N content	FAIL
 emseq	SRR30812846	ncontent	emseq	Sequence Length Distribution	PASS
@@ -11674,7 +11674,7 @@ emseq	SRR35878071	dupspike	emseq	Basic Statistics	PASS
 emseq	SRR35878071	dupspike	emseq	Per base sequence quality	PASS
 emseq	SRR35878071	dupspike	emseq	Per tile sequence quality	PASS
 emseq	SRR35878071	dupspike	emseq	Per sequence quality scores	PASS
-emseq	SRR35878071	dupspike	emseq	Per base sequence content	FAIL
+emseq	SRR35878071	dupspike	emseq	Per base sequence content	WARN
 emseq	SRR35878071	dupspike	emseq	Per sequence GC content	WARN
 emseq	SRR35878071	dupspike	emseq	Per base N content	PASS
 emseq	SRR35878071	dupspike	emseq	Sequence Length Distribution	PASS
@@ -11718,7 +11718,7 @@ rrbs	SRR35082582	clean	rrbs	Basic Statistics	PASS
 rrbs	SRR35082582	clean	rrbs	Per base sequence quality	PASS
 rrbs	SRR35082582	clean	rrbs	Per tile sequence quality	PASS
 rrbs	SRR35082582	clean	rrbs	Per sequence quality scores	PASS
-rrbs	SRR35082582	clean	rrbs	Per base sequence content	FAIL
+rrbs	SRR35082582	clean	rrbs	Per base sequence content	WARN
 rrbs	SRR35082582	clean	rrbs	Per sequence GC content	WARN
 rrbs	SRR35082582	clean	rrbs	Per base N content	PASS
 rrbs	SRR35082582	clean	rrbs	Sequence Length Distribution	PASS
@@ -11762,7 +11762,7 @@ rrbs	SRR35082582	qualtail	rrbs	Basic Statistics	PASS
 rrbs	SRR35082582	qualtail	rrbs	Per base sequence quality	FAIL
 rrbs	SRR35082582	qualtail	rrbs	Per tile sequence quality	PASS
 rrbs	SRR35082582	qualtail	rrbs	Per sequence quality scores	PASS
-rrbs	SRR35082582	qualtail	rrbs	Per base sequence content	FAIL
+rrbs	SRR35082582	qualtail	rrbs	Per base sequence content	WARN
 rrbs	SRR35082582	qualtail	rrbs	Per sequence GC content	WARN
 rrbs	SRR35082582	qualtail	rrbs	Per base N content	PASS
 rrbs	SRR35082582	qualtail	rrbs	Sequence Length Distribution	PASS
@@ -11806,7 +11806,7 @@ rrbs	SRR35082582	gccontam	rrbs	Basic Statistics	PASS
 rrbs	SRR35082582	gccontam	rrbs	Per base sequence quality	PASS
 rrbs	SRR35082582	gccontam	rrbs	Per tile sequence quality	PASS
 rrbs	SRR35082582	gccontam	rrbs	Per sequence quality scores	PASS
-rrbs	SRR35082582	gccontam	rrbs	Per base sequence content	FAIL
+rrbs	SRR35082582	gccontam	rrbs	Per base sequence content	WARN
 rrbs	SRR35082582	gccontam	rrbs	Per sequence GC content	WARN
 rrbs	SRR35082582	gccontam	rrbs	Per base N content	PASS
 rrbs	SRR35082582	gccontam	rrbs	Sequence Length Distribution	PASS
@@ -11833,7 +11833,7 @@ rrbs	SRR35082582	dupspike	rrbs	Per sequence GC content	WARN
 rrbs	SRR35082582	dupspike	rrbs	Per base N content	WARN
 rrbs	SRR35082582	dupspike	rrbs	Sequence Length Distribution	PASS
 rrbs	SRR35082582	dupspike	rrbs	Sequence Duplication Levels	WARN
-rrbs	SRR35082582	dupspike	rrbs	Overrepresented sequences	FAIL
+rrbs	SRR35082582	dupspike	rrbs	Overrepresented sequences	WARN
 rrbs	SRR35082582	dupspike	rrbs	Adapter Content	FAIL
 rrbs	SRR35082582	ncontent	generic	Basic Statistics	PASS
 rrbs	SRR35082582	ncontent	generic	Per base sequence quality	PASS
@@ -11960,7 +11960,7 @@ rrbs	SRR35488093	gccontam	rrbs	Basic Statistics	PASS
 rrbs	SRR35488093	gccontam	rrbs	Per base sequence quality	PASS
 rrbs	SRR35488093	gccontam	rrbs	Per tile sequence quality	PASS
 rrbs	SRR35488093	gccontam	rrbs	Per sequence quality scores	PASS
-rrbs	SRR35488093	gccontam	rrbs	Per base sequence content	FAIL
+rrbs	SRR35488093	gccontam	rrbs	Per base sequence content	WARN
 rrbs	SRR35488093	gccontam	rrbs	Per sequence GC content	WARN
 rrbs	SRR35488093	gccontam	rrbs	Per base N content	PASS
 rrbs	SRR35488093	gccontam	rrbs	Sequence Length Distribution	PASS
@@ -11987,7 +11987,7 @@ rrbs	SRR35488093	dupspike	rrbs	Per sequence GC content	WARN
 rrbs	SRR35488093	dupspike	rrbs	Per base N content	FAIL
 rrbs	SRR35488093	dupspike	rrbs	Sequence Length Distribution	PASS
 rrbs	SRR35488093	dupspike	rrbs	Sequence Duplication Levels	WARN
-rrbs	SRR35488093	dupspike	rrbs	Overrepresented sequences	FAIL
+rrbs	SRR35488093	dupspike	rrbs	Overrepresented sequences	WARN
 rrbs	SRR35488093	dupspike	rrbs	Adapter Content	FAIL
 rrbs	SRR35488093	ncontent	generic	Basic Statistics	PASS
 rrbs	SRR35488093	ncontent	generic	Per base sequence quality	PASS
@@ -12114,7 +12114,7 @@ rrbs	SRR35168606	gccontam	rrbs	Basic Statistics	PASS
 rrbs	SRR35168606	gccontam	rrbs	Per base sequence quality	PASS
 rrbs	SRR35168606	gccontam	rrbs	Per tile sequence quality	FAIL
 rrbs	SRR35168606	gccontam	rrbs	Per sequence quality scores	PASS
-rrbs	SRR35168606	gccontam	rrbs	Per base sequence content	FAIL
+rrbs	SRR35168606	gccontam	rrbs	Per base sequence content	WARN
 rrbs	SRR35168606	gccontam	rrbs	Per sequence GC content	WARN
 rrbs	SRR35168606	gccontam	rrbs	Per base N content	PASS
 rrbs	SRR35168606	gccontam	rrbs	Sequence Length Distribution	WARN
@@ -12141,7 +12141,7 @@ rrbs	SRR35168606	dupspike	rrbs	Per sequence GC content	WARN
 rrbs	SRR35168606	dupspike	rrbs	Per base N content	PASS
 rrbs	SRR35168606	dupspike	rrbs	Sequence Length Distribution	WARN
 rrbs	SRR35168606	dupspike	rrbs	Sequence Duplication Levels	WARN
-rrbs	SRR35168606	dupspike	rrbs	Overrepresented sequences	FAIL
+rrbs	SRR35168606	dupspike	rrbs	Overrepresented sequences	WARN
 rrbs	SRR35168606	dupspike	rrbs	Adapter Content	PASS
 rrbs	SRR35168606	ncontent	generic	Basic Statistics	PASS
 rrbs	SRR35168606	ncontent	generic	Per base sequence quality	PASS
@@ -15372,7 +15372,7 @@ wgbs	SRR28106288	clean	wgbs	Basic Statistics	PASS
 wgbs	SRR28106288	clean	wgbs	Per base sequence quality	PASS
 wgbs	SRR28106288	clean	wgbs	Per tile sequence quality	PASS
 wgbs	SRR28106288	clean	wgbs	Per sequence quality scores	PASS
-wgbs	SRR28106288	clean	wgbs	Per base sequence content	FAIL
+wgbs	SRR28106288	clean	wgbs	Per base sequence content	WARN
 wgbs	SRR28106288	clean	wgbs	Per sequence GC content	WARN
 wgbs	SRR28106288	clean	wgbs	Per base N content	PASS
 wgbs	SRR28106288	clean	wgbs	Sequence Length Distribution	PASS
@@ -15416,7 +15416,7 @@ wgbs	SRR28106288	qualtail	wgbs	Basic Statistics	PASS
 wgbs	SRR28106288	qualtail	wgbs	Per base sequence quality	FAIL
 wgbs	SRR28106288	qualtail	wgbs	Per tile sequence quality	PASS
 wgbs	SRR28106288	qualtail	wgbs	Per sequence quality scores	PASS
-wgbs	SRR28106288	qualtail	wgbs	Per base sequence content	FAIL
+wgbs	SRR28106288	qualtail	wgbs	Per base sequence content	WARN
 wgbs	SRR28106288	qualtail	wgbs	Per sequence GC content	WARN
 wgbs	SRR28106288	qualtail	wgbs	Per base N content	PASS
 wgbs	SRR28106288	qualtail	wgbs	Sequence Length Distribution	PASS
@@ -15604,7 +15604,7 @@ wgbs	SRR34325725	gccontam	generic	Adapter Content	PASS
 wgbs	SRR34325725	gccontam	wgbs	Basic Statistics	PASS
 wgbs	SRR34325725	gccontam	wgbs	Per base sequence quality	PASS
 wgbs	SRR34325725	gccontam	wgbs	Per sequence quality scores	PASS
-wgbs	SRR34325725	gccontam	wgbs	Per base sequence content	FAIL
+wgbs	SRR34325725	gccontam	wgbs	Per base sequence content	WARN
 wgbs	SRR34325725	gccontam	wgbs	Per sequence GC content	WARN
 wgbs	SRR34325725	gccontam	wgbs	Per base N content	PASS
 wgbs	SRR34325725	gccontam	wgbs	Sequence Length Distribution	WARN
@@ -15666,7 +15666,7 @@ emseq	SRR37217442	clean	emseq	Basic Statistics	PASS
 emseq	SRR37217442	clean	emseq	Per base sequence quality	PASS
 emseq	SRR37217442	clean	emseq	Per tile sequence quality	PASS
 emseq	SRR37217442	clean	emseq	Per sequence quality scores	PASS
-emseq	SRR37217442	clean	emseq	Per base sequence content	WARN
+emseq	SRR37217442	clean	emseq	Per base sequence content	PASS
 emseq	SRR37217442	clean	emseq	Per sequence GC content	WARN
 emseq	SRR37217442	clean	emseq	Per base N content	PASS
 emseq	SRR37217442	clean	emseq	Sequence Length Distribution	PASS
@@ -15710,7 +15710,7 @@ emseq	SRR37217442	qualtail	emseq	Basic Statistics	PASS
 emseq	SRR37217442	qualtail	emseq	Per base sequence quality	FAIL
 emseq	SRR37217442	qualtail	emseq	Per tile sequence quality	PASS
 emseq	SRR37217442	qualtail	emseq	Per sequence quality scores	PASS
-emseq	SRR37217442	qualtail	emseq	Per base sequence content	WARN
+emseq	SRR37217442	qualtail	emseq	Per base sequence content	PASS
 emseq	SRR37217442	qualtail	emseq	Per sequence GC content	WARN
 emseq	SRR37217442	qualtail	emseq	Per base N content	PASS
 emseq	SRR37217442	qualtail	emseq	Sequence Length Distribution	PASS
@@ -15776,7 +15776,7 @@ emseq	SRR37217442	dupspike	emseq	Basic Statistics	PASS
 emseq	SRR37217442	dupspike	emseq	Per base sequence quality	PASS
 emseq	SRR37217442	dupspike	emseq	Per tile sequence quality	PASS
 emseq	SRR37217442	dupspike	emseq	Per sequence quality scores	PASS
-emseq	SRR37217442	dupspike	emseq	Per base sequence content	FAIL
+emseq	SRR37217442	dupspike	emseq	Per base sequence content	WARN
 emseq	SRR37217442	dupspike	emseq	Per sequence GC content	WARN
 emseq	SRR37217442	dupspike	emseq	Per base N content	PASS
 emseq	SRR37217442	dupspike	emseq	Sequence Length Distribution	PASS
@@ -15798,7 +15798,7 @@ emseq	SRR37217442	ncontent	emseq	Basic Statistics	PASS
 emseq	SRR37217442	ncontent	emseq	Per base sequence quality	PASS
 emseq	SRR37217442	ncontent	emseq	Per tile sequence quality	PASS
 emseq	SRR37217442	ncontent	emseq	Per sequence quality scores	PASS
-emseq	SRR37217442	ncontent	emseq	Per base sequence content	WARN
+emseq	SRR37217442	ncontent	emseq	Per base sequence content	FAIL
 emseq	SRR37217442	ncontent	emseq	Per sequence GC content	WARN
 emseq	SRR37217442	ncontent	emseq	Per base N content	FAIL
 emseq	SRR37217442	ncontent	emseq	Sequence Length Distribution	PASS
@@ -15820,7 +15820,7 @@ emseq	SRR35280603	clean	emseq	Basic Statistics	PASS
 emseq	SRR35280603	clean	emseq	Per base sequence quality	PASS
 emseq	SRR35280603	clean	emseq	Per tile sequence quality	PASS
 emseq	SRR35280603	clean	emseq	Per sequence quality scores	PASS
-emseq	SRR35280603	clean	emseq	Per base sequence content	WARN
+emseq	SRR35280603	clean	emseq	Per base sequence content	PASS
 emseq	SRR35280603	clean	emseq	Per sequence GC content	PASS
 emseq	SRR35280603	clean	emseq	Per base N content	PASS
 emseq	SRR35280603	clean	emseq	Sequence Length Distribution	PASS
@@ -15864,7 +15864,7 @@ emseq	SRR35280603	qualtail	emseq	Basic Statistics	PASS
 emseq	SRR35280603	qualtail	emseq	Per base sequence quality	FAIL
 emseq	SRR35280603	qualtail	emseq	Per tile sequence quality	PASS
 emseq	SRR35280603	qualtail	emseq	Per sequence quality scores	PASS
-emseq	SRR35280603	qualtail	emseq	Per base sequence content	WARN
+emseq	SRR35280603	qualtail	emseq	Per base sequence content	PASS
 emseq	SRR35280603	qualtail	emseq	Per sequence GC content	PASS
 emseq	SRR35280603	qualtail	emseq	Per base N content	PASS
 emseq	SRR35280603	qualtail	emseq	Sequence Length Distribution	PASS
@@ -15930,7 +15930,7 @@ emseq	SRR35280603	dupspike	emseq	Basic Statistics	PASS
 emseq	SRR35280603	dupspike	emseq	Per base sequence quality	FAIL
 emseq	SRR35280603	dupspike	emseq	Per tile sequence quality	PASS
 emseq	SRR35280603	dupspike	emseq	Per sequence quality scores	PASS
-emseq	SRR35280603	dupspike	emseq	Per base sequence content	FAIL
+emseq	SRR35280603	dupspike	emseq	Per base sequence content	WARN
 emseq	SRR35280603	dupspike	emseq	Per sequence GC content	WARN
 emseq	SRR35280603	dupspike	emseq	Per base N content	FAIL
 emseq	SRR35280603	dupspike	emseq	Sequence Length Distribution	PASS
@@ -15952,7 +15952,7 @@ emseq	SRR35280603	ncontent	emseq	Basic Statistics	PASS
 emseq	SRR35280603	ncontent	emseq	Per base sequence quality	PASS
 emseq	SRR35280603	ncontent	emseq	Per tile sequence quality	PASS
 emseq	SRR35280603	ncontent	emseq	Per sequence quality scores	PASS
-emseq	SRR35280603	ncontent	emseq	Per base sequence content	WARN
+emseq	SRR35280603	ncontent	emseq	Per base sequence content	FAIL
 emseq	SRR35280603	ncontent	emseq	Per sequence GC content	PASS
 emseq	SRR35280603	ncontent	emseq	Per base N content	FAIL
 emseq	SRR35280603	ncontent	emseq	Sequence Length Distribution	PASS
@@ -15974,7 +15974,7 @@ emseq	SRR37304395	clean	emseq	Basic Statistics	PASS
 emseq	SRR37304395	clean	emseq	Per base sequence quality	PASS
 emseq	SRR37304395	clean	emseq	Per tile sequence quality	PASS
 emseq	SRR37304395	clean	emseq	Per sequence quality scores	PASS
-emseq	SRR37304395	clean	emseq	Per base sequence content	WARN
+emseq	SRR37304395	clean	emseq	Per base sequence content	PASS
 emseq	SRR37304395	clean	emseq	Per sequence GC content	WARN
 emseq	SRR37304395	clean	emseq	Per base N content	PASS
 emseq	SRR37304395	clean	emseq	Sequence Length Distribution	PASS
@@ -16018,7 +16018,7 @@ emseq	SRR37304395	qualtail	emseq	Basic Statistics	PASS
 emseq	SRR37304395	qualtail	emseq	Per base sequence quality	FAIL
 emseq	SRR37304395	qualtail	emseq	Per tile sequence quality	PASS
 emseq	SRR37304395	qualtail	emseq	Per sequence quality scores	PASS
-emseq	SRR37304395	qualtail	emseq	Per base sequence content	WARN
+emseq	SRR37304395	qualtail	emseq	Per base sequence content	PASS
 emseq	SRR37304395	qualtail	emseq	Per sequence GC content	WARN
 emseq	SRR37304395	qualtail	emseq	Per base N content	PASS
 emseq	SRR37304395	qualtail	emseq	Sequence Length Distribution	PASS
@@ -16084,7 +16084,7 @@ emseq	SRR37304395	dupspike	emseq	Basic Statistics	PASS
 emseq	SRR37304395	dupspike	emseq	Per base sequence quality	FAIL
 emseq	SRR37304395	dupspike	emseq	Per tile sequence quality	PASS
 emseq	SRR37304395	dupspike	emseq	Per sequence quality scores	PASS
-emseq	SRR37304395	dupspike	emseq	Per base sequence content	FAIL
+emseq	SRR37304395	dupspike	emseq	Per base sequence content	WARN
 emseq	SRR37304395	dupspike	emseq	Per sequence GC content	WARN
 emseq	SRR37304395	dupspike	emseq	Per base N content	FAIL
 emseq	SRR37304395	dupspike	emseq	Sequence Length Distribution	PASS
@@ -16106,7 +16106,7 @@ emseq	SRR37304395	ncontent	emseq	Basic Statistics	PASS
 emseq	SRR37304395	ncontent	emseq	Per base sequence quality	PASS
 emseq	SRR37304395	ncontent	emseq	Per tile sequence quality	PASS
 emseq	SRR37304395	ncontent	emseq	Per sequence quality scores	PASS
-emseq	SRR37304395	ncontent	emseq	Per base sequence content	WARN
+emseq	SRR37304395	ncontent	emseq	Per base sequence content	FAIL
 emseq	SRR37304395	ncontent	emseq	Per sequence GC content	WARN
 emseq	SRR37304395	ncontent	emseq	Per base N content	FAIL
 emseq	SRR37304395	ncontent	emseq	Sequence Length Distribution	PASS
@@ -16128,7 +16128,7 @@ rrbs	SRR36114658	clean	rrbs	Basic Statistics	PASS
 rrbs	SRR36114658	clean	rrbs	Per base sequence quality	PASS
 rrbs	SRR36114658	clean	rrbs	Per tile sequence quality	PASS
 rrbs	SRR36114658	clean	rrbs	Per sequence quality scores	PASS
-rrbs	SRR36114658	clean	rrbs	Per base sequence content	FAIL
+rrbs	SRR36114658	clean	rrbs	Per base sequence content	WARN
 rrbs	SRR36114658	clean	rrbs	Per sequence GC content	PASS
 rrbs	SRR36114658	clean	rrbs	Per base N content	PASS
 rrbs	SRR36114658	clean	rrbs	Sequence Length Distribution	PASS
@@ -16172,7 +16172,7 @@ rrbs	SRR36114658	qualtail	rrbs	Basic Statistics	PASS
 rrbs	SRR36114658	qualtail	rrbs	Per base sequence quality	FAIL
 rrbs	SRR36114658	qualtail	rrbs	Per tile sequence quality	PASS
 rrbs	SRR36114658	qualtail	rrbs	Per sequence quality scores	WARN
-rrbs	SRR36114658	qualtail	rrbs	Per base sequence content	FAIL
+rrbs	SRR36114658	qualtail	rrbs	Per base sequence content	WARN
 rrbs	SRR36114658	qualtail	rrbs	Per sequence GC content	PASS
 rrbs	SRR36114658	qualtail	rrbs	Per base N content	PASS
 rrbs	SRR36114658	qualtail	rrbs	Sequence Length Distribution	PASS
@@ -16216,7 +16216,7 @@ rrbs	SRR36114658	gccontam	rrbs	Basic Statistics	PASS
 rrbs	SRR36114658	gccontam	rrbs	Per base sequence quality	PASS
 rrbs	SRR36114658	gccontam	rrbs	Per tile sequence quality	PASS
 rrbs	SRR36114658	gccontam	rrbs	Per sequence quality scores	PASS
-rrbs	SRR36114658	gccontam	rrbs	Per base sequence content	FAIL
+rrbs	SRR36114658	gccontam	rrbs	Per base sequence content	WARN
 rrbs	SRR36114658	gccontam	rrbs	Per sequence GC content	WARN
 rrbs	SRR36114658	gccontam	rrbs	Per base N content	PASS
 rrbs	SRR36114658	gccontam	rrbs	Sequence Length Distribution	PASS
@@ -16243,7 +16243,7 @@ rrbs	SRR36114658	dupspike	rrbs	Per sequence GC content	WARN
 rrbs	SRR36114658	dupspike	rrbs	Per base N content	WARN
 rrbs	SRR36114658	dupspike	rrbs	Sequence Length Distribution	PASS
 rrbs	SRR36114658	dupspike	rrbs	Sequence Duplication Levels	WARN
-rrbs	SRR36114658	dupspike	rrbs	Overrepresented sequences	FAIL
+rrbs	SRR36114658	dupspike	rrbs	Overrepresented sequences	WARN
 rrbs	SRR36114658	dupspike	rrbs	Adapter Content	PASS
 rrbs	SRR36114658	ncontent	generic	Basic Statistics	PASS
 rrbs	SRR36114658	ncontent	generic	Per base sequence quality	PASS
@@ -16370,7 +16370,7 @@ rrbs	SRR36184714	gccontam	rrbs	Basic Statistics	PASS
 rrbs	SRR36184714	gccontam	rrbs	Per base sequence quality	PASS
 rrbs	SRR36184714	gccontam	rrbs	Per tile sequence quality	FAIL
 rrbs	SRR36184714	gccontam	rrbs	Per sequence quality scores	PASS
-rrbs	SRR36184714	gccontam	rrbs	Per base sequence content	FAIL
+rrbs	SRR36184714	gccontam	rrbs	Per base sequence content	WARN
 rrbs	SRR36184714	gccontam	rrbs	Per sequence GC content	WARN
 rrbs	SRR36184714	gccontam	rrbs	Per base N content	PASS
 rrbs	SRR36184714	gccontam	rrbs	Sequence Length Distribution	PASS
@@ -16397,7 +16397,7 @@ rrbs	SRR36184714	dupspike	rrbs	Per sequence GC content	WARN
 rrbs	SRR36184714	dupspike	rrbs	Per base N content	FAIL
 rrbs	SRR36184714	dupspike	rrbs	Sequence Length Distribution	PASS
 rrbs	SRR36184714	dupspike	rrbs	Sequence Duplication Levels	WARN
-rrbs	SRR36184714	dupspike	rrbs	Overrepresented sequences	FAIL
+rrbs	SRR36184714	dupspike	rrbs	Overrepresented sequences	WARN
 rrbs	SRR36184714	dupspike	rrbs	Adapter Content	FAIL
 rrbs	SRR36184714	ncontent	generic	Basic Statistics	PASS
 rrbs	SRR36184714	ncontent	generic	Per base sequence quality	PASS
@@ -16436,7 +16436,7 @@ rrbs	SRR34901921	clean	rrbs	Basic Statistics	PASS
 rrbs	SRR34901921	clean	rrbs	Per base sequence quality	PASS
 rrbs	SRR34901921	clean	rrbs	Per tile sequence quality	PASS
 rrbs	SRR34901921	clean	rrbs	Per sequence quality scores	PASS
-rrbs	SRR34901921	clean	rrbs	Per base sequence content	FAIL
+rrbs	SRR34901921	clean	rrbs	Per base sequence content	WARN
 rrbs	SRR34901921	clean	rrbs	Per sequence GC content	PASS
 rrbs	SRR34901921	clean	rrbs	Per base N content	PASS
 rrbs	SRR34901921	clean	rrbs	Sequence Length Distribution	PASS
@@ -16480,7 +16480,7 @@ rrbs	SRR34901921	qualtail	rrbs	Basic Statistics	PASS
 rrbs	SRR34901921	qualtail	rrbs	Per base sequence quality	FAIL
 rrbs	SRR34901921	qualtail	rrbs	Per tile sequence quality	PASS
 rrbs	SRR34901921	qualtail	rrbs	Per sequence quality scores	PASS
-rrbs	SRR34901921	qualtail	rrbs	Per base sequence content	FAIL
+rrbs	SRR34901921	qualtail	rrbs	Per base sequence content	WARN
 rrbs	SRR34901921	qualtail	rrbs	Per sequence GC content	PASS
 rrbs	SRR34901921	qualtail	rrbs	Per base N content	PASS
 rrbs	SRR34901921	qualtail	rrbs	Sequence Length Distribution	PASS
@@ -16524,7 +16524,7 @@ rrbs	SRR34901921	gccontam	rrbs	Basic Statistics	PASS
 rrbs	SRR34901921	gccontam	rrbs	Per base sequence quality	PASS
 rrbs	SRR34901921	gccontam	rrbs	Per tile sequence quality	PASS
 rrbs	SRR34901921	gccontam	rrbs	Per sequence quality scores	PASS
-rrbs	SRR34901921	gccontam	rrbs	Per base sequence content	FAIL
+rrbs	SRR34901921	gccontam	rrbs	Per base sequence content	WARN
 rrbs	SRR34901921	gccontam	rrbs	Per sequence GC content	WARN
 rrbs	SRR34901921	gccontam	rrbs	Per base N content	PASS
 rrbs	SRR34901921	gccontam	rrbs	Sequence Length Distribution	PASS
@@ -16551,7 +16551,7 @@ rrbs	SRR34901921	dupspike	rrbs	Per sequence GC content	WARN
 rrbs	SRR34901921	dupspike	rrbs	Per base N content	FAIL
 rrbs	SRR34901921	dupspike	rrbs	Sequence Length Distribution	PASS
 rrbs	SRR34901921	dupspike	rrbs	Sequence Duplication Levels	WARN
-rrbs	SRR34901921	dupspike	rrbs	Overrepresented sequences	FAIL
+rrbs	SRR34901921	dupspike	rrbs	Overrepresented sequences	WARN
 rrbs	SRR34901921	dupspike	rrbs	Adapter Content	FAIL
 rrbs	SRR34901921	ncontent	generic	Basic Statistics	PASS
 rrbs	SRR34901921	ncontent	generic	Per base sequence quality	PASS
@@ -16568,7 +16568,7 @@ rrbs	SRR34901921	ncontent	rrbs	Basic Statistics	PASS
 rrbs	SRR34901921	ncontent	rrbs	Per base sequence quality	PASS
 rrbs	SRR34901921	ncontent	rrbs	Per tile sequence quality	PASS
 rrbs	SRR34901921	ncontent	rrbs	Per sequence quality scores	PASS
-rrbs	SRR34901921	ncontent	rrbs	Per base sequence content	FAIL
+rrbs	SRR34901921	ncontent	rrbs	Per base sequence content	WARN
 rrbs	SRR34901921	ncontent	rrbs	Per sequence GC content	PASS
 rrbs	SRR34901921	ncontent	rrbs	Per base N content	FAIL
 rrbs	SRR34901921	ncontent	rrbs	Sequence Length Distribution	PASS
