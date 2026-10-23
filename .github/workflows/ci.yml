@@ -49,6 +49,9 @@ jobs:
       - name: Paired-end duplication and pairing tests
         run: test/paired/run_paired_tests.sh ./falcoAmadeus
 
+      - name: Per base N content grades
+        run: test/n_content/run_n_content_tests.sh ./falcoAmadeus
+
       - name: Show test log on failure
         if: failure()
         run: |

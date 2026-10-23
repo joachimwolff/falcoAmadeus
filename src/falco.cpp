@@ -2283,6 +2283,13 @@ main(int argc, char *argv[]) {
       "mates that are out of order make every paired statistic meaningless.",
       false, falco_config.allow_unmatched_pairs);
 
+    opt_parse.add_opt(
+      "-legacy-n-content-grade", '\0',
+      "[FalcoAmadeus] Grade Per base N content as falco 1.x does, where the "
+      "module never warns or fails. By default it is graded as in FastQC: "
+      "warn above 5% and fail above 20% N at any position.",
+      false, falco_config.legacy_n_content_grade);
+
     std::vector<std::string> leftover_args;
     opt_parse.parse(argc, argv, leftover_args);
     // [FalcoAmadeus] "-" is the conventional alias for stdin; normalize it to

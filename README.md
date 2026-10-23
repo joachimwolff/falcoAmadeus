@@ -5,19 +5,22 @@
 popular [FastQC](https://www.bioinformatics.babraham.ac.uk/projects/fastqc)
 software) that checks large sequencing reads for common problems.
 
-By default it produces **byte-identical output** to upstream falco: a plain
-single-end run's `fastqc_data.txt` and `summary.txt` still match the reference
-checksums in the upstream test suite (`test/md5sum.txt`). The speed work never
-changes results. Everything new below is **opt-in** behind a flag or a new
-mode, so existing single-end pipelines are unaffected.
+By default it produces the same output as upstream falco 1.3.2 with one
+corrected grade: Per base N content is graded as in FastQC (warn above 5 %,
+fail above 20 % N at a position), where falco 1.x never warns or fails because
+it compares a fraction with the percent limits. With
+`--legacy-n-content-grade`, a plain single-end run's `fastqc_data.txt` and
+`summary.txt` are byte-identical to those of falco 1.3.2 (checked in CI). The
+speed work never changes results. Everything else new below is **opt-in**
+behind a flag or a new mode.
 
 ## Why this fork exists
 
 These optimizations were offered to upstream falco as a patch, but the
 maintainers declined to merge it. FalcoAmadeus exists to make the faster
 implementation available to users who want it, and to add the sequencing-aware
-and reporting features below, while keeping the default output identical to the
-original.
+and reporting features below, while keeping the output identical to the
+original apart from the corrected N-content grade.
 
 ## What FalcoAmadeus does differently
 
@@ -286,6 +289,7 @@ FalcoAmadeus-specific options:
 | `--paired-data mates\|combined\|both` | With `--paired-with`, which `fastqc_data.txt` files to emit for MultiQC: separate mates (default), a single pooled sample, or both. |
 | `--assay TYPE` | Assay-aware pass/warn/fail grading (`rnaseq`, `amplicon`, `wgbs`/`emseq`/`rrbs`, `chipseq`, `atac`, `smallrna`, `wgs`, …; default `generic` is byte-identical to falco). |
 | `--conversion-residual F` | For bisulfite assays, the residual unmethylated-base fraction (0–1) above which a possible incomplete-conversion warning is emitted. |
+| `--legacy-n-content-grade` | Grade Per base N content as falco 1.x does (never warns or fails), for output byte-identical to falco 1.3.2. |
 | `--name NAME` | Sample name for the report `Filename` / MultiQC, instead of the input basename. |
 | `-t, --threads N` | Parse with N threads; works for FASTQ, gzipped FASTQ, SAM and BAM (byte-identical output at every thread count). |
 

@@ -288,6 +288,7 @@ struct ModulePerBaseNContent : public Module {
   std::size_t grade_n_warn{};   // for grade
   std::size_t grade_n_error{};  // for grade
   double max_n_pct{};
+  bool legacy_grade{};  // FalcoConfig::legacy_n_content_grade
   std::array<std::size_t, 101> gc_count;
   std::array<std::size_t, 101> theoretical_gc_count;
   std::vector<double> n_pct;

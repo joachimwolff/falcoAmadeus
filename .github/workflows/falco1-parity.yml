@@ -2,7 +2,9 @@ name: falco1 parity
 
 # Verify the project's core claim on every push and pull request: default
 # single-end output is byte-identical to upstream falco 1.3.2, modulo two
-# documented differences:
+# documented differences, with --legacy-n-content-grade (by default
+# falcoAmadeus grades Per base N content as FastQC does; falco 1.3.2 compares
+# a fraction with the percent limits, so the module never warns or fails):
 #   1. line 1 of fastqc_data.txt names the tool and version;
 #   2. the Overrepresented Sequences section lists count-TIED entries in a
 #      deterministic (frequency, then sequence) order, whereas upstream emits
@@ -82,9 +84,9 @@ jobs:
             gzip -kf "$f"
             for case in t1 t8 gz; do
               case $case in
-                t1) inp=$f;    fa_args="-t 1";;
-                t8) inp=$f;    fa_args="-t 8";;
-                gz) inp=$f.gz; fa_args="-t 8";;
+                t1) inp=$f;    fa_args="-t 1 --legacy-n-content-grade";;
+                t8) inp=$f;    fa_args="-t 8 --legacy-n-content-grade";;
+                gz) inp=$f.gz; fa_args="-t 8 --legacy-n-content-grade";;
               esac
               rm -rf parity/out_f1 parity/out_fa
               mkdir -p parity/out_f1 parity/out_fa

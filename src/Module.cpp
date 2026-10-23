@@ -1676,6 +1676,7 @@ ModulePerBaseNContent::ModulePerBaseNContent(const FalcoConfig &config) :
   grade_n_warn = grade_n.find("warn")->second;
   grade_n_error = grade_n.find("error")->second;
   do_group = !config.nogroup;
+  legacy_grade = config.legacy_n_content_grade;
 }
 
 void
@@ -1724,12 +1725,20 @@ ModulePerBaseNContent::summarize_module(FastqStats &stats) {
 
 void
 ModulePerBaseNContent::make_grade() {
+  // The reported percentages per position (or group), as in FastQC; the
+  // legacy grade compares the largest per-base fraction instead.
+  double worst = max_n_pct;
+  if (!legacy_grade) {
+    worst = 0.0;
+    for (const double p : n_pct)
+      worst = std::max(worst, p);
+  }
   if (grade != "fail") {
-    if (max_n_pct > grade_n_error) {
+    if (worst > grade_n_error) {
       grade = "fail";
     }
 
-    else if (max_n_pct > grade_n_warn) {
+    else if (worst > grade_n_warn) {
       grade = "warn";
     }
   }

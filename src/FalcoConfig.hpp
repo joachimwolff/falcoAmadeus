@@ -192,6 +192,10 @@ struct FalcoConfig {
   // disagree (mates out of order or files from different runs), since every
   // paired statistic would be meaningless. This overrides that check.
   bool allow_unmatched_pairs = false;
+  // [FalcoAmadeus] grade Per base N content as falco 1.x did: its largest
+  // per-position N fraction (0 to 1) was compared with the percent limits,
+  // so the module never warned or failed
+  bool legacy_n_content_grade = false;
   // [FalcoAmadeus] when non-empty, the FASTQ input is the concatenation of
   // these files, streamed directly (paired-end combined view); filename is
   // then the first file, used for format/tile detection.

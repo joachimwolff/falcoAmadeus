@@ -19,6 +19,15 @@
 
 ### Fixed
 
+- **Per base N content is graded.** Inherited from falco 1.x, the module
+  compared the largest per-position N fraction (0 to 1) with the percent
+  limits (warn 5, error 20), so it never warned or failed: reads with 50 % N
+  at positions 11 to 20 graded PASS. It is now graded on the reported
+  percentages per position or position group, as in FastQC; FastQC 0.12.1
+  gives the same grades on the bundled test data and on generated files.
+  Five of the bundled test files now WARN or FAIL (their checksums in
+  `test/md5sum.txt` were updated). `--legacy-n-content-grade` restores the
+  falco 1.x grade; the falco 1.3.2 parity check runs with it.
 - **Mates out of order are rejected.** `--paired-with` accepted R1/R2 files
   whose read identifiers did not correspond and reported a duplicate rate
   for meaningless pairs. Mismatched identifiers now stop the run with an
