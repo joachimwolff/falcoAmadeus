@@ -93,6 +93,7 @@ LABEL = {"adapter": "Adapter (Adapter Content)",
          "qualtail": "Quality tail (Per base sequence quality)",
          "gccontam": "GC contamination (Per sequence GC content)",
          "dupspike": "Duplicate spike (Sequence Duplication Levels)",
+         "ncontent": "N block (Per base N content)",
          "midbias": "Composition bias (Per base sequence content)"}
 sheet(wb, "Injected defects",
       ["Defect (targeted module)", "Runs detected, generic",

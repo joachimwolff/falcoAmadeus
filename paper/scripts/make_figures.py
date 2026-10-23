@@ -294,7 +294,8 @@ ax.set_ylabel("Module checks flagged (%)")
 ax.legend(frameon=False, loc="upper left", ncol=2)
 save(fig, "fig4a.pdf")
 
-DEFECT_ORDER = ["adapter", "qualtail", "gccontam", "dupspike", "midbias"]
+DEFECT_ORDER = ["adapter", "qualtail", "gccontam", "dupspike", "ncontent",
+                "midbias"]
 DEFECT_LABEL = {"adapter": "Adapter", "qualtail": "Quality tail",
                 "gccontam": "GC contamination", "dupspike": "Duplicate spike",
                 "midbias": "Composition bias", "ncontent": "N block"}
@@ -320,6 +321,6 @@ with open(os.path.join(OUT, "table_assay_modules.tsv"), "w") as out:
         out.write(f"{a}\t{m}\t{v[0]}\t{v[1]}\t{v[2]}\n")
 with open(os.path.join(OUT, "table_assay_detection.tsv"), "w") as out:
     out.write("defect\tgeneric_detected\tprofile_detected\truns\n")
-    for d in DEFECT_ORDER + ["ncontent"]:
+    for d in DEFECT_ORDER:
         out.write(f"{d}\t{det[(d, 'generic')][0]}\t{det[(d, 'profile')][0]}"
                   f"\t{det[(d, 'generic')][1]}\n")
