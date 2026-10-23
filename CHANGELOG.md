@@ -27,6 +27,9 @@
   above 10, fail above 20 percentage points). `-b/--bisulfite` itself is
   unchanged. `--assay rrbs` also turns overrepresented-sequence failures into
   warnings, since RRBS samples the same MspI fragments by design.
+  `--assay emseq` leaves the first and last 10 read positions out of the
+  composition grade, as the Bismark documentation recommends clipping them
+  for NEB EM-seq libraries.
 
 ### Fixed
 

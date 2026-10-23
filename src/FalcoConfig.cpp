@@ -289,12 +289,14 @@ endswith(const std::string &fn, const std::string &extn) {
 //   chipseq  : peak pileups duplicate.
 //   wgbs/emseq/rrbs : bisulfite/EM conversion depletes C (or G) and shifts GC
 //              down; rrbs additionally has an MspI CGG/TGG motif in bases 1-3
-//              and samples the same MspI fragments repeatedly.
+//              and samples the same MspI fragments repeatedly; emseq has
+//              10 bp of end bias at both read ends.
 static const std::unordered_map<std::string, AssayProfile> assay_profiles = [] {
   std::unordered_map<std::string, AssayProfile> m;
   auto add = [&m](AssayProfile p) { m[p.name] = p; };
 
   // name, mask, suppress, methylation, relax_gc, downgrade_dup, downgrade_over
+  // [, mask_3p]
   add({"generic", 0, false, false, false, false, false});
   add({"wgs",     0, false, false, false, false, false});
   add({"exome",   0, false, false, true,  true,  false});
@@ -305,7 +307,9 @@ static const std::unordered_map<std::string, AssayProfile> assay_profiles = [] {
   add({"atac",    11, false, false, false, true,  false});
   add({"chipseq", 0, false, false, false, true,  false});
   add({"wgbs",    0, false, true,  true,  false, false});
-  add({"emseq",   0, false, true,  true,  false, false});
+  // EM-seq: 10 bp of composition bias at each read end (Bismark
+  // documentation, library types: --clip_R1 10 --three_prime_clip_R1 10)
+  add({"emseq",   10, false, true,  true,  false, false, 10});
   add({"rrbs",    3, false, true,  true,  true,  true});
   return m;
 }();
