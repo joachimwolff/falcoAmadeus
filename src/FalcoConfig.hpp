@@ -49,8 +49,9 @@ struct AssayProfile {
   // never warn/fail: composition is primer/adapter-locked and expected.
   bool suppress_per_base{false};
   // bisulfite/EM handling: C->T (Read1/OT) or G->A (Read2/OB) depletion is
-  // expected; grade only non-converted bases and soft-flag incomplete
-  // conversion (see kIncompleteConversionResidual).
+  // expected; each graded position is compared with the library's own mean
+  // composition (no genome-wide base balance assumed) and incomplete
+  // conversion is soft-flagged (see kIncompleteConversionResidual).
   bool methylation{false};
 
   // --- Per Sequence GC Content ---
@@ -61,6 +62,11 @@ struct AssayProfile {
 
   // --- Overrepresented Sequences ---
   bool downgrade_overrep{false};  // FAIL -> WARN (miRNAs/amplicons are signal)
+
+  // --- Per Base Sequence Content ---
+  // ignore this many trailing read positions when grading (3' end-repair /
+  // fill-in artifacts of methylation libraries)
+  std::size_t mask_3p{0};
 };
 
 // Residual unmethylated-C (or -G) fraction below which a bisulfite/EM library

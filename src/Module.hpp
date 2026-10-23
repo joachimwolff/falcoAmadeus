@@ -241,6 +241,8 @@ struct ModulePerBaseSequenceContent : public Module {
   double mean_c_frac{};
   double mean_g_frac{};
   double methyl_residual{};       // residual fraction of the depleted base
+  // methylation assays: mean A, C, T, G percent over the graded positions
+  double methyl_mean_pct[4]{};
   char methyl_depleted_base{'C'}; // 'C' for Read1/OT, 'G' for Read2/OB
 
   double sequence_error{};  // for grade

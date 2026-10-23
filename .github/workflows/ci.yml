@@ -52,6 +52,9 @@ jobs:
       - name: Per base N content grades
         run: test/n_content/run_n_content_tests.sh ./falcoAmadeus
 
+      - name: Methylation profile grades
+        run: test/assay/run_methylation_tests.sh ./falcoAmadeus
+
       - name: Show test log on failure
         if: failure()
         run: |

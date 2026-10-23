@@ -1293,6 +1293,27 @@ ModulePerBaseSequenceContent::summarize_module(FastqStats &stats) {
     is_reverse_complement = (mean_g_frac < mean_c_frac);  // G-depleted => OB/R2
     methyl_depleted_base = is_reverse_complement ? 'G' : 'C';
     methyl_residual = is_reverse_complement ? mean_g_frac : mean_c_frac;
+
+    // the library's mean composition (percent, N included in the total, as
+    // for the per-position values) over the graded positions
+    double g_tot[5] = {};
+    for (std::size_t i = assay.mask_per_base; i + assay.mask_3p < num_bases;
+         ++i) {
+      for (std::size_t b = 0; b < 4; ++b)
+        g_tot[b] +=
+          (i < FastqStats::SHORT_READ_THRESHOLD)
+            ? stats.base_count[(i << FastqStats::kBitShiftNucleotide) | b]
+            : stats.long_base_count[((i - FastqStats::SHORT_READ_THRESHOLD)
+                                     << FastqStats::kBitShiftNucleotide) | b];
+      g_tot[4] += (i < FastqStats::SHORT_READ_THRESHOLD)
+                    ? stats.n_base_count[i]
+                    : stats.long_n_base_count[i - FastqStats::SHORT_READ_THRESHOLD];
+    }
+    const double g_all = std::max(std::numeric_limits<double>::min(),
+                                  g_tot[0] + g_tot[1] + g_tot[2] + g_tot[3] +
+                                    g_tot[4]);
+    for (std::size_t b = 0; b < 4; ++b)
+      methyl_mean_pct[b] = 100.0 * g_tot[b] / g_all;
   }
 
   if (do_group) {
@@ -1356,8 +1377,18 @@ ModulePerBaseSequenceContent::summarize_module(FastqStats &stats) {
       // reported data table is unchanged; only max_diff (the grade input) is.
       // mask_per_base == 0 (generic) leaves this branch always taken, so the
       // default result is byte-identical.
-      if (i >= assay.mask_per_base) {
-        if (is_bisulfite) {
+      if (i >= assay.mask_per_base && i + assay.mask_3p < num_bases) {
+        if (assay.methylation) {
+          // deviation from the library's own mean composition; positions no
+          // read reaches carry no composition
+          if (total_pos > 0)
+            max_diff = std::max(
+              max_diff, std::max(std::max(std::fabs(a_pos - methyl_mean_pct[0]),
+                                          std::fabs(c_pos - methyl_mean_pct[1])),
+                                 std::max(std::fabs(t_pos - methyl_mean_pct[2]),
+                                          std::fabs(g_pos - methyl_mean_pct[3]))));
+        }
+        else if (is_bisulfite) {
           // for WGBS, we only test non-bisulfite treated bases
           max_diff =
             std::max(max_diff, is_reverse_complement ? std::fabs(c_pos - t_pos)
@@ -1400,10 +1431,10 @@ ModulePerBaseSequenceContent::make_grade() {
   const std::string tag = assay_tag(assay);
 
   if (assay.methylation) {
-    // The bisulfite-aware max_diff above already EXCLUDES the expected C->T (or
-    // G->A) depletion (it compares only non-converted bases), so a proper
-    // library grades PASS naturally. Annotate the expected depletion, then
-    // apply the incomplete-conversion heuristic.
+    // max_diff above measures each position against the library's own mean
+    // composition, so the expected C->T (or G->A) depletion does not count
+    // and a library of even composition grades PASS. Annotate the expected
+    // depletion, then apply the incomplete-conversion heuristic.
     const std::string role =
       is_reverse_complement ? "G->A Read2" : "C->T Read1";
     assay_annotations.push_back(

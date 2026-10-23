@@ -17,6 +17,17 @@
   unless the user sets it): 10-35% less CPU time at unchanged wall time; on
   an 8-CPU machine `-t 8` now uses 15% more CPU than `-t 1` (was 60%).
 
+- **Methylation profiles grade composition against the library itself.**
+  `--assay wgbs/emseq/rrbs` compared the two unconverted bases (A with G for
+  C-depleted reads, C with T for G-depleted reads), a rule taken from falco's
+  `--bisulfite`. These bases are not balanced in the genome (human: about
+  29.5 % A against 20.5 % G per strand), so a library without any defect sat
+  just below the warn limit and most public libraries warned. Each graded
+  position is now compared with the library's own mean composition (warn
+  above 10, fail above 20 percentage points). `-b/--bisulfite` itself is
+  unchanged. `--assay rrbs` also turns overrepresented-sequence failures into
+  warnings, since RRBS samples the same MspI fragments by design.
+
 ### Fixed
 
 - **Per base N content is graded.** Inherited from falco 1.x, the module
