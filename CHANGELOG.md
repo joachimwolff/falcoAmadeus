@@ -1,6 +1,6 @@
 # Changelog
 
-## FalcoAmadeus 4 (unreleased)
+## FalcoAmadeus 4
 
 ### Changed
 
