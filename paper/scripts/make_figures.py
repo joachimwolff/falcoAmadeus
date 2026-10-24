@@ -24,7 +24,7 @@ DATA, OUT = sys.argv[1], sys.argv[2]
 os.makedirs(OUT, exist_ok=True)
 
 plt.rcParams.update({
-    "font.family": "DejaVu Sans",
+    "font.family": "Liberation Sans",  # metric-compatible with Arial (PLOS)
     "font.size": 8,
     "axes.titlesize": 8,
     "axes.labelsize": 8,
