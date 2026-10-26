@@ -14,7 +14,9 @@ same() {  # dirA dirB [ignore-filename]
     diff <(grep -v '^Filename' "$1/fastqc_data.txt") \
          <(grep -v '^Filename' "$2/fastqc_data.txt") > /dev/null
   else
-    diff -q "$1/fastqc_data.txt" "$2/fastqc_data.txt" > /dev/null &&
+    # line 1 names the program version, which differs between builds
+    diff <(tail -n +2 "$1/fastqc_data.txt") <(tail -n +2 "$2/fastqc_data.txt") \
+      > /dev/null &&
       diff -q "$1/summary.txt" "$2/summary.txt" > /dev/null
   fi
 }
