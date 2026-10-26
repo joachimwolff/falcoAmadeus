@@ -30,6 +30,10 @@ expect unique "Paired-end exact" 0
 sim dup25 --pairs 1000 --dup 0.25 && run dup25
 expect dup25 "Paired-end exact" 25
 
+# copies read from the other strand (mates swapped) are the same fragment
+sim swap25 --pairs 1000 --dup 0.25 --swap-mates && run swap25
+expect swap25 "Paired-end exact" 25
+
 # exact rate must not depend on where the copies sit in the file
 for p in late early shuffled; do
   sim "o_$p" --pairs 200000 --dup 0.45 --placement "$p" && run "o_$p"

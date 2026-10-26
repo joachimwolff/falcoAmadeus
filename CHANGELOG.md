@@ -17,6 +17,13 @@
   unless the user sets it): 10-35% less CPU time at unchanged wall time; on
   an 8-CPU machine `-t 8` now uses 15% more CPU than `-t 1` (was 60%).
 
+- **Paired duplicates are counted in either mate order.** A fragment can
+  be sequenced from either strand, so its copies carry the mates as (a,b)
+  or (b,a); the pair key no longer depends on the order. On 10 million
+  HG002 pairs the paired duplicate rate on the pairs Picard MarkDuplicates
+  examines rose from 0.0039 % to 0.050 %; 98.8 % of these duplicates are
+  also Picard duplicates, and they make up 36 % of Picard's (the rest
+  differ by sequencing errors within the first 50 bases of a mate).
 - **Methylation profiles grade composition against the library itself.**
   `--assay wgbs/emseq/rrbs` compared the two unconverted bases (A with G for
   C-depleted reads, C with T for G-depleted reads), a rule taken from falco's

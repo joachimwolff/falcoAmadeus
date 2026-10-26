@@ -516,6 +516,16 @@ fp_finalize(std::uint64_t x) {  // splitmix64 finalizer
   return x;
 }
 
+// Key of a read pair from its mates' keys. A fragment can be read from either
+// strand, so its copies come with the mates in either order ((a,b) or
+// (b,a)); the key does not depend on the order.
+static inline std::uint64_t
+pair_key(const std::uint64_t a, const std::uint64_t b) {
+  const std::uint64_t lo = a < b ? a : b, hi = a < b ? b : a;
+  return fp_finalize(lo * 0x9e3779b97f4a7c15ULL ^
+                     fp_finalize(hi + 0x632be59bd9b4e019ULL));
+}
+
 // Decompressed byte source for the fingerprint scan: ISA-L inflate for gzip
 // input when available, zlib otherwise (gzread is transparent for plain
 // files), filling large blocks rather than reading line by line.
@@ -1174,8 +1184,8 @@ paired_duplication_report(FpView &k1, FpView &k2,
   const PairStats pstats = pairing_check(k1.size(), k2.size(), matching,
                                          r1_file, r2_file, allow_unmatched);
   const std::size_t num_pairs = pstats.pairs;
-  // Exact counts per mate and for the pair key: both truncated mates (an
-  // ordered combination, so (a,b) and (b,a) stay distinct), computed in place
+  // Exact counts per mate and for the pair key: both truncated mates in
+  // either order (pair_key), computed in place
   // over R1's keys once R1's own counts are done. The FastQC-style rates
   // (read order matters; mostly a serial prefix) run on helper threads
   // meanwhile, the pair's after the pair keys exist.
@@ -1204,8 +1214,7 @@ paired_duplication_report(FpView &k1, FpView &k2,
       const std::size_t hi = num_pairs * (t + 1) / nthreads;
       std::size_t *const h = &pair_groups.hist[t * B];
       zip_views(k1, k2, lo, hi, [h](std::uint64_t &a, const std::uint64_t b) {
-        a = fp_finalize(a * 0x9e3779b97f4a7c15ULL ^
-                        fp_finalize(b + 0x632be59bd9b4e019ULL));
+        a = pair_key(a, b);
         ++h[a >> (64 - FP_BUCKET_BITS)];
       });
       pair_groups.runs[t] = view_runs(k1, lo, hi);
@@ -1228,8 +1237,7 @@ paired_duplication_report(FpView &k1, FpView &k2,
       std::size_t j = 0;
       zip_views(k1, k2, 0, pre.size(),
                 [&](const std::uint64_t a, const std::uint64_t b) {
-                  pre[j++] = fp_finalize(a * 0x9e3779b97f4a7c15ULL ^
-                                         fp_finalize(b + 0x632be59bd9b4e019ULL));
+                  pre[j++] = pair_key(a, b);
                 });
       {
         std::lock_guard<std::mutex> lk(pm);
@@ -1291,7 +1299,8 @@ paired_duplication_report(FpView &k1, FpView &k2,
   os << "#Sequence duplicate rate (%): fraction of reads (pairs) that are "
         "additional copies of an earlier identical sequence. Sequences are "
         "keyed as in FastQC (reads longer than 75 bp on their first 50 bp). "
-        "A pair is a copy only when BOTH mates match. Counted exactly over all "
+        "A pair is a copy only when BOTH mates match, in either mate order "
+        "(the same fragment read from the other strand). Counted exactly over all "
         "reads; independent of read order. Reflects PCR duplication AND "
         "natural sequence redundancy (coverage depth, highly expressed or "
         "enriched loci).\n";

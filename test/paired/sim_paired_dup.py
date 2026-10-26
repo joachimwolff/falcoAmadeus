@@ -12,6 +12,8 @@ controlled to probe order dependence:
 
 Additional modes:
   --shared-r1    copies repeat R1 only; R2 is always new (true paired rate 0)
+  --swap-mates   copies carry the source's mates in swapped order (the same
+                 fragment read from the other strand; true rate still dup)
   --reorder-r2   shuffle the R2 records (mates no longer in matching order)
 
 Output is fully determined by the arguments and --seed.
@@ -36,6 +38,7 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--shared-r1", action="store_true")
     ap.add_argument("--reorder-r2", action="store_true")
+    ap.add_argument("--swap-mates", action="store_true")
     ap.add_argument("--prefix", required=True,
                     help="writes <prefix>_R1.fastq and <prefix>_R2.fastq")
     a = ap.parse_args()
@@ -49,7 +52,9 @@ def main():
 
     def copy_of(src):
         r1, r2 = distinct[src]
-        return (r1, rand_seq(rng, a.length)) if a.shared_r1 else (r1, r2)
+        if a.shared_r1:
+            return (r1, rand_seq(rng, a.length))
+        return (r2, r1) if a.swap_mates else (r1, r2)
 
     if a.placement == "late":
         pairs = distinct + [copy_of(s) for s in sources]
