@@ -46,7 +46,7 @@ for (h1, s1, _, _), (h2, s2, _, _) in zip(read_fastq(R1), read_fastq(R2)):
 keys = np.array(keys, dtype=np.uint64)
 n = len(keys)
 
-# pass 2: alignment state per mate (read index from the name SRR.N)
+# pass 2: alignment state per mate (pair index from the name p.N)
 mapq = np.zeros((2, n), dtype=np.uint8)
 mapped = np.zeros((2, n), dtype=bool)
 proper = np.zeros((2, n), dtype=bool)

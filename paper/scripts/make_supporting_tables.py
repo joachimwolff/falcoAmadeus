@@ -4,7 +4,8 @@
 Usage: make_supporting_tables.py <data_dir> <panels_dir> <out_dir>
   panels_dir holds table_se.tsv, table_pe.tsv, table_assay_modules.tsv and
   table_assay_detection.tsv written by make_figures.py; data_dir holds the
-  Picard comparison (picard_comparison.tsv, picard_set_mismatches.tsv).
+  Picard comparisons (picard_comparison_<set>.tsv,
+  picard_set_mismatches_<set>.tsv).
 """
 import csv
 import os
@@ -105,8 +106,8 @@ sheet(wb, "Injected defects",
 wb.save(os.path.join(OUT, "S3_Table.xlsx"))
 
 # S4 Table: paired duplicate rate against Picard MarkDuplicates
-cmp_rows = {r["metric"]: r["value"] for r in
-            tsv(os.path.join(DATA, "picard_comparison.tsv"))}
+SETS = [("hg002", "HG002 WGS (SRR12898355)"),
+        ("drr041223", "Mouse RNA-seq (DRR041223)")]
 CMP = [("pairs_total", "Read pairs"),
        ("pairs_compared", "Pairs compared (both mates primary, properly "
                           "paired, mapping quality >= 30)"),
@@ -118,16 +119,21 @@ CMP = [("pairs_total", "Read pairs"),
         "falcoAmadeus duplicates that are Picard duplicates (%)"),
        ("picard_flagged_with_sequence_partner_pct",
         "Picard duplicates with a sequence-identical pair (%)")]
+cmp_rows = {k: {r["metric"]: r["value"] for r in
+                tsv(os.path.join(DATA, f"picard_comparison_{k}.tsv"))}
+            for k, _ in SETS}
 wb = Workbook()
-sheet(wb, "Comparison", ["Measure", "Value"],
-      [[label, num(cmp_rows[k])] for k, label in CMP], first=True)
-mm = tsv(os.path.join(DATA, "picard_set_mismatches.tsv"))
-sheet(wb, "Picard duplicate sets",
-      ["Mismatching bases (first 50 bases of both mates)",
-       "Pairs, mate order", "Pairs (%), mate order",
-       "Pairs, either mate order", "Pairs (%), either mate order"],
-      [[r["mismatches"], num(r["pairs"]), num(r["pct"]),
-        num(r["pairs_either_order"]), num(r["pct_either_order"])]
-       for r in mm if r["mismatches"] not in ("length differs", "with_N",
-                                              "mates_swapped")])
+sheet(wb, "Comparison", ["Measure"] + [label for _, label in SETS],
+      [[label] + [num(cmp_rows[k][m]) for k, _ in SETS] for m, label in CMP],
+      first=True)
+for k, label in SETS:
+    mm = tsv(os.path.join(DATA, f"picard_set_mismatches_{k}.tsv"))
+    sheet(wb, f"Picard sets, {k}",
+          ["Mismatching bases (first 50 bases of both mates)",
+           "Pairs, mate order", "Pairs (%), mate order",
+           "Pairs, either mate order", "Pairs (%), either mate order"],
+          [[r["mismatches"], num(r["pairs"]), num(r["pct"]),
+            num(r["pairs_either_order"]), num(r["pct_either_order"])]
+           for r in mm if r["mismatches"] not in ("length differs", "with_N",
+                                                  "mates_swapped")])
 wb.save(os.path.join(OUT, "S4_Table.xlsx"))
