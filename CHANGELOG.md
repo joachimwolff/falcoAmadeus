@@ -17,6 +17,14 @@
   unless the user sets it): 10-35% less CPU time at unchanged wall time; on
   an 8-CPU machine `-t 8` now uses 15% more CPU than `-t 1` (was 60%).
 
+- **Kmer Content module: memory and speed.** With the module switched on,
+  every worker thread zeroed its own 65 MB k-mer table (2.2 GB at -t 32 on
+  29.9 million reads; falco 2.0.3 0.6 GB). The tables are now allocated as
+  untouched zero pages, so only the rows of the read positions in use take
+  memory (0.47 GB at -t 32). The fast per-base path, which the module
+  switched off for every read, now runs for all reads; the k-mers of the
+  sampled reads (every 50th) are counted in a separate pass with
+  prefetching, and single-range slices skip the record count pass.
 - **Paired duplicates are counted in either mate order.** A fragment can
   be sequenced from either strand, so its copies carry the mates as (a,b)
   or (b,a); the pair key no longer depends on the order. On 10 million

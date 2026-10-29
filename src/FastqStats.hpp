@@ -323,8 +323,35 @@ struct FastqStats {
   std::vector<size_t> long_cumulative_read_length_freq;
 
   /********** KMER FREQUENCY ****************/
-  // A (4^K + 1)*SHORT_READ_THRESHOLD std::vector to count all possible kmers
-  std::vector<size_t> kmer_count;
+  // Zero-initialised storage from calloc: a large table comes as untouched
+  // zero pages, so only the rows (read positions) that receive counts occupy
+  // memory, instead of every worker thread writing the whole table.
+  template <class T>
+  struct ZeroPageAlloc {
+    using value_type = T;
+    ZeroPageAlloc() = default;
+    template <class U>
+    ZeroPageAlloc(const ZeroPageAlloc<U> &) {}
+    T *allocate(std::size_t n) {
+      void *p = std::calloc(n, sizeof(T));
+      if (!p)
+        throw std::bad_alloc();
+      return static_cast<T *>(p);
+    }
+    void deallocate(T *p, std::size_t) { std::free(p); }
+    template <class U>
+    void construct(U *) noexcept {}  // calloc already zeroed it
+    template <class U, class... Args>
+    void construct(U *p, Args &&...args) {
+      ::new (static_cast<void *>(p)) U(std::forward<Args>(args)...);
+    }
+    template <class U>
+    bool operator==(const ZeroPageAlloc<U> &) const { return true; }
+    template <class U>
+    bool operator!=(const ZeroPageAlloc<U> &) const { return false; }
+  };
+  // A (4^K + 1)*SHORT_READ_THRESHOLD table to count all possible kmers
+  std::vector<size_t, ZeroPageAlloc<size_t>> kmer_count;
 
   // How many kmers were counted in each position
   std::array<size_t, SHORT_READ_THRESHOLD> pos_kmer_count;

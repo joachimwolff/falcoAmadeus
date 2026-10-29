@@ -78,20 +78,27 @@ jobs:
           EOF
 
           CONF="-l Configuration/limits.txt -a Configuration/adapter_list.txt -c Configuration/contaminant_list.txt"
+          # the same limits with the Kmer Content module switched on
+          sed 's/^kmer\([[:space:]]*\)ignore\([[:space:]]*\)1/kmer\1ignore\20/' \
+            Configuration/limits.txt > parity/limits_kmer.txt
+          grep -q '^kmer[[:space:]]*ignore[[:space:]]*0' parity/limits_kmer.txt
+          KCONF="-l parity/limits_kmer.txt -a Configuration/adapter_list.txt -c Configuration/contaminant_list.txt"
           fail=0
           for f in parity/*.fastq; do
             n=$(basename "$f" .fastq)
             gzip -kf "$f"
-            for case in t1 t8 gz; do
+            for case in t1 t8 gz kmer; do
+              conf=$CONF
               case $case in
                 t1) inp=$f;    fa_args="-t 1 --legacy-n-content-grade";;
                 t8) inp=$f;    fa_args="-t 8 --legacy-n-content-grade";;
                 gz) inp=$f.gz; fa_args="-t 8 --legacy-n-content-grade";;
+                kmer) inp=$f;  fa_args="-t 8 --legacy-n-content-grade"; conf=$KCONF;;
               esac
               rm -rf parity/out_f1 parity/out_fa
               mkdir -p parity/out_f1 parity/out_fa
-              ./falco-1.3.2/falco $CONF -o parity/out_f1 "$inp" > /dev/null 2>&1
-              ./falcoAmadeus  $CONF $fa_args -o parity/out_fa "$inp" > /dev/null 2>&1
+              ./falco-1.3.2/falco $conf -o parity/out_f1 "$inp" > /dev/null 2>&1
+              ./falcoAmadeus  $conf $fa_args -o parity/out_fa "$inp" > /dev/null 2>&1
               if ! diff <(python3 parity/canon.py parity/out_f1/fastqc_data.txt) \
                         <(python3 parity/canon.py parity/out_fa/fastqc_data.txt) > /dev/null \
                  || ! diff -q parity/out_f1/summary.txt parity/out_fa/summary.txt > /dev/null; then

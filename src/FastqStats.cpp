@@ -117,8 +117,7 @@ FastqStats::FastqStats(bool need_kmer) {
   // itself to master.kmer_count.size(), and the module -- hence every read of
   // kmer_count -- is skipped, so nothing indexes it).
   if (need_kmer)
-    kmer_count =
-      std::vector<size_t>(SHORT_READ_THRESHOLD * (Constants::kmer_mask + 1), 0);
+    kmer_count.resize(SHORT_READ_THRESHOLD * (Constants::kmer_mask + 1));
 }
 
 // GC models are built lazily per read length (see FastqStats.hpp).

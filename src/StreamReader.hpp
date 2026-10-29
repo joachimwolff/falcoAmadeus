@@ -375,6 +375,8 @@ class StreamReader{
   size_t cur_gc_count;  // Number of gc bases in read
   size_t cur_quality;  // Sum of quality values in read
   size_t num_bases_after_n;  // count of k-mers that reset at every N
+  // [FalcoAmadeus] table indices of a sampled read's k-mers (count_kmers)
+  std::vector<std::uint32_t> kmer_idx;
   size_t cur_kmer;  // 32-mer hash as you pass through the sequence line
 
   // variables for gc model

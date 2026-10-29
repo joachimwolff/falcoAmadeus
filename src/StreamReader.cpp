@@ -920,7 +920,11 @@ StreamReader::read_sequence_line(FastqStats &stats) {
 #else
   static const bool fa_simd = false;
 #endif
-  if (fa_simd && still_in_buffer && !do_kmer)
+  // k-mers of a read sampled for the k-mer module are counted after the
+  // loop (count_kmers below), so every read can take the fast path
+  const bool kmer_pass = do_kmer && do_kmer_read;
+  const std::size_t nba0 = nba, kmer0 = kmer;
+  if (fa_simd && still_in_buffer)
     seq_simd_chunks(stats, c, rp, bsz, sep, buf, gc, nba, kmer, next_trunc);
   for (; rp < bsz; ++c, ++rp) {
     const char ch = *c;
@@ -938,12 +942,6 @@ StreamReader::read_sequence_line(FastqStats &stats) {
 
       if (do_sliding_window) {
         kmer = (kmer << Constants::bit_shift_base) | two_bit;
-        if (do_kmer && do_kmer_read &&
-            (nba >= Constants::kmer_size)) {
-          ++stats.kmer_count[(rp << Constants::bit_shift_kmer) |
-                             (kmer & Constants::kmer_mask)];
-          ++stats.pos_kmer_count[rp];
-        }
         if (do_adapter_optimized && (nba == adapter_size)) {
           kmer &= adapter_mask;
           const std::size_t bmb = kmer & adapter_bm_mask;
@@ -967,6 +965,37 @@ StreamReader::read_sequence_line(FastqStats &stats) {
       truncated_gc_count = gc;
       truncated_length = rp;
       next_trunc += 100;
+    }
+  }
+  if (kmer_pass) {
+    // The k-mers of the read's first rp bases, as the per-base loop counts
+    // them: at every position with at least kmer_size bases since the read
+    // start or the last N (the run counter saturates at adapter_size). The
+    // table indices are collected first and the counts incremented with
+    // prefetching, so the cache misses of the large table overlap.
+    if (kmer_idx.size() < bsz)
+      kmer_idx.resize(bsz);
+    std::uint32_t *const idx = kmer_idx.data();
+    std::size_t m = 0, run = nba0, k = kmer0;
+    for (std::size_t p = 0; p < rp; ++p) {
+      const char ch = buf[p];
+      if (ch == 'N') {
+        run = 1;
+        continue;
+      }
+      k = (k << Constants::bit_shift_base) | ((ch >> 1) & 3);
+      if (run >= Constants::kmer_size)
+        idx[m++] = static_cast<std::uint32_t>(
+          (p << Constants::bit_shift_kmer) | (k & Constants::kmer_mask));
+      run += (run != adapter_size);
+    }
+    std::size_t *const kc = stats.kmer_count.data();
+    constexpr std::size_t AHEAD = 8;
+    for (std::size_t j = 0; j < m; ++j) {
+      if (j + AHEAD < m)
+        __builtin_prefetch(kc + idx[j + AHEAD], 1);
+      ++kc[idx[j]];
+      ++stats.pos_kmer_count[idx[j] >> Constants::bit_shift_kmer];
     }
   }
   // publish the locals back to the members
@@ -1832,8 +1861,13 @@ read_parallel_impl(FalcoConfig &config, FastqStats &master,
     add_arr(master.read_length_freq, ws.read_length_freq);
     add_arr(master.pos_kmer_count, ws.pos_kmer_count);
     add_arr(master.pos_adapter_count, ws.pos_adapter_count);
-    for (std::size_t i = 0; i < master.kmer_count.size(); ++i)
-      master.kmer_count[i] += ws.kmer_count[i];
+    {  // rows beyond the worker's longest read hold no counts
+      const std::size_t nk = std::min(
+        master.kmer_count.size(),
+        (ws.max_read_length + 1) << Constants::bit_shift_kmer);
+      for (std::size_t i = 0; i < nk; ++i)
+        master.kmer_count[i] += ws.kmer_count[i];
+    }
     master.total_bases += ws.total_bases;
     master.total_gc += ws.total_gc;
     master.empty_reads += ws.empty_reads;
@@ -2937,7 +2971,7 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
   // file that is not in the page cache), the slice consists of the records
   // that START before `lazy_end`, and the parse itself discovers where the
   // last of them ends. The duplication prefix applies the same rule, so both
-  // see the same records. Off when the K-mer count pass needs plimit early.
+  // see the same records.
   bool lazy = false;
   std::size_t lazy_end = 0;
   std::size_t rstep = 0;  // range stride within the current slice
@@ -3012,7 +3046,7 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
           if (end == size) {
             plimit = size;
           }
-          else if (nthreads == 1 && !need_g) {
+          else if (nthreads == 1) {
             lazy = true;
             lazy_end = end;
             plimit = size;  // parse bound; the slice end is set by the parse
@@ -3123,7 +3157,8 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
         break;
 
       // -- Phase 1, k-mer runs only: count records to know each range's g0 ----
-      if (need_g) {
+      // (a single range starts at the running total: no count pass)
+      if (need_g && nranges > 1) {
 #ifdef _OPENMP
 #pragma omp for schedule(dynamic)
 #endif
@@ -3168,7 +3203,8 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
         std::size_t p = bound(r);
         const std::size_t pend = bound(r + 1);
         const bool tail = !lazy && (plimit == size) && (pend == plimit);
-        std::size_t g = need_g ? gstart[r] : 0;  // g meaningful only for k-mer
+        // g meaningful only for k-mer
+        std::size_t g = need_g ? (nranges > 1 ? gstart[r] : total) : 0;
         std::size_t n = 0;
         std::size_t tdrop = p;
         const std::size_t DW = std::size_t(1) << 20;
@@ -3616,7 +3652,8 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
         break;
 
       // ---- Phase 1, k-mer runs only: count records for each range's g0 ------
-      if (need_g && nranges) {
+      // (a single range starts at the running total: no count pass)
+      if (need_g && nranges > 1) {
 #ifdef _OPENMP
 #pragma omp for schedule(dynamic)
 #endif
@@ -3681,7 +3718,8 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
         std::size_t p = sbound(r);
         const std::size_t pend = sbound(r + 1);
         const bool tail = eof && (pend == plimit);
-        std::size_t g = need_g ? gstart[r] : 0;  // g meaningful only for k-mer
+        // g meaningful only for k-mer
+        std::size_t g = need_g ? (nranges > 1 ? gstart[r] : total) : 0;
         std::size_t n = 0;
         // Deferred-by-one dup lookup (see read_bytesplit_core). Keys point
         // into `buf`, which stays valid until the next chunk switch, and the
