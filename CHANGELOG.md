@@ -40,7 +40,11 @@
 - **Long reads: faster tail past the 500-base buffer.** Bases and
   qualities beyond the first 500 positions went through per-base member
   calls with a dead copy of every base; they are now counted in one pass
-  over local variables (half the CPU time on 5-15 kb reads).
+  over local variables (half the CPU time on 5-15 kb reads). Their
+  qualities are counted in a compact 16-bit table, and the full long-read
+  quality table is allocated as zero pages and released per worker after
+  the merge (5-15 kb reads at -t 32: 20.8 -> 4.2 s CPU time, 0.56 -> 0.32
+  GB).
 - **Small inputs.** Small files are read with at most one thread per MB
   of input, the duplication tracker's slot table and the adapter position
   counts are allocated as untouched zero pages, and the overrepresented

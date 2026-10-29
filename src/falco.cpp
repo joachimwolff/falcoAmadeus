@@ -1895,8 +1895,7 @@ merge_mate_stats(FastqStats &comb, FastqStats &s2,
     for (std::size_t i = 0; i < dst.size(); ++i)
       dst[i] += src[i];
   };
-  auto add_vec = [](std::vector<std::size_t> &dst,
-                    const std::vector<std::size_t> &src) {
+  auto add_vec = [](auto &dst, const auto &src) {
     if (dst.size() < src.size())
       dst.resize(src.size(), 0);
     for (std::size_t i = 0; i < src.size(); ++i)

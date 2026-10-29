@@ -1191,7 +1191,13 @@ StreamReader::read_quality_line(FastqStats &stats) {
     const char *c = cur_char;
     std::size_t li = 0, rp = read_pos, cq = cur_quality;
     char lowest = stats.lowest_char;
-    std::size_t *const lpq = stats.long_position_quality_count.data();
+    // counted in the 16-bit long tile (see FastqStats::long_qual_tile); a
+    // read adds at most one to a counter, so flushing every 65535 reads
+    // keeps them in range
+    if (stats.long_qtile_reads == 65535)
+      stats.flush_qtile();
+    ++stats.long_qtile_reads;
+    std::uint16_t *const lpq = stats.long_qual_tile.data();
     for (; (*c != field_separator) && (*c != line_separator); ++c) {
       lowest = min8(lowest,
                     ((*c == 9) ? (std::numeric_limits<char>::max()) : (*c)));
@@ -1868,8 +1874,7 @@ read_parallel_impl(FalcoConfig &config, FastqStats &master,
     for (std::size_t i = 0; i < dst.size(); ++i)
       dst[i] += src[i];
   };
-  auto add_vec = [](std::vector<std::size_t> &dst,
-                    const std::vector<std::size_t> &src) {
+  auto add_vec = [](auto &dst, const auto &src) {
     if (dst.size() < src.size())
       dst.resize(src.size(), 0);
     for (std::size_t i = 0; i < src.size(); ++i)
@@ -1904,6 +1909,11 @@ read_parallel_impl(FalcoConfig &config, FastqStats &master,
     add_vec(master.long_position_quality_count, ws.long_position_quality_count);
     add_vec(master.long_read_length_freq, ws.long_read_length_freq);
     master.num_extra_bases = std::max(master.num_extra_bases, ws.num_extra_bases);
+    // a worker's long-read quality tables are merged: release them, so that
+    // at most one is resident during the merge
+    decltype(ws.long_position_quality_count)().swap(
+      ws.long_position_quality_count);
+    std::vector<std::uint16_t>().swap(ws.long_qual_tile);
   }
 
   // tile maps: create master vectors at the reconstructed lengths, then sum
@@ -2142,8 +2152,7 @@ merge_worker_stats(
     for (std::size_t i = 0; i < dst.size(); ++i)
       dst[i] += src[i];
   };
-  auto add_vec = [](std::vector<std::size_t> &dst,
-                    const std::vector<std::size_t> &src) {
+  auto add_vec = [](auto &dst, const auto &src) {
     if (dst.size() < src.size())
       dst.resize(src.size(), 0);
     for (std::size_t i = 0; i < src.size(); ++i)
@@ -2171,6 +2180,11 @@ merge_worker_stats(
     add_vec(master.long_position_quality_count, ws.long_position_quality_count);
     add_vec(master.long_read_length_freq, ws.long_read_length_freq);
     master.num_extra_bases = std::max(master.num_extra_bases, ws.num_extra_bases);
+    // a worker's long-read quality tables are merged: release them, so that
+    // at most one is resident during the merge
+    decltype(ws.long_position_quality_count)().swap(
+      ws.long_position_quality_count);
+    std::vector<std::uint16_t>().swap(ws.long_qual_tile);
   }
 
   // ---- tile maps: reconstruct lengths in global read order, then sum ----

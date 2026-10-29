@@ -81,6 +81,12 @@ FastqStats::flush_qtile() {
       }
   }
   qual_tile_reads = 0;
+  for (std::size_t i = 0; i < long_qual_tile.size(); ++i)
+    if (long_qual_tile[i] != 0) {
+      long_position_quality_count[i] += long_qual_tile[i];
+      long_qual_tile[i] = 0;
+    }
+  long_qtile_reads = 0;
 }
 
 FastqStats::FastqStats(bool need_kmer) {
@@ -132,8 +138,11 @@ FastqStats::allocate_new_base(const bool ignore_tile) {
   long_n_base_count.push_back(0);
 
   // space for quality boxplot
+  // (resize: the zero-page storage is not written)
+  long_position_quality_count.resize(long_position_quality_count.size() +
+                                     kNumQualityValues);
   for (size_t i = 0; i < kNumQualityValues; ++i)
-    long_position_quality_count.push_back(0);
+    long_qual_tile.push_back(0);
 
   long_read_length_freq.push_back(0);
 

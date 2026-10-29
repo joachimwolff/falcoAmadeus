@@ -27,6 +27,7 @@
 #include <new>
 #include <cstring>
 #include <cstdlib>
+#include <type_traits>
 #include <cstdint>
 #include "FalcoConfig.hpp"
 // log of a power of two, to use in bit shifting for fast index acces
@@ -122,6 +123,41 @@ struct GCModel {
 /*************************************************************
  ******************** FASTQ STATS ****************************
  *************************************************************/
+
+// [FalcoAmadeus] Allocator for zero-initialised storage from calloc: a large
+// block comes as untouched zero pages, and zero values are not written (also
+// when the vector grows and copies its elements), so only the entries that
+// receive counts occupy memory.
+template <class T>
+struct ZeroPageAlloc {
+  using value_type = T;
+  ZeroPageAlloc() = default;
+  template <class U>
+  ZeroPageAlloc(const ZeroPageAlloc<U> &) {}
+  T *allocate(std::size_t n) {
+    void *p = std::calloc(n, sizeof(T));
+    if (!p)
+      throw std::bad_alloc();
+    return static_cast<T *>(p);
+  }
+  void deallocate(T *p, std::size_t) { std::free(p); }
+  template <class U>
+  void construct(U *) noexcept {}  // calloc already zeroed it
+  template <class U, class V>
+  void construct(U *p, V &&v) {
+    if constexpr (std::is_arithmetic<U>::value) {
+      if (v != 0)  // the storage is zero already
+        *p = static_cast<U>(v);
+    }
+    else {
+      ::new (static_cast<void *>(p)) U(std::forward<V>(v));
+    }
+  }
+  template <class U>
+  bool operator==(const ZeroPageAlloc<U> &) const { return true; }
+  template <class U>
+  bool operator!=(const ZeroPageAlloc<U> &) const { return false; }
+};
 
 // [FalcoAmadeus] Fixed-size zero-initialised array in calloc'd storage.
 // Large calloc blocks come from fresh zero pages, so the parts a run never
@@ -295,6 +331,12 @@ struct FastqStats {
   // fully flushed before any read.
   ZeroedArray<std::uint16_t, kNumQualityValues * SHORT_READ_THRESHOLD> qual_tile;
   std::uint32_t qual_tile_reads;  // reads accumulated since the last flush
+  // The same for the positions past SHORT_READ_THRESHOLD of long reads
+  // (position-major, kNumQualityValues counters per position, grown with
+  // allocate_new_base): the full long table is 1 KB per position, so with
+  // many threads its rows no longer fit in the cache.
+  std::vector<std::uint16_t> long_qual_tile;
+  std::uint32_t long_qtile_reads = 0;  // long reads since the last flush
   static const std::uint32_t kQualTileFlushReads = 60000;
   void flush_qtile();  // fold qual_tile into position_quality_count
 
@@ -318,7 +360,7 @@ struct FastqStats {
   // Leftover memory using dynamic allocation
   std::vector<size_t> long_base_count;
   std::vector<size_t> long_n_base_count;
-  std::vector<size_t> long_position_quality_count;
+  std::vector<size_t, ZeroPageAlloc<size_t>> long_position_quality_count;
   std::vector<size_t> long_read_length_freq;
   std::vector<size_t> long_cumulative_read_length_freq;
 
@@ -326,30 +368,6 @@ struct FastqStats {
   // Zero-initialised storage from calloc: a large table comes as untouched
   // zero pages, so only the rows (read positions) that receive counts occupy
   // memory, instead of every worker thread writing the whole table.
-  template <class T>
-  struct ZeroPageAlloc {
-    using value_type = T;
-    ZeroPageAlloc() = default;
-    template <class U>
-    ZeroPageAlloc(const ZeroPageAlloc<U> &) {}
-    T *allocate(std::size_t n) {
-      void *p = std::calloc(n, sizeof(T));
-      if (!p)
-        throw std::bad_alloc();
-      return static_cast<T *>(p);
-    }
-    void deallocate(T *p, std::size_t) { std::free(p); }
-    template <class U>
-    void construct(U *) noexcept {}  // calloc already zeroed it
-    template <class U, class... Args>
-    void construct(U *p, Args &&...args) {
-      ::new (static_cast<void *>(p)) U(std::forward<Args>(args)...);
-    }
-    template <class U>
-    bool operator==(const ZeroPageAlloc<U> &) const { return true; }
-    template <class U>
-    bool operator!=(const ZeroPageAlloc<U> &) const { return false; }
-  };
   // A (4^K + 1)*SHORT_READ_THRESHOLD table to count all possible kmers
   std::vector<size_t, ZeroPageAlloc<size_t>> kmer_count;
 
