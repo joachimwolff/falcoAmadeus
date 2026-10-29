@@ -332,6 +332,8 @@ class StreamReader{
   const std::vector<std::string> adapter_seqs;
 
   const size_t num_adapters;
+  // adapter lists up to this size are matched eight windows at a time
+  static constexpr std::size_t kVecAdapters = 16;
   const size_t adapter_size;
   const size_t adapter_mask;
   const std::array<size_t, Constants::max_adapters> adapters;

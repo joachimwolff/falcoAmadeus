@@ -543,7 +543,7 @@ StreamReader::postprocess_sequence_line(FastqStats &stats) {
 // so every edge case keeps exact serial semantics. Only used when do_kmer is off.
 // Both back ends are byte-identical by construction (identical integer math).
 #if defined(__x86_64__) || defined(__i386__)
-__attribute__((target("avx512f,avx512bw,avx512vl,bmi2")))
+__attribute__((target("avx512f,avx512bw,avx512vl,bmi2,popcnt")))
 void
 StreamReader::seq_simd_chunks(FastqStats &stats, const char *&c, std::size_t &rp,
     std::size_t bsz, char sep, char *buf, std::size_t &gc, std::size_t &nba,
@@ -552,7 +552,7 @@ StreamReader::seq_simd_chunks(FastqStats &stats, const char *&c, std::size_t &rp
   const __m512i vN = _mm512_set1_epi8('N');
   const __m512i v3 = _mm512_set1_epi8(3);
   const __m512i v1 = _mm512_set1_epi8(1);
-  const __m512i vzero = _mm512_setzero_si512();
+  const __m512i v2 = _mm512_set1_epi8(2);
   // Base composition goes into the 2 KB uint8 tile (same SoA layout as
   // soa_base): one masked byte-add per code per block instead of four uint32
   // sub-vector RMWs per code. Folded into soa_base by flush_tile8() -- see the
@@ -578,20 +578,22 @@ StreamReader::seq_simd_chunks(FastqStats &stats, const char *&c, std::size_t &rp
       break;  // 'N' before the separator: scalar path keeps exact semantics
     _mm512_mask_storeu_epi8(buf + rp, valid, v);
     const __m512i t = _mm512_and_si512(_mm512_srli_epi16(v, 1), v3);
-    const __m512i tgc = _mm512_maskz_mov_epi8(valid, _mm512_and_si512(t, v1));
+    // G/C lanes: the low bit of the two-bit code, i.e. bit 1 of the byte;
+    // counted with a popcount instead of a byte sum and vector reduction
+    const __mmask64 mgc = _mm512_test_epi8_mask(v, v2) & valid;
     // GC truncation point inside this block's lanes (at most one: the step is
     // 100 > 64). The scalar loop captures gc AFTER adding the base at index
     // next_trunc, so the prefix mask is inclusive of that lane.
     if (do_gc_sequence && next_trunc < rp + mlen) {
       const unsigned L = static_cast<unsigned>(next_trunc - rp);  // < mlen <= 64
-      const __mmask64 pm = (static_cast<__mmask64>(1) << (L + 1)) - 1;
+      const __mmask64 pm = (L == 63) ? ~static_cast<__mmask64>(0)
+                                     : ((static_cast<__mmask64>(1) << (L + 1)) - 1);
       truncated_gc_count =
-          gc + _mm512_reduce_add_epi64(
-                   _mm512_sad_epu8(_mm512_maskz_mov_epi8(pm, tgc), vzero));
+          gc + static_cast<std::size_t>(__builtin_popcountll(mgc & pm));
       truncated_length = next_trunc;
       next_trunc += 100;
     }
-    gc += _mm512_reduce_add_epi64(_mm512_sad_epu8(tgc, vzero));
+    gc += static_cast<std::size_t>(__builtin_popcountll(mgc));
     for (int code = 0; code < 4; ++code) {
       const __mmask64 m =
           _mm512_cmpeq_epi8_mask(t, _mm512_set1_epi8(code)) & valid;
@@ -626,7 +628,14 @@ StreamReader::seq_simd_chunks(FastqStats &stats, const char *&c, std::size_t &rp
     const std::size_t asz = adapter_size;
     std::size_t k = kmer, nb = nba;
     std::size_t i = rp0;
-    // warm-up: until the window fills (nba saturates), at most adapter_size
+    // warm-up: until the window fills (nba saturates), at most adapter_size.
+    // Eight bases at a time while at least eight remain to fill: eight steps
+    // of the unmasked k = (k << 2) | code are k << 16 | (the eight codes).
+    for (; i + 8 <= rp && nb + 8 <= asz; i += 8, nb += 8) {
+      std::uint64_t w;
+      std::memcpy(&w, buf + i, 8);
+      k = (k << 16) | _pext_u64(__builtin_bswap64(w), 0x0606060606060606ULL);
+    }
     for (; i < rp && nb != asz; ++i) {
       k = (k << Constants::bit_shift_base) |
           (static_cast<std::size_t>(buf[i] >> 1) & 3);
@@ -656,6 +665,44 @@ StreamReader::seq_simd_chunks(FastqStats &stats, const char *&c, std::size_t &rp
             }
         }
       };
+      // With a few adapters the eight windows of a group are formed in one
+      // vector and compared with every adapter; only a group holding a match
+      // runs the probes above, in position order, so the counts and
+      // adapters_found evolve exactly as when every base is probed (a probe
+      // changes state only on an exact match).
+      if (nad <= kVecAdapters) {
+        const __m512i shl = _mm512_setr_epi64(2, 4, 6, 8, 10, 12, 14, 16);
+        const __m512i shr = _mm512_setr_epi64(14, 12, 10, 8, 6, 4, 2, 0);
+        const __m512i vam = _mm512_set1_epi64(static_cast<long long>(amask));
+        __m512i vad[kVecAdapters];
+        for (std::size_t a = 0; a != nad; ++a)
+          vad[a] = _mm512_set1_epi64(static_cast<long long>(ad[a]));
+        for (; i + 8 <= rp; i += 8) {
+          std::uint64_t w;
+          std::memcpy(&w, buf + i, 8);
+          const std::uint64_t g =
+              _pext_u64(__builtin_bswap64(w), 0x0606060606060606ULL);
+          const __m512i win = _mm512_and_si512(
+              _mm512_or_si512(
+                  _mm512_sllv_epi64(_mm512_set1_epi64(static_cast<long long>(k)), shl),
+                  _mm512_srlv_epi64(_mm512_set1_epi64(static_cast<long long>(g)), shr)),
+              vam);
+          __mmask8 hit = 0;
+          for (std::size_t a = 0; a != nad; ++a)
+            hit |= _mm512_cmpeq_epi64_mask(win, vad[a]);
+          if (hit) {
+            probe(((k << 2) | (g >> 14)) & amask, i);
+            probe(((k << 4) | (g >> 12)) & amask, i + 1);
+            probe(((k << 6) | (g >> 10)) & amask, i + 2);
+            probe(((k << 8) | (g >> 8)) & amask, i + 3);
+            probe(((k << 10) | (g >> 6)) & amask, i + 4);
+            probe(((k << 12) | (g >> 4)) & amask, i + 5);
+            probe(((k << 14) | (g >> 2)) & amask, i + 6);
+            probe(((k << 16) | g) & amask, i + 7);
+          }
+          k = (k << 16) | g;
+        }
+      }
       for (; i + 8 <= rp; i += 8) {
         std::uint64_t w;
         std::memcpy(&w, buf + i, 8);
@@ -839,11 +886,18 @@ StreamReader::qual_simd_chunks(FastqStats &stats, const char *&c,
       break;  // *c is now a separator; the caller's loop exits immediately
   }
   cq += bytesum - Constants::quality_zero * nbytes;
-  // fold the vector minimum into the running scalar minimum
-  alignas(64) char mb[64];
-  _mm512_store_si512(mb, vmin);
-  for (int i = 0; i < 64; ++i)
-    lowest = min8(lowest, mb[i]);
+  // fold the vector minimum into the running scalar minimum (a shuffle
+  // reduction: a 64-step scalar loop here cost more than a short read's
+  // whole quality line)
+  const __m256i m256 = _mm256_min_epi8(_mm512_castsi512_si256(vmin),
+                                       _mm512_extracti64x4_epi64(vmin, 1));
+  __m128i m = _mm_min_epi8(_mm256_castsi256_si128(m256),
+                           _mm256_extracti128_si256(m256, 1));
+  m = _mm_min_epi8(m, _mm_srli_si128(m, 8));
+  m = _mm_min_epi8(m, _mm_srli_si128(m, 4));
+  m = _mm_min_epi8(m, _mm_srli_si128(m, 2));
+  m = _mm_min_epi8(m, _mm_srli_si128(m, 1));
+  lowest = min8(lowest, static_cast<char>(_mm_cvtsi128_si32(m)));
 }
 #else
 void
