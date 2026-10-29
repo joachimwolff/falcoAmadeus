@@ -1431,7 +1431,36 @@ prepare_file_config(FalcoConfig &falco_config, const std::string &filename,
 }
 
 static void
+read_file_into_impl(FalcoConfig &falco_config, FastqStats &stats);
+
+// [FalcoAmadeus] Reads with at most one thread per MB of input (per 256 KB of
+// compressed input): a small file is parsed by fewer threads, which saves
+// their start-up and per-thread tables; the results do not depend on the
+// thread count.
+static void
 read_file_into(FalcoConfig &falco_config, FastqStats &stats) {
+  const std::size_t requested = falco_config.threads;
+  if (requested > 1 && falco_config.seekable_input) {
+    struct stat st;
+    if (stat(falco_config.filename.c_str(), &st) == 0 && st.st_size > 0) {
+      const bool packed = falco_config.is_fastq_gz || falco_config.is_bam;
+      const std::size_t per = packed ? (std::size_t(256) << 10)
+                                     : (std::size_t(1) << 20);
+      const std::size_t cap = std::max<std::size_t>(
+        1, static_cast<std::size_t>(st.st_size) / per);
+      falco_config.threads = std::min(requested, cap);
+    }
+  }
+  struct Restore {
+    FalcoConfig &c;
+    std::size_t t;
+    ~Restore() { c.threads = t; }
+  } restore{falco_config, requested};
+  read_file_into_impl(falco_config, stats);
+}
+
+static void
+read_file_into_impl(FalcoConfig &falco_config, FastqStats &stats) {
   if (!falco_config.quiet)
     log_process("Started reading file " + falco_config.filename);
 
