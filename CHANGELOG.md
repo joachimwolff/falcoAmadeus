@@ -36,6 +36,10 @@
   through the chunked parallel parser with 16 MB chunks. A last record
   without a final newline is now read as from a file (the serial reader
   lost its sequence).
+- **Long reads: faster tail past the 500-base buffer.** Bases and
+  qualities beyond the first 500 positions went through per-base member
+  calls with a dead copy of every base; they are now counted in one pass
+  over local variables (half the CPU time on 5-15 kb reads).
 - **Paired duplicates are counted in either mate order.** A fragment can
   be sequenced from either strand, so its copies carry the mates as (a,b)
   or (b,a); the pair key no longer depends on the order. On 10 million

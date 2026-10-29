@@ -1009,28 +1009,45 @@ StreamReader::read_sequence_line(FastqStats &stats) {
   // Slow tail: only entered when the read is longer than the static buffer.
   if (*cur_char != field_separator) {
     still_in_buffer = false;
-    leftover_ind = 0;
-    for (; *cur_char != field_separator; ++cur_char, ++read_pos) {
-      // Make sure we have memory space to process new base
-      if (leftover_ind == stats.num_extra_bases) {
-        stats.allocate_new_base(tile_ignore);
+    // [FalcoAmadeus] the bases past the buffer in one pass over locals: the
+    // per-position tables are grown once to the read's length, and each base
+    // is counted as process_sequence_base_from_leftover counts it (no k-mers
+    // past the buffer). The leftover copy of the bases is read only by the
+    // BAM reader, which fills its own, so it is not written here.
+    const char *const c0 = cur_char;
+    std::size_t len = 0;
+    while (c0[len] != field_separator)
+      ++len;
+    while (stats.num_extra_bases < len)
+      stats.allocate_new_base(tile_ignore);
+    std::size_t *const lbc = stats.long_base_count.data();
+    std::size_t *const lnc = stats.long_n_base_count.data();
+    std::size_t g = cur_gc_count, nt = next_truncation, rp0 = read_pos;
+    for (std::size_t i = 0; i < len; ++i) {
+      const char ch = c0[i];
+      if (ch == 'N') {
+        ++lnc[i];
+        num_bases_after_n = 1;  // start over the current kmer
       }
-
-      // puts base either on buffer or leftover
-      put_base_in_buffer();
-
-      process_sequence_base_from_leftover(stats);
-
-      // Increase leftover pos if no longer in buffer
-      ++leftover_ind;
-
+      else {
+        const auto two_bit = actg_to_2bit(ch);
+        g += (two_bit & 1);
+        ++lbc[(i << Constants::bit_shift_base) | two_bit];
+      }
       // Truncate GC counts to multiples of 100
-      if (do_gc_sequence && read_pos == next_truncation) {
-        truncated_gc_count = cur_gc_count;
-        truncated_length = read_pos;
-        next_truncation += 100;
+      if (do_gc_sequence && rp0 + i == nt) {
+        truncated_gc_count = g;
+        truncated_length = rp0 + i;
+        nt += 100;
       }
     }
+    if (len)
+      base_from_buffer = c0[len - 1];
+    cur_gc_count = g;
+    next_truncation = nt;
+    leftover_ind = len;
+    read_pos = rp0 + len;
+    cur_char = const_cast<char *>(c0 + len);
   }
 
   // statistics summarized after the read
@@ -1169,25 +1186,33 @@ StreamReader::read_quality_line(FastqStats &stats) {
       (*cur_char != line_separator)) {
     still_in_buffer = false;
     leftover_ind = 0;
-    for (; (*cur_char != field_separator) && (*cur_char != line_separator);
-         ++cur_char) {
-      // update lowest quality
-      stats.lowest_char = min8(
-        stats.lowest_char,
-        ((*cur_char == 9) ? (std::numeric_limits<char>::max()) : (*cur_char)));
-
-      // Converts quality ascii to zero-based
-      quality_value = *cur_char - Constants::quality_zero;
-
-      process_quality_base_from_leftover(stats);
-      ++leftover_ind;
-
-      // Sums quality value so we can bin the average at the end
-      cur_quality += quality_value;
-
-      // Flag to start reading and writing outside of buffer
-      ++read_pos;
+    // [FalcoAmadeus] the qualities past the buffer over locals, counted as
+    // process_quality_base_from_leftover counts them
+    const char *c = cur_char;
+    std::size_t li = 0, rp = read_pos, cq = cur_quality;
+    char lowest = stats.lowest_char;
+    std::size_t *const lpq = stats.long_position_quality_count.data();
+    for (; (*c != field_separator) && (*c != line_separator); ++c) {
+      lowest = min8(lowest,
+                    ((*c == 9) ? (std::numeric_limits<char>::max()) : (*c)));
+      const std::size_t qv =
+        static_cast<std::size_t>(*c - Constants::quality_zero);
+      ++lpq[(li << Constants::bit_shift_quality) | qv];
+      if (do_tile_quality) {
+        (*cur_tile_quality)[rp] += qv;
+        ++(*cur_tile_count)[rp];
+      }
+      ++li;
+      cq += qv;
+      ++rp;
     }
+    if (li)
+      quality_value = static_cast<std::size_t>(*(c - 1) - Constants::quality_zero);
+    stats.lowest_char = lowest;
+    leftover_ind = li;
+    read_pos = rp;
+    cur_quality = cq;
+    cur_char = const_cast<char *>(c);
   }
 
   // Average quality approximated to the nearest integer. Used to make a
