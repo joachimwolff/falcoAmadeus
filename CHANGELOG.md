@@ -25,11 +25,12 @@
   switched off for every read, now runs for all reads; the k-mers of the
   sampled reads (every 50th) are counted in a separate pass with
   prefetching, and single-range slices skip the record count pass.
-- **Read names with tile numbers use the sliced driver.** Per-tile quality
-  forced the whole-buffer driver, which keeps one record per read: on 10
-  million Illumina-named reads it lost to falco 2.0.3 on time. The tile
-  reads and the tile vector lengths are now reconstructed slice by slice
-  in file order, with memory bounded by the slice.
+- **Read names with tile numbers use the chunked drivers.** Per-tile
+  quality forced the whole-buffer driver (plain FASTQ, SAM) or the serial
+  dispatcher (gzip FASTQ): on 10 million Illumina-named reads falcoAmadeus
+  lost to falco 2.0.3 on time, and on gzip also on memory. The tile reads
+  and the tile vector lengths are now reconstructed chunk by chunk in file
+  order, with memory bounded by the chunk.
 - **FASTQ from a pipe is parsed in parallel.** Piped or stdin FASTQ
   (`-f fastq -`) used the serial reader at every thread count (8 s at -t 8
   on 29.9 million reads against 4.5 s for falco 2.0.3); it now streams

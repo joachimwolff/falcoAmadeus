@@ -2832,6 +2832,81 @@ private:
   std::thread th_;
 };
 
+// [FalcoAmadeus] Per-tile quality in the chunked drivers. Every
+// num_reads_for_tile-th read in file order is a tile read, and a tile's
+// vectors get the longest read seen before the tile's first tile read,
+// extended by the tile's own tile reads (the whole-buffer driver's
+// reconstruction). Per range: the tile reads with the longest read before
+// them in the range, and the range's longest read (record, end_range); the
+// ranges are folded in order when their chunk closes (fold), and finish
+// builds the tile vectors and adds the workers' sums.
+class TileFold {
+ public:
+  explicit TileFold(std::size_t max_ranges)
+      : rtile_(max_ranges), rmax_(max_ranges, 0) {}
+  struct Range {
+    std::vector<std::uint32_t> recs;  // seqlen, tile, before (3 per read)
+    std::size_t lpmax = 0;            // longest read so far in the range
+    void record(std::size_t g, std::size_t seqlen, std::size_t tile) {
+      if (g % StreamReader::num_reads_for_tile == 0) {
+        recs.push_back(static_cast<std::uint32_t>(seqlen));
+        recs.push_back(static_cast<std::uint32_t>(tile));
+        recs.push_back(static_cast<std::uint32_t>(lpmax));
+      }
+      lpmax = std::max(lpmax, seqlen);
+    }
+  };
+  void end_range(std::size_t r, Range &tr) {
+    rtile_[r].swap(tr.recs);
+    rmax_[r] = tr.lpmax;
+  }
+  void fold(std::size_t nranges) {
+    for (std::size_t r = 0; r < nranges; ++r) {
+      const std::vector<std::uint32_t> &v = rtile_[r];
+      for (std::size_t k = 0; k + 2 < v.size(); k += 3) {
+        const std::size_t seqlen = v[k], tile = v[k + 1];
+        const std::size_t before = std::max<std::size_t>(maxlen_, v[k + 2]);
+        if (len_.find(tile) == len_.end())
+          len_[tile] = before;  // length at first sight
+        if (tile != 0)
+          len_[tile] = std::max<std::size_t>(len_[tile], seqlen);
+      }
+      maxlen_ = std::max(maxlen_, rmax_[r]);
+      rtile_[r].clear();
+    }
+  }
+  void finish(FalcoConfig &config, FastqStats &master,
+              std::vector<std::unique_ptr<FastqStats>> &wstats) {
+    config.do_tile = true;  // the merge assumed tile-less input
+    for (const auto &kv : len_) {
+      master.tile_position_quality[kv.first] =
+        std::vector<double>(kv.second, 0.0);
+      master.tile_position_count[kv.first] =
+        std::vector<std::size_t>(kv.second, 0);
+    }
+    for (auto &ws : wstats) {
+      for (const auto &kv : ws->tile_position_quality) {
+        auto &dst = master.tile_position_quality[kv.first];
+        const std::size_t lim = std::min(kv.second.size(), dst.size());
+        for (std::size_t i = 0; i < lim; ++i)
+          dst[i] += kv.second[i];
+      }
+      for (const auto &kv : ws->tile_position_count) {
+        auto &dst = master.tile_position_count[kv.first];
+        const std::size_t lim = std::min(kv.second.size(), dst.size());
+        for (std::size_t i = 0; i < lim; ++i)
+          dst[i] += kv.second[i];
+      }
+    }
+  }
+
+ private:
+  std::vector<std::vector<std::uint32_t>> rtile_;
+  std::vector<std::size_t> rmax_;
+  std::unordered_map<std::size_t, std::size_t> len_;
+  std::size_t maxlen_ = 0;
+};
+
 // [FalcoAmadeus] The duplication prefix (the reads up to the one that fills
 // the tracker with its 100,000th distinct key, in file order) of a parsed
 // buffer, computed in parallel: every range collects its distinct keys in
@@ -3067,23 +3142,11 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
   // shared per-slice state written inside `omp single` blocks; the implicit
   // barrier ending each single/for publishes the writes to all threads.
   GCReplayer replayer(master, R_MAX);
-  // Per-tile quality (tiled input): every num_reads_for_tile-th read in file
-  // order is a tile read, and a tile's vectors get the longest read length
-  // seen before the tile's first tile read, extended by the tile's own tile
-  // reads (the whole-buffer driver's reconstruction). Per range: the tile
-  // reads with the longest read before them in the range, and the range's
-  // longest read; folded in range order when the slice closes.
-  struct TileRec {
-    std::uint32_t seqlen, tile, before;
-  };
-  std::vector<std::vector<TileRec>> rtile(tile_ignore ? 0 : R_MAX);
+  TileFold tiles(tile_ignore ? 0 : R_MAX);  // per-tile quality (tiled input)
   // parallel duplication prefix when a slice has several ranges
   ParallelDupPrefix<P> pfx;
   bool par_pfx = false;
   std::size_t cur_sbytes = 0;
-  std::vector<std::size_t> rmax(tile_ignore ? 0 : R_MAX, 0);
-  std::unordered_map<std::size_t, std::size_t> tile_len;
-  std::size_t tile_maxlen = 0;
   // native paired mode (FASTQ only): per-read fingerprints and the combined
   // view's continuation, see PairedHooks
   PairedHooks *H = nullptr;
@@ -3221,19 +3284,7 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
             for (std::size_t r = 0; r < nranges; ++r)
               H->take_range(rspan[r]);
           if (!tile_ignore)
-            for (std::size_t r = 0; r < nranges; ++r) {
-              for (const TileRec &tr : rtile[r]) {
-                const std::size_t before =
-                  std::max<std::size_t>(tile_maxlen, tr.before);
-                if (tile_len.find(tr.tile) == tile_len.end())
-                  tile_len[tr.tile] = before;  // length at first sight
-                if (tr.tile != 0)
-                  tile_len[tr.tile] =
-                    std::max<std::size_t>(tile_len[tr.tile], tr.seqlen);
-              }
-              tile_maxlen = std::max(tile_maxlen, rmax[r]);
-              rtile[r].clear();
-            }
+            tiles.fold(nranges);
           // Replay + page drop both run on the replay thread while the next
           // slice parses: the replay reads only its GCRecords, and the pages
           // dropped are the fully parsed previous slice (nothing reads them
@@ -3427,8 +3478,7 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
         const bool tail = !lazy && (plimit == size) && (pend == plimit);
         // g meaningful only for k-mer and tile sampling
         std::size_t g = need_g ? (nranges > 1 ? gstart[r] : total) : 0;
-        std::vector<TileRec> trec;  // this range's tile reads
-        std::size_t lpmax = 0;      // longest read so far in the range
+        TileFold::Range trec;  // this range's tile reads
         std::size_t n = 0;
         std::size_t tdrop = p;
         const std::size_t DW = std::size_t(1) << 20;
@@ -3452,13 +3502,8 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
           gc.emplace_back(GCRecord{0, 0, 0});
           p = P::parse_one(w, ws, base, plimit, p, g, &gc.back(), tile_ignore,
                            tail, seqlen, tile_cur, key);
-          if (!tile_ignore) {
-            if (g % StreamReader::num_reads_for_tile == 0)
-              trec.push_back(TileRec{static_cast<std::uint32_t>(seqlen),
-                                     static_cast<std::uint32_t>(tile_cur),
-                                     static_cast<std::uint32_t>(lpmax)});
-            lpmax = std::max(lpmax, seqlen);
-          }
+          if (!tile_ignore)
+            trec.record(g, seqlen, tile_cur);
           ++g;
           ++n;
           std::uint64_t hk = 0;
@@ -3510,10 +3555,8 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
                             static_cast<std::uint32_t>(tid)};
           slabs[tid].used += n;
         }
-        if (!tile_ignore) {
-          rtile[r].swap(trec);
-          rmax[r] = lpmax;
-        }
+        if (!tile_ignore)
+          tiles.end_range(r, trec);
         counts[r] = n;  // == the count pass's value on well-formed input
         if (lazy)
           plimit = p;  // one thread, one range: the slice ends here
@@ -3540,30 +3583,8 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
   merge_worker_stats(config, master, nthreads, total, wstats, empty_gc, deltas,
                      tilerecs, gstart, count_dup_final,
                      /*tile_ignore=*/true, /*skip_gc=*/true);
-  if (!tile_ignore) {
-    // tile vectors at the reconstructed lengths, then the workers' sums
-    config.do_tile = true;  // the merge above assumed tile-less input
-    for (const auto &kv : tile_len) {
-      master.tile_position_quality[kv.first] =
-        std::vector<double>(kv.second, 0.0);
-      master.tile_position_count[kv.first] =
-        std::vector<std::size_t>(kv.second, 0);
-    }
-    for (std::size_t t = 0; t < nthreads; ++t) {
-      for (const auto &kv : wstats[t]->tile_position_quality) {
-        auto &dst = master.tile_position_quality[kv.first];
-        const std::size_t lim = std::min(kv.second.size(), dst.size());
-        for (std::size_t i = 0; i < lim; ++i)
-          dst[i] += kv.second[i];
-      }
-      for (const auto &kv : wstats[t]->tile_position_count) {
-        auto &dst = master.tile_position_count[kv.first];
-        const std::size_t lim = std::min(kv.second.size(), dst.size());
-        for (std::size_t i = 0; i < lim; ++i)
-          dst[i] += kv.second[i];
-      }
-    }
-  }
+  if (!tile_ignore)
+    tiles.finish(config, master, wstats);
   if (fa_times)
     std::fprintf(stderr,
                  "[FA_TIMES bytes] slices %zu  serial %.3f  parse %.3f  "
@@ -3646,7 +3667,9 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
   ParallelWorker cfg(config, BUF);
   const bool tile_ignore = cfg.tile_ignore;
   const bool do_hash = cfg.do_sequence_hash;
-  if (!tile_ignore) {  // tiled: cannot pre-scan a stream -> dispatcher
+  // Tiled input in native paired mode keeps the dispatcher (the combined
+  // view would need the tile reconstruction across both mates).
+  if (!tile_ignore && config.paired_hooks) {
     read_gz_parallel(config, master, nthreads);
     return;
   }
@@ -3686,7 +3709,7 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
   // comments there): no count pass unless the K-mer module needs the global
   // read index, a byte-offset duplication gate, the ordered GC replay on a
   // background thread, and one persistent parallel region.
-  const bool need_g = config.do_kmer;
+  const bool need_g = config.do_kmer || !tile_ignore;
   const std::size_t RANGE_BYTES = std::size_t(1) << 19;
   const std::size_t R_MAX = std::max<std::size_t>(
     nthreads, (FRONT + CHUNK + RANGE_BYTES - 1) / RANGE_BYTES);
@@ -3698,6 +3721,7 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
   auto nodrop = [](std::size_t, std::size_t) {};
 
   GCReplayer replayer(master, R_MAX);
+  TileFold tiles(tile_ignore ? 0 : R_MAX);  // per-tile quality (tiled input)
   // native paired mode: per-read fingerprints and the combined view's
   // continuation, see PairedHooks
   PairedHooks *const H = config.paired_hooks;
@@ -3798,6 +3822,8 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
             if (H)
               for (std::size_t r = 0; r < nranges; ++r)
                 H->take_range(rspan[r]);
+            if (!tile_ignore)
+              tiles.fold(nranges);
             replayer.submit(nranges);  // replays while this chunk parses
           }
           left = carry;
@@ -4012,6 +4038,7 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
         const bool tail = eof && (pend == plimit);
         // g meaningful only for k-mer
         std::size_t g = need_g ? (nranges > 1 ? gstart[r] : total) : 0;
+        TileFold::Range trec;  // this range's tile reads
         std::size_t n = 0;
         // Deferred-by-one dup lookup (see read_bytesplit_core). Keys point
         // into `buf`, which stays valid until the next chunk switch, and the
@@ -4033,6 +4060,8 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
           gc.emplace_back(GCRecord{0, 0, 0});
           p = FastqPolicy::parse_one(w, ws, buf, plimit, p, g, &gc.back(),
                                      tile_ignore, tail, seqlen, tile_cur, key);
+          if (!tile_ignore)
+            trec.record(g, seqlen, tile_cur);
           ++g;
           ++n;
           std::uint64_t hk = 0;
@@ -4080,6 +4109,8 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
                             static_cast<std::uint32_t>(tid)};
           slabs[tid].used += n;
         }
+        if (!tile_ignore)
+          tiles.end_range(r, trec);
         counts[r] = n;  // == the count pass's value on well-formed input
       }  // barrier: counts[] complete, next chunk produced
     }
@@ -4101,6 +4132,8 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
   merge_worker_stats(config, master, nthreads, total, wstats, empty_gc, deltas,
                      tilerecs, gstart, count_dup_final,
                      /*tile_ignore=*/true, /*skip_gc=*/true);
+  if (!tile_ignore)
+    tiles.finish(config, master, wstats);
 }
 #endif  // USE_ISAL || USE_RAPIDGZIP
 
