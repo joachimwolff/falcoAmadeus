@@ -1041,7 +1041,7 @@ void read_gz_chunked(FalcoConfig &config, FastqStats &master, size_t nthreads);
 
 // [FalcoAmadeus] Paired-end combined view: parse several FASTQ/FASTQ.gz files
 // as ONE stream (their concatenation), without writing a concatenated copy.
-// Supported for tile-less input when built with ISA-L; callers check
+// Supported when built with ISA-L (tiled input included); callers check
 // pooled_stream_supported() first and otherwise concatenate to a file.
 bool pooled_stream_supported(const FalcoConfig &config,
                              const std::string &first_file);

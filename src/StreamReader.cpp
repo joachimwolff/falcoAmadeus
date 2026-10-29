@@ -5036,12 +5036,11 @@ bool
 pooled_stream_supported(const FalcoConfig &config,
                         const std::string &first_file) {
 #if defined(USE_ISAL)
-  // The stream driver is tile-less (a stream cannot be pre-scanned for the
-  // per-tile module); tiled input must use a concatenated file instead.
-  FalcoConfig probe = config;
-  probe.filename = first_file;
-  ParallelWorker w(probe, FastqStats::SHORT_READ_THRESHOLD);
-  return w.tile_ignore;
+  // The stream driver reconstructs per-tile quality in stream order, so a
+  // pooled stream of tiled mates is analysed as their concatenation.
+  (void)config;
+  (void)first_file;
+  return true;
 #else
   (void)config;
   (void)first_file;

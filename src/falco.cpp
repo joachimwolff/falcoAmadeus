@@ -2749,7 +2749,9 @@ main(int argc, char *argv[]) {
           if (fused && pf.comb_ready && stream_pooled) {
             prepare_file_config(falco_config, pooled_in, forced_file_format,
                                 true, " (combined)", std::string{});
-            falco_config.do_tile = false;  // as the pooled read of tile-less input
+            // per-tile quality as the pooled read: kept for tiled mates
+            // (comb_tiles), off for tile-less input
+            falco_config.do_tile = falco_config.do_tile && pf.h2.comb_tiles;
             merge_mate_stats(*pf.s1, *pf.s2, pf.comb_gc, pf.h2.comb_counts,
                              &pf.h2);
             summarize_and_write(falco_config, *pf.s1, comb_dir,
