@@ -1521,6 +1521,12 @@ read_file_into(FalcoConfig &falco_config, FastqStats &stats) {
     else if (bytesplit_seek) {
       read_uncompressed_chunked(falco_config, stats, falco_config.threads);
     }
+    else if (falco_config.read_step == 1 && piped_fastq_supported()) {
+      // pipe/stdin: parallel parse of the streamed chunks (also at -t 1: the
+      // chunked parse reads a last record without a final newline as the
+      // file drivers do)
+      read_piped_fastq(falco_config, stats, falco_config.threads);
+    }
     else {
       FastqReader in(falco_config, stats.SHORT_READ_THRESHOLD);
       read_stream_into_stats(in, stats, falco_config);

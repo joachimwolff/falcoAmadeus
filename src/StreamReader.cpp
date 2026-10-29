@@ -4605,6 +4605,61 @@ class ChainedFastqSource {
 };
 #endif
 
+// Sequential reads of an uncompressed stream (pipe, stdin, FIFO).
+class FdFastqSource {
+ public:
+  explicit FdFastqSource(const std::string &path) {
+    fd_ = ::open(path.c_str(), O_RDONLY);
+    if (fd_ < 0)
+      throw std::runtime_error("Cannot open FASTQ file : " + path);
+  }
+  ~FdFastqSource() { ::close(fd_); }
+  FdFastqSource(const FdFastqSource &) = delete;
+  FdFastqSource &operator=(const FdFastqSource &) = delete;
+  size_t fill(char *out, size_t cap) {
+    size_t got = 0;
+    while (got < cap) {
+      const ssize_t n = ::read(fd_, out + got, cap - got);
+      if (n < 0) {
+        if (errno == EINTR)
+          continue;
+        throw std::runtime_error("read error in input stream");
+      }
+      if (n == 0)
+        break;
+      got += static_cast<size_t>(n);
+    }
+    return got;
+  }
+
+ private:
+  int fd_ = -1;
+};
+
+bool
+piped_fastq_supported() {
+#if defined(USE_ISAL) || defined(USE_RAPIDGZIP)
+  return true;
+#else
+  return false;
+#endif
+}
+
+void
+read_piped_fastq(FalcoConfig &config, FastqStats &master,
+                 std::size_t nthreads) {
+#if defined(USE_ISAL) || defined(USE_RAPIDGZIP)
+  FdFastqSource raw(config.filename);
+  SerialChunkSource<FdFastqSource> src(raw);
+  // a pipe delivers a few GB/s at most: small chunks keep the double buffer
+  // (and the memory) small without slowing the parse down
+  read_stream_fused(config, master, nthreads, src, std::size_t(16) << 20);
+#else
+  (void)config; (void)master; (void)nthreads;
+  throw std::runtime_error("piped FASTQ streaming requires ISA-L");
+#endif
+}
+
 bool
 pooled_stream_supported(const FalcoConfig &config,
                         const std::string &first_file) {

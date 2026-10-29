@@ -55,6 +55,9 @@ jobs:
       - name: Methylation profile grades
         run: test/assay/run_methylation_tests.sh ./falcoAmadeus
 
+      - name: FASTQ from a pipe
+        run: test/stdin/run_stdin_tests.sh ./falcoAmadeus
+
       - name: Show test log on failure
         if: failure()
         run: |

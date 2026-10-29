@@ -30,6 +30,12 @@
   million Illumina-named reads it lost to falco 2.0.3 on time. The tile
   reads and the tile vector lengths are now reconstructed slice by slice
   in file order, with memory bounded by the slice.
+- **FASTQ from a pipe is parsed in parallel.** Piped or stdin FASTQ
+  (`-f fastq -`) used the serial reader at every thread count (8 s at -t 8
+  on 29.9 million reads against 4.5 s for falco 2.0.3); it now streams
+  through the chunked parallel parser with 16 MB chunks. A last record
+  without a final newline is now read as from a file (the serial reader
+  lost its sequence).
 - **Paired duplicates are counted in either mate order.** A fragment can
   be sequenced from either strand, so its copies carry the mates as (a,b)
   or (b,a); the pair key no longer depends on the order. On 10 million

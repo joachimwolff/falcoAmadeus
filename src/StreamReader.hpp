@@ -1027,6 +1027,13 @@ void read_gz_chunked(FalcoConfig &config, FastqStats &master, size_t nthreads);
 // pooled_stream_supported() first and otherwise concatenate to a file.
 bool pooled_stream_supported(const FalcoConfig &config,
                              const std::string &first_file);
+// [FalcoAmadeus] Uncompressed FASTQ from a pipe or stdin, parsed in parallel
+// by the streaming driver (a pipe is never pre-scanned for tiles, so it is
+// tile-less). Needs ISA-L or rapidgzip builds (the streaming driver).
+bool piped_fastq_supported();
+void read_piped_fastq(FalcoConfig &config, FastqStats &master,
+                      std::size_t nthreads);
+
 void read_pooled_fastq(FalcoConfig &config, FastqStats &master,
                        size_t nthreads, const std::vector<std::string> &files);
 
