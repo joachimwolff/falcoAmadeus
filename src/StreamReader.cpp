@@ -3468,8 +3468,24 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
           // dropped are the fully parsed previous slice (nothing reads them
           // again), so neither touches state the parse phase uses.
           const std::size_t d_lo = dropped, d_hi = plimit;
-          replayer.submit(nranges,
-                          [&drop_range, d_lo, d_hi] { drop_range(d_lo, d_hi); });
+          if (nranges > 1 && can_drop) {
+            // the parse threads dropped their ranges' whole pages; what is
+            // left are the pages that straddle a range boundary
+            std::vector<std::size_t> edges(sync.begin() + 1,
+                                           sync.begin() + nranges);
+            replayer.submit(nranges, [&drop_range, PGSZ,
+                                      e = std::move(edges)] {
+              for (const std::size_t b : e) {
+                const std::size_t pg = b & ~(PGSZ - 1);
+                if (pg != b)
+                  drop_range(pg, pg + PGSZ);
+              }
+            });
+          }
+          else
+            replayer.submit(nranges, [&drop_range, d_lo, d_hi] {
+              drop_range(d_lo, d_hi);
+            });
           dropped = plimit;
           off = plimit;
           slice_open = false;
@@ -3653,6 +3669,7 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
         // qual_no_nl probe false -- exactly as if can_be_last were false.
         std::size_t p = bound(r);
         const std::size_t pend = bound(r + 1);
+        sync[r] = p;  // the range's start, for the slice's boundary pages
         const bool tail = !lazy && (plimit == size) && (pend == plimit);
         // g meaningful only for k-mer and tile sampling
         std::size_t g = need_g ? (nranges > 1 ? gstart[r] : total) : 0;
@@ -3740,6 +3757,13 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
                             static_cast<std::uint32_t>(tid)};
           slabs[tid].used += n;
         }
+        // [FalcoAmadeus] Drop the range's parsed pages here, on all threads:
+        // dropping each slice on the replay thread took as long as the GC
+        // replay itself and made that thread the bottleneck for short reads.
+        // Nothing reads them again (a neighbour's boundary probe that does
+        // faults them back in from the page cache).
+        if (nranges > 1)
+          drop_range(tdrop, pend);
         if (!tile_ignore)
           tiles.end_range(r, trec);
         if (comb_tiles)
