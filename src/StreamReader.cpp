@@ -2843,37 +2843,52 @@ private:
         after = std::move(after_);
       }
       // exact serial replay order: range 0's records in parse order, then
-      // range 1's, ... (same statements as the previous inline replay)
+      // range 1's, ... Each bin receives the same additions in the same order
+      // as with the per-read model loops; the bins live in locals for the job
+      // (bin 101 takes the flat models' padding, see flat()).
+      std::array<double, 102> acc, acc2;
+      std::copy(master_.gc_count.begin(), master_.gc_count.end(), acc.begin());
+      acc[101] = 0.0;
+      if (gc2_)
+        std::copy(gc2_, gc2_ + 101, acc2.begin());
+      acc2[101] = 0.0;
       for (std::size_t r = 0; r < nused; ++r) {
         const std::vector<GCRecord> &gc = bufs_[slot][r];
         if (gc2_) {  // both targets in one pass, each in read order
           for (const GCRecord &gr : gc) {
             if (gr.kind == 1) {
-              for (const auto &v : FastqStats::gc_models[gr.a].models[gr.b]) {
-                master_.gc_count[v.percent] += v.increment;
-                gc2_[v.percent] += v.increment;
+              const Flat &f = flat(gr.a);
+              const std::size_t o = static_cast<std::size_t>(gr.b) * f.k;
+              for (std::size_t j = 0; j < f.k; ++j) {
+                acc[f.pct[o + j]] += f.inc[o + j];
+                acc2[f.pct[o + j]] += f.inc[o + j];
               }
             }
             else if (gr.kind == 2) {
-              ++master_.gc_count[gr.a];
-              ++gc2_[gr.a];
+              acc[gr.a] += 1.0;
+              acc2[gr.a] += 1.0;
             }
           }
         }
         else {
           for (const GCRecord &gr : gc) {
             if (gr.kind == 1) {
-              for (const auto &v : FastqStats::gc_models[gr.a].models[gr.b])
-                master_.gc_count[v.percent] += v.increment;
+              const Flat &f = flat(gr.a);
+              const std::size_t o = static_cast<std::size_t>(gr.b) * f.k;
+              for (std::size_t j = 0; j < f.k; ++j)
+                acc[f.pct[o + j]] += f.inc[o + j];
             }
             else if (gr.kind == 2) {
-              ++master_.gc_count[gr.a];
+              acc[gr.a] += 1.0;
             }
           }
         }
         if (sink_)
           sink_->insert(sink_->end(), gc.begin(), gc.end());
       }
+      std::copy(acc.begin(), acc.begin() + 101, master_.gc_count.begin());
+      if (gc2_)
+        std::copy(acc2.begin(), acc2.begin() + 101, gc2_);
       if (after)
         after();  // e.g. drop the slice's pages, off the serial path
       {
@@ -2883,6 +2898,34 @@ private:
       }
     }
   }
+  // The GC models of one read length with every GC count padded to the same
+  // number of entries (the padding adds 0.0 to the scratch bin 101): the
+  // replay's inner loop then has a fixed trip count per read length instead
+  // of one that changes from read to read (a branch miss per read).
+  struct Flat {
+    std::size_t k = 0;
+    std::vector<std::uint8_t> pct;  // [gc count * k + j]
+    std::vector<double> inc;
+    bool built = false;
+  };
+  const Flat &flat(std::size_t len) {
+    Flat &f = flat_[len];
+    if (!f.built) {
+      const auto &models = FastqStats::gc_models[len].models;
+      for (const auto &m : models)
+        f.k = std::max(f.k, m.size());
+      f.pct.assign(models.size() * f.k, 101);
+      f.inc.assign(models.size() * f.k, 0.0);
+      for (std::size_t b = 0; b < models.size(); ++b)
+        for (std::size_t j = 0; j < models[b].size(); ++j) {
+          f.pct[b * f.k + j] = static_cast<std::uint8_t>(models[b][j].percent);
+          f.inc[b * f.k + j] = models[b][j].increment;
+        }
+      f.built = true;
+    }
+    return f;
+  }
+  std::array<Flat, FastqStats::SHORT_READ_THRESHOLD> flat_;
   FastqStats &master_;
   std::vector<GCRecord> *sink_ = nullptr;
   double *gc2_ = nullptr;

@@ -23,6 +23,7 @@
 
 #include "dup_hash_map.hpp"
 #include <array>
+#include <atomic>
 #include <mutex>
 #include <new>
 #include <cstring>
@@ -254,18 +255,23 @@ struct FastqStats {
   // Building all 500 lengths up front (~125k small vectors) cost ~9 ms at
   // every program start while a file typically has one or a few lengths.
   // Each length is built exactly once (call_once), so concurrent readers
-  // are safe and later lookups cost one atomic load.
+  // are safe; later lookups cost one acquire load (libstdc++'s call_once
+  // sets up thread-local state and calls into the library on every call,
+  // which dominated the serial GC replay of short reads).
   class GCModelTable {
    public:
     const GCModel &operator[](size_t len) const {
-      std::call_once(flags_[len], [this, len] {
-        models_[len] = GCModel(static_cast<int>(len));
-      });
+      if (!ready_[len].load(std::memory_order_acquire))
+        std::call_once(flags_[len], [this, len] {
+          models_[len] = GCModel(static_cast<int>(len));
+          ready_[len].store(true, std::memory_order_release);
+        });
       return models_[len];
     }
 
    private:
     mutable std::array<std::once_flag, SHORT_READ_THRESHOLD> flags_;
+    mutable std::array<std::atomic<bool>, SHORT_READ_THRESHOLD> ready_{};
     mutable std::array<GCModel, SHORT_READ_THRESHOLD> models_;
   };
   static const GCModelTable gc_models;
