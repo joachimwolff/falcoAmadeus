@@ -35,19 +35,10 @@ replace_tag(std::string &s, const std::string &tag, const std::string &rep) {
     s = std::regex_replace(s, std::regex("\\{\\{" + tag + "\\}\\}"), rep);
     return;
   }
-  std::string out;
-  out.reserve(s.size() + rep.size());
-  std::size_t from = 0;
+  // in place: the page is not copied once per tag
   for (std::size_t pos = s.find(lit); pos != std::string::npos;
-       pos = s.find(lit, from)) {
-    out.append(s, from, pos - from);
-    out.append(rep);
-    from = pos + lit.size();
-  }
-  if (from == 0)
-    return;  // no occurrence: leave the string untouched
-  out.append(s, from, std::string::npos);
-  s.swap(out);
+       pos = s.find(lit, pos + rep.size()))
+    s.replace(pos, lit.size(), rep);
 }
 
 void

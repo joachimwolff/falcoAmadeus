@@ -8,10 +8,11 @@
  *
  * This replacement stores entries contiguously and indexes them with an
  * open-addressing (linear-probing) slot table, so a lookup touches one cache
- * line of indices plus the entry. It is pre-sized to the fixed 100k-unique cap
- * (unique_reads_stop_counting), so it never rehashes and the entry storage
- * never reallocates -- pointers/iterators into it are therefore stable, which
- * the hot loop relies on. The counting semantics are identical to the previous
+ * line of indices plus the entry. The entry storage is reserved to the fixed
+ * 100k-unique cap (unique_reads_stop_counting), so it never reallocates --
+ * pointers/iterators into it are therefore stable, which the hot loop relies
+ * on. The slot table only re-indexes (when it doubles during inserts, which
+ * callers make from one thread while no other thread looks up). The counting semantics are identical to the previous
  * std::unordered_map usage, so the QC results are byte-for-byte unchanged.
  *
  * It exposes just the subset of the map interface the callers use: find(),
@@ -26,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <algorithm>
 #include <cstring>
 #include <memory>
 #include <new>
@@ -55,6 +57,16 @@ public:
   // return end() / no-op without allocating (an empty map contains nothing, so
   // "not found" is exactly the pre-lazy result).
   explicit DupHashMap(std::size_t cap = 100000) : cap_(cap) {}
+
+  // [FalcoAmadeus] An upper estimate of the number of keys (from the input
+  // size), given before the first insert: the slot table is sized for it
+  // instead of the full cap, so a small input touches a small table. A low
+  // estimate only costs a rehash (the table doubles at load 1/2; entries and
+  // keys stay in place, so iterators stay valid).
+  void expect(std::size_t n) {
+    if (!slots_)
+      hint_ = n;
+  }
 
   iterator begin() { return entries_.data(); }
   iterator end() { return entries_.data() + entries_.size(); }
@@ -120,13 +132,15 @@ public:
   // Insert a key known not to be present (callers only emplace after a failed
   // find, exactly as the previous unordered_map code did). All storage
   // allocates on first insert so the per-worker map instances, which only ever
-  // find() against the master map, never pay for it. Once allocated, the slot
-  // table never rehashes and entries_ (reserved to cap_ before the first
-  // element exists) never reallocates, so pointer/iterator stability -- which
-  // the hot loops rely on -- is exactly as before.
+  // find() against the master map, never pay for it. entries_ (reserved to
+  // cap_ before the first element exists) never reallocates, so
+  // pointer/iterator stability -- which the hot loops rely on -- is exactly as
+  // before; a doubling of the slot table moves only slot indices.
   void emplace(const char *p, std::size_t n, std::size_t value) {
     if (!slots_)
       allocate();
+    if ((entries_.size() + 1) * 2 > mask_ + 1)
+      grow();
     const std::uint64_t hh = hash_key(p, n);
     const std::uint32_t tag = (static_cast<std::uint32_t>(hh >> 56) | 1u) << 24;
     std::size_t h = static_cast<std::size_t>(hh) & mask_;
@@ -135,7 +149,7 @@ public:
     const std::size_t idx = entries_.size();
     slots_[h] = tag | static_cast<std::uint32_t>(idx + 1);
     std::memcpy(keys_.get() + idx * KSTRIDE, p, n);
-    klen_[idx] = static_cast<std::uint8_t>(n);
+    klen_.push_back(static_cast<std::uint8_t>(n));
     entries_.push_back(value_type{value});
   }
   void emplace(const std::string &key, std::size_t value) {
@@ -150,6 +164,8 @@ public:
                                             std::size_t value) {
     if (!slots_)
       allocate();
+    if ((entries_.size() + 1) * 2 > mask_ + 1)
+      grow();
     const std::uint64_t hh = hash_key(p, n);
     const std::uint32_t tag = (static_cast<std::uint32_t>(hh >> 56) | 1u) << 24;
     std::size_t h = static_cast<std::size_t>(hh) & mask_;
@@ -168,30 +184,47 @@ public:
     const std::size_t idx = entries_.size();
     slots_[h] = tag | static_cast<std::uint32_t>(idx + 1);
     std::memcpy(keys_.get() + idx * KSTRIDE, p, n);
-    klen_[idx] = static_cast<std::uint8_t>(n);
+    klen_.push_back(static_cast<std::uint8_t>(n));
     entries_.push_back(value_type{value});
     return {entries_.data() + idx, true};
   }
 
 private:
-  // Deferred constructor body: build the slot table (with its mask), reserve
-  // the entry storage and zero the shadow key store. Runs at most once, before
+  // Deferred constructor body: build the slot table (with its mask) and
+  // reserve the entry storage and the key lengths. Runs at most once, before
   // the first element is inserted.
   void allocate() {
-    std::size_t nslots = 1;
-    while (nslots < (cap_ << 2))
-      nslots <<= 1;  // >= 4x cap -> load factor < 0.25
+    const std::size_t keys = hint_ ? std::min(hint_, cap_) : cap_;
+    std::size_t nslots = 64;
+    while (nslots < (keys << 2))
+      nslots <<= 1;  // >= 4x the keys -> load factor < 0.25
+    new_slots(nslots);
+    entries_.reserve(cap_);
+    // written before it is read (a slot points to an entry only after its
+    // key bytes are stored), so it is left uninitialised
+    keys_.reset(new char[cap_ * KSTRIDE]);
+    klen_.reserve(cap_);
+  }
+  void new_slots(std::size_t nslots) {
     // calloc: zero pages, so only the slots in use occupy memory
     slots_.reset(static_cast<std::uint32_t *>(
       std::calloc(nslots, sizeof(std::uint32_t))));
     if (!slots_)
       throw std::bad_alloc();
     mask_ = nslots - 1;
-    entries_.reserve(cap_);
-    // written before it is read (a slot points to an entry only after its
-    // key bytes are stored), so it is left uninitialised
-    keys_.reset(new char[cap_ * KSTRIDE]);
-    klen_.assign(cap_, 0);
+  }
+  // double the slot table and re-index every entry (inserts only)
+  void grow() {
+    new_slots((mask_ + 1) << 1);
+    for (std::size_t idx = 0; idx < entries_.size(); ++idx) {
+      const std::uint64_t hh = hash_key(keys_.get() + idx * KSTRIDE, klen_[idx]);
+      const std::uint32_t tag =
+        (static_cast<std::uint32_t>(hh >> 56) | 1u) << 24;
+      std::size_t h = static_cast<std::size_t>(hh) & mask_;
+      while (slots_[h] != 0)
+        h = (h + 1) & mask_;
+      slots_[h] = tag | static_cast<std::uint32_t>(idx + 1);
+    }
   }
 
   static inline std::uint64_t mix(std::uint64_t x) {
@@ -278,6 +311,7 @@ private:
   std::vector<std::uint8_t> klen_;    // shadow key lengths
   std::size_t mask_ = 0;
   std::size_t cap_ = 0;
+  std::size_t hint_ = 0;  // expected keys, 0 = the cap
 };
 
 #endif

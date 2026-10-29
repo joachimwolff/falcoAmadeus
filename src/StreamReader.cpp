@@ -1987,9 +1987,12 @@ read_parallel_impl(FalcoConfig &config, FastqStats &master,
         (dmbegin + s)->second += deltas[t][s];
 
   // ---- merge worker accumulators into master ----
+  // zero counts are skipped: adding them would make every page of the
+  // (lazily zeroed) master tables resident
   auto add_arr = [](auto &dst, const auto &src) {
     for (std::size_t i = 0; i < dst.size(); ++i)
-      dst[i] += src[i];
+      if (src[i] != 0)
+        dst[i] += src[i];
   };
   auto add_vec = [](auto &dst, const auto &src) {
     if (dst.size() < src.size())
@@ -2259,9 +2262,12 @@ merge_worker_stats(
       }
     }
   }
+  // zero counts are skipped: adding them would make every page of the
+  // (lazily zeroed) master tables resident
   auto add_arr = [](auto &dst, const auto &src) {
     for (std::size_t i = 0; i < dst.size(); ++i)
-      dst[i] += src[i];
+      if (src[i] != 0)
+        dst[i] += src[i];
   };
   auto add_vec = [](auto &dst, const auto &src) {
     if (dst.size() < src.size())
@@ -2850,7 +2856,17 @@ public:
   // `after` (optional) runs on the replay thread once the replay is done --
   // used to push the slice's madvise(DONTNEED) off the serial path. It must
   // not touch master.gc_count readers' state or the parse buffers.
-  void submit(std::size_t nused, std::function<void()> after = {}) {
+  // `last`: no parse follows this submission, so when no replay thread was
+  // started (an input of one slice) the set is replayed here instead of
+  // starting one (its stack and malloc arena are memory a small input
+  // would otherwise pay for).
+  void submit(std::size_t nused, std::function<void()> after = {},
+              bool last = false) {
+    if (last && !th_.joinable()) {
+      replay_job(cur_, nused, after);
+      cur_ ^= 1;
+      return;
+    }
     std::unique_lock<std::mutex> lk(m_);
     cv_.wait(lk, [&] { return inflight_ < 0; });
     inflight_ = cur_;
@@ -2882,6 +2898,59 @@ public:
   }
 
 private:
+  // the replay of one parsed set, then its `after` hook
+  void replay_job(int slot, std::size_t nused,
+                  const std::function<void()> &after) {
+    // exact serial replay order: range 0's records in parse order, then
+    // range 1's, ... Each bin receives the same additions in the same order
+    // as with the per-read model loops; the bins live in locals for the job
+    // (bin 101 takes the flat models' padding, see flat()).
+    std::array<double, 102> acc, acc2;
+    std::copy(master_.gc_count.begin(), master_.gc_count.end(), acc.begin());
+    acc[101] = 0.0;
+    if (gc2_)
+      std::copy(gc2_, gc2_ + 101, acc2.begin());
+    acc2[101] = 0.0;
+    for (std::size_t r = 0; r < nused; ++r) {
+      const std::vector<GCRecord> &gc = bufs_[slot][r];
+      if (gc2_) {  // both targets in one pass, each in read order
+        for (const GCRecord &gr : gc) {
+          if (gr.kind == 1) {
+            const Flat &f = flat(gr.a);
+            const std::size_t o = static_cast<std::size_t>(gr.b) * f.k;
+            for (std::size_t j = 0; j < f.k; ++j) {
+              acc[f.pct[o + j]] += f.inc[o + j];
+              acc2[f.pct[o + j]] += f.inc[o + j];
+            }
+          }
+          else if (gr.kind == 2) {
+            acc[gr.a] += 1.0;
+            acc2[gr.a] += 1.0;
+          }
+        }
+      }
+      else {
+        for (const GCRecord &gr : gc) {
+          if (gr.kind == 1) {
+            const Flat &f = flat(gr.a);
+            const std::size_t o = static_cast<std::size_t>(gr.b) * f.k;
+            for (std::size_t j = 0; j < f.k; ++j)
+              acc[f.pct[o + j]] += f.inc[o + j];
+          }
+          else if (gr.kind == 2) {
+            acc[gr.a] += 1.0;
+          }
+        }
+      }
+      if (sink_)
+        sink_->insert(sink_->end(), gc.begin(), gc.end());
+    }
+    std::copy(acc.begin(), acc.begin() + 101, master_.gc_count.begin());
+    if (gc2_)
+      std::copy(acc2.begin(), acc2.begin() + 101, gc2_);
+    if (after)
+      after();  // e.g. drop the slice's pages, off the serial path
+  }
   void run() {
     for (;;) {
       int slot;
@@ -2896,55 +2965,7 @@ private:
         nused = inflight_n_;
         after = std::move(after_);
       }
-      // exact serial replay order: range 0's records in parse order, then
-      // range 1's, ... Each bin receives the same additions in the same order
-      // as with the per-read model loops; the bins live in locals for the job
-      // (bin 101 takes the flat models' padding, see flat()).
-      std::array<double, 102> acc, acc2;
-      std::copy(master_.gc_count.begin(), master_.gc_count.end(), acc.begin());
-      acc[101] = 0.0;
-      if (gc2_)
-        std::copy(gc2_, gc2_ + 101, acc2.begin());
-      acc2[101] = 0.0;
-      for (std::size_t r = 0; r < nused; ++r) {
-        const std::vector<GCRecord> &gc = bufs_[slot][r];
-        if (gc2_) {  // both targets in one pass, each in read order
-          for (const GCRecord &gr : gc) {
-            if (gr.kind == 1) {
-              const Flat &f = flat(gr.a);
-              const std::size_t o = static_cast<std::size_t>(gr.b) * f.k;
-              for (std::size_t j = 0; j < f.k; ++j) {
-                acc[f.pct[o + j]] += f.inc[o + j];
-                acc2[f.pct[o + j]] += f.inc[o + j];
-              }
-            }
-            else if (gr.kind == 2) {
-              acc[gr.a] += 1.0;
-              acc2[gr.a] += 1.0;
-            }
-          }
-        }
-        else {
-          for (const GCRecord &gr : gc) {
-            if (gr.kind == 1) {
-              const Flat &f = flat(gr.a);
-              const std::size_t o = static_cast<std::size_t>(gr.b) * f.k;
-              for (std::size_t j = 0; j < f.k; ++j)
-                acc[f.pct[o + j]] += f.inc[o + j];
-            }
-            else if (gr.kind == 2) {
-              acc[gr.a] += 1.0;
-            }
-          }
-        }
-        if (sink_)
-          sink_->insert(sink_->end(), gc.begin(), gc.end());
-      }
-      std::copy(acc.begin(), acc.begin() + 101, master_.gc_count.begin());
-      if (gc2_)
-        std::copy(acc2.begin(), acc2.begin() + 101, gc2_);
-      if (after)
-        after();  // e.g. drop the slice's pages, off the serial path
+      replay_job(slot, nused, after);
       {
         std::lock_guard<std::mutex> lk(m_);
         inflight_ = -1;
@@ -3522,6 +3543,7 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
           // dropped are the fully parsed previous slice (nothing reads them
           // again), so neither touches state the parse phase uses.
           const std::size_t d_lo = dropped, d_hi = plimit;
+          const bool last = (plimit == size);
           if (nranges > 1 && can_drop) {
             // the parse threads dropped their ranges' whole pages; what is
             // left are the pages that straddle a range boundary
@@ -3534,12 +3556,12 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
                 if (pg != b)
                   drop_range(pg, pg + PGSZ);
               }
-            });
+            }, last);
           }
           else
             replayer.submit(nranges, [&drop_range, d_lo, d_hi] {
               drop_range(d_lo, d_hi);
-            });
+            }, last);
           dropped = plimit;
           off = plimit;
           slice_open = false;

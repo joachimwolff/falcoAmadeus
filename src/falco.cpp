@@ -1436,18 +1436,21 @@ read_file_into_impl(FalcoConfig &falco_config, FastqStats &stats);
 // [FalcoAmadeus] Reads with at most one thread per MB of input (per 256 KB of
 // compressed input): a small file is parsed by fewer threads, which saves
 // their start-up and per-thread tables; the results do not depend on the
-// thread count.
+// thread count. The duplication tracker's slot table is sized for at most one
+// read per 64 bytes of input (eight times that for compressed input) instead
+// of the full 100k-sequence cap.
 static void
 read_file_into(FalcoConfig &falco_config, FastqStats &stats) {
   const std::size_t requested = falco_config.threads;
-  if (requested > 1 && falco_config.seekable_input) {
+  if (falco_config.seekable_input) {
     struct stat st;
     if (stat(falco_config.filename.c_str(), &st) == 0 && st.st_size > 0) {
       const bool packed = falco_config.is_fastq_gz || falco_config.is_bam;
+      const std::size_t size = static_cast<std::size_t>(st.st_size);
+      stats.sequence_count.expect((packed ? size * 8 : size) / 64 + 1);
       const std::size_t per = packed ? (std::size_t(256) << 10)
                                      : (std::size_t(1) << 20);
-      const std::size_t cap = std::max<std::size_t>(
-        1, static_cast<std::size_t>(st.st_size) / per);
+      const std::size_t cap = std::max<std::size_t>(1, size / per);
       falco_config.threads = std::min(requested, cap);
     }
   }
