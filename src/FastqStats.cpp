@@ -69,7 +69,7 @@ FastqStats::flush_tile8() {
 // FastqStats.hpp comment for the flush-point / overflow invariants). Addition
 // commutes, so the result is byte-identical to the direct scatter.
 void
-FastqStats::flush_qtile() {
+FastqStats::flush_qtile(const bool with_long) {
   // Only nonzero tile entries are folded and cleared: adding or storing a
   // zero would dirty (and make resident) every page of both tables.
   for (std::size_t q = 0; q < kNumQualityValues; ++q) {
@@ -81,6 +81,8 @@ FastqStats::flush_qtile() {
       }
   }
   qual_tile_reads = 0;
+  if (!with_long)
+    return;
   for (std::size_t i = 0; i < long_qual_tile.size(); ++i)
     if (long_qual_tile[i] != 0) {
       long_position_quality_count[i] += long_qual_tile[i];

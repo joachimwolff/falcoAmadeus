@@ -338,7 +338,9 @@ struct FastqStats {
   std::vector<std::uint16_t> long_qual_tile;
   std::uint32_t long_qtile_reads = 0;  // long reads since the last flush
   static const std::uint32_t kQualTileFlushReads = 60000;
-  void flush_qtile();  // fold qual_tile into position_quality_count
+  // fold qual_tile into position_quality_count (and, with_long, the long
+  // tile into long_position_quality_count)
+  void flush_qtile(bool with_long = true);
 
   // Counts of average quality (truncated) per sequence
   std::array<size_t, kNumQualityValues> quality_count;

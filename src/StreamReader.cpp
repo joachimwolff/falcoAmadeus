@@ -1659,6 +1659,69 @@ struct ParRec {
 };
 }  // namespace
 
+// [FalcoAmadeus] The per-worker tile flushes and the long-read quality table
+// reduction, run on all threads: with long reads every worker holds a table of
+// 1 KB per position past the buffer, and summing 32 of them serially took
+// longer than the parse. The workers' 16-bit long tiles are added straight
+// into the master table (no worker's 64-bit table is filled at the end, so
+// none becomes resident). Integer adds commute, so the totals are those of
+// the serial merge. The worker tables are released here; the serial merge
+// that follows finds them empty and the tiles flushed.
+template <class Get>
+static void
+merge_long_tables(FastqStats &master, std::size_t nthreads, Get get) {
+  std::size_t L = master.long_position_quality_count.size();
+  for (std::size_t t = 0; t < nthreads; ++t)
+    L = std::max(L, get(t).long_position_quality_count.size());
+  const long nt = static_cast<long>(nthreads);
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(nthreads) schedule(static)
+#endif
+  for (long t = 0; t < nt; ++t) {
+    get(t).flush_soa();
+    get(t).flush_qtile(/*with_long=*/false);
+  }
+  if (L > 0) {
+    master.long_position_quality_count.resize(L);  // zero pages, not written
+    std::size_t *const m = master.long_position_quality_count.data();
+#ifdef _OPENMP
+#pragma omp parallel num_threads(nthreads)
+#endif
+    {
+#ifdef _OPENMP
+      const std::size_t tid = static_cast<std::size_t>(omp_get_thread_num());
+      const std::size_t nth = static_cast<std::size_t>(omp_get_num_threads());
+#else
+      const std::size_t tid = 0, nth = 1;
+#endif
+      const std::size_t lo = L * tid / nth, hi = L * (tid + 1) / nth;
+      for (std::size_t t = 0; t < nthreads; ++t) {
+        const FastqStats &w = get(t);
+        const auto &wl = w.long_position_quality_count;
+        const std::uint16_t *const wt = w.long_qual_tile.data();
+        // the tile grows with the table, so both have the same length
+        const std::size_t e = std::min(hi, wl.size());
+        for (std::size_t i = lo; i < e; ++i) {
+          // reading a zero page of the 64-bit table keeps it unbacked
+          const std::size_t v = wl[i] + wt[i];
+          if (v != 0)
+            m[i] += v;
+        }
+      }
+    }
+  }
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(nthreads) schedule(static)
+#endif
+  for (long t = 0; t < nt; ++t) {
+    FastqStats &ws = get(t);
+    decltype(ws.long_position_quality_count)().swap(
+      ws.long_position_quality_count);
+    std::vector<std::uint16_t>().swap(ws.long_qual_tile);
+    ws.long_qtile_reads = 0;
+  }
+}
+
 // Shared core for both parallel drivers. `decomp` is any line source exposing
 // getline(dst, maxlen) / eof() -- a GzBlockDecompressor for gzipped input or a
 // PlainBlockReader for uncompressed input. The dispatch / worker / merge logic
@@ -1880,10 +1943,10 @@ read_parallel_impl(FalcoConfig &config, FastqStats &master,
     for (std::size_t i = 0; i < src.size(); ++i)
       dst[i] += src[i];
   };
+  merge_long_tables(master, nthreads,
+                    [&](std::size_t t) -> FastqStats & { return wstats[t]; });
   for (std::size_t t = 0; t < nthreads; ++t) {
     FastqStats &ws = wstats[t];
-    ws.flush_soa();
-    ws.flush_qtile();  // position_quality_count is read (added) just below
     add_arr(master.base_count, ws.base_count);
     add_arr(master.n_base_count, ws.n_base_count);
     add_arr(master.position_quality_count, ws.position_quality_count);
@@ -1906,14 +1969,8 @@ read_parallel_impl(FalcoConfig &config, FastqStats &master,
     master.lowest_char = std::min(master.lowest_char, ws.lowest_char);
     add_vec(master.long_base_count, ws.long_base_count);
     add_vec(master.long_n_base_count, ws.long_n_base_count);
-    add_vec(master.long_position_quality_count, ws.long_position_quality_count);
     add_vec(master.long_read_length_freq, ws.long_read_length_freq);
     master.num_extra_bases = std::max(master.num_extra_bases, ws.num_extra_bases);
-    // a worker's long-read quality tables are merged: release them, so that
-    // at most one is resident during the merge
-    decltype(ws.long_position_quality_count)().swap(
-      ws.long_position_quality_count);
-    std::vector<std::uint16_t>().swap(ws.long_qual_tile);
   }
 
   // tile maps: create master vectors at the reconstructed lengths, then sum
@@ -2158,10 +2215,10 @@ merge_worker_stats(
     for (std::size_t i = 0; i < src.size(); ++i)
       dst[i] += src[i];
   };
+  merge_long_tables(master, nthreads,
+                    [&](std::size_t t) -> FastqStats & { return *wstats[t]; });
   for (std::size_t t = 0; t < nthreads; ++t) {
     FastqStats &ws = *wstats[t];
-    ws.flush_soa();
-    ws.flush_qtile();  // position_quality_count is read (added) just below
     add_arr(master.base_count, ws.base_count);
     add_arr(master.n_base_count, ws.n_base_count);
     add_arr(master.position_quality_count, ws.position_quality_count);
@@ -2177,14 +2234,8 @@ merge_worker_stats(
     master.lowest_char = std::min(master.lowest_char, ws.lowest_char);
     add_vec(master.long_base_count, ws.long_base_count);
     add_vec(master.long_n_base_count, ws.long_n_base_count);
-    add_vec(master.long_position_quality_count, ws.long_position_quality_count);
     add_vec(master.long_read_length_freq, ws.long_read_length_freq);
     master.num_extra_bases = std::max(master.num_extra_bases, ws.num_extra_bases);
-    // a worker's long-read quality tables are merged: release them, so that
-    // at most one is resident during the merge
-    decltype(ws.long_position_quality_count)().swap(
-      ws.long_position_quality_count);
-    std::vector<std::uint16_t>().swap(ws.long_qual_tile);
   }
 
   // ---- tile maps: reconstruct lengths in global read order, then sum ----
