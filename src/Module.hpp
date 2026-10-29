@@ -384,6 +384,9 @@ struct ModuleOverrepresentedSequences : public Module {
   // Function to find the matching contaminant within the list
   std::string
   get_matching_contaminant(const std::string &seq);
+  // true when no contaminant can match seq (see Module.cpp)
+  bool
+  surely_no_hit(const std::string &seq);
 
   ModuleOverrepresentedSequences(const FalcoConfig &config);
   ~ModuleOverrepresentedSequences() {}

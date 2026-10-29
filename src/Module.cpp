@@ -16,6 +16,7 @@
 #include "Module.hpp"
 
 #include <algorithm>
+#include <array>
 #if defined(__x86_64__)
 #include <immintrin.h>
 #endif
@@ -25,6 +26,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <iomanip>
+#include <mutex>
 #include <sstream>
 
 /******************* AUX FUNCTIONS *******************************************/
@@ -2135,38 +2137,175 @@ ModuleOverrepresentedSequences::ModuleOverrepresentedSequences(
   assay = config.assay_profile;
 }
 
-// gets the largest suffix of left which is a prefix of right
-// returns 0 if none exist
+// gets the largest suffix of left which is a prefix of right, or the length
+// of right when right occurs inside left; returns 0 if none exist.
+// [FalcoAmadeus] One Knuth-Morris-Pratt pass of left against right instead of
+// a comparison from every start of left: a full match of right is the longest
+// possible answer, and otherwise the matcher's final state is the longest
+// suffix of left that is a prefix of right. With every overrepresented
+// sequence compared with every contaminant in both directions, the start-by-
+// start search took more time per small file than its parse.
 std::size_t
 get_overlap(const std::string &left, const std::string &right) {
-  const auto left_st(begin(left));
-  const auto left_end(end(left));
-
-  const auto right_st(begin(right));
-  const auto right_end(end(right));
-
-  std::size_t best = 0;
-  const auto sz = std::size(left);
-  for (std::size_t start = 0; start < sz; ++start) {
-    std::size_t cur = 0;
-    auto left_it(left_st + start);
-    auto right_it(right_st);
-    for (; (left_it != left_end) && (right_it != right_end) &&
-           (*left_it == *right_it);
-         ++left_it, ++right_it, ++cur)
-      ;
-
-    // does not accept if overlap does not cover a suffix or the
-    // entirety of right
-    cur = (left_it == left_end || right_it == right_end) ? (cur) : 0;
-    best = std::max(best, cur);
+  const std::size_t m = std::size(right);
+  if (m == 0 || left.empty())
+    return 0;
+  std::array<std::uint8_t, 256> pi_small;
+  std::vector<std::size_t> pi_large;
+  const bool small = m <= pi_small.size();
+  if (!small)
+    pi_large.assign(m, 0);
+  auto pi = [&](std::size_t i) -> std::size_t {
+    return small ? pi_small[i] : pi_large[i];
+  };
+  auto set_pi = [&](std::size_t i, std::size_t v) {
+    if (small)
+      pi_small[i] = static_cast<std::uint8_t>(v);
+    else
+      pi_large[i] = v;
+  };
+  set_pi(0, 0);
+  for (std::size_t i = 1, k = 0; i < m; ++i) {
+    while (k > 0 && right[i] != right[k])
+      k = pi(k - 1);
+    if (right[i] == right[k])
+      ++k;
+    set_pi(i, k);
   }
-  return best;
+  std::size_t q = 0;
+  for (const char c : left) {
+    while (q > 0 && c != right[q])
+      q = pi(q - 1);
+    if (c == right[q])
+      ++q;
+    if (q == m)
+      return m;
+  }
+  return q;
+}
+
+// [FalcoAmadeus] Contaminant pre-filter. A contaminant is reported only when
+// its overlap with the sequence reaches min(name length, sequence length) / 2
+// (the FastQC rule below). Where that threshold is at least kContamK, such an
+// overlap contains a common substring of kContamK bases, so a contaminant that
+// shares no kContamK-mer with the sequence cannot be reported. When none of
+// the remaining candidates reaches its threshold and some contaminant
+// overlaps the sequence by at least one base (one ends with the sequence's
+// first base or starts with its last), the answer is "No Hit" without
+// comparing the sequence with every contaminant (with no overlap at all the
+// rule returns an empty source). Otherwise the full comparison below decides
+// (the best overlap may belong to another contaminant). Contaminants with a
+// base other than ACGT are always candidates.
+namespace {
+constexpr std::size_t kContamK = 10;
+constexpr std::size_t kContamIndexMin = 32;
+
+int
+acgt_code(const char c) {
+  switch (c) {
+    case 'A': return 0;
+    case 'C': return 1;
+    case 'G': return 2;
+    case 'T': return 3;
+    default: return -1;
+  }
+}
+
+// calls f(code) for every window of kContamK ACGT bases of s
+template <class F>
+void
+for_each_kmer(const std::string &s, F f) {
+  std::uint32_t k = 0;
+  std::size_t run = 0;
+  for (const char ch : s) {
+    const int c = acgt_code(ch);
+    if (c < 0) {
+      run = 0;
+      continue;
+    }
+    k = ((k << 2) | static_cast<std::uint32_t>(c)) &
+        ((1u << (2 * kContamK)) - 1);
+    if (++run >= kContamK)
+      f(k);
+  }
+}
+
+struct ContamIndex {
+  std::vector<std::pair<std::string, std::string>> list;
+  // (k-mer << 32) | contaminant, sorted: a compact table (8 bytes per k-mer
+  // of the list) instead of a node per k-mer
+  std::vector<std::uint64_t> kmers;
+  std::vector<bool> non_acgt;  // a base other than ACGT
+  // some contaminant starts / ends with this character
+  std::array<bool, 256> first{}, last{};
+
+  void build(const std::vector<std::pair<std::string, std::string>> &l) {
+    list = l;
+    kmers.clear();
+    std::size_t n = 0;
+    for (const auto &c : l)
+      n += c.second.size() >= kContamK ? c.second.size() - kContamK + 1 : 0;
+    kmers.reserve(n);
+    non_acgt.assign(l.size(), false);
+    first.fill(false);
+    last.fill(false);
+    for (std::uint32_t i = 0; i < l.size(); ++i) {
+      if (!l[i].second.empty()) {
+        first[static_cast<unsigned char>(l[i].second.front())] = true;
+        last[static_cast<unsigned char>(l[i].second.back())] = true;
+      }
+      for (const char ch : l[i].second)
+        if (acgt_code(ch) < 0)
+          non_acgt[i] = true;
+      for_each_kmer(l[i].second, [&](std::uint32_t k) {
+        kmers.push_back((static_cast<std::uint64_t>(k) << 32) | i);
+      });
+    }
+    std::sort(kmers.begin(), kmers.end());
+    kmers.erase(std::unique(kmers.begin(), kmers.end()), kmers.end());
+  }
+};
+}  // namespace
+
+bool
+ModuleOverrepresentedSequences::surely_no_hit(const std::string &seq) {
+  static std::mutex m;
+  static ContamIndex ix;
+  std::lock_guard<std::mutex> lk(m);
+  if (ix.list != contaminants)
+    ix.build(contaminants);
+  if (seq.empty() || !(ix.last[static_cast<unsigned char>(seq.front())] ||
+                       ix.first[static_cast<unsigned char>(seq.back())]))
+    return false;  // possibly no overlap at all: the full comparison decides
+  std::vector<bool> cand(contaminants.size(), false);
+  for (std::size_t i = 0; i < contaminants.size(); ++i)
+    cand[i] = ix.non_acgt[i] ||
+              std::min(std::size(contaminants[i].first), std::size(seq)) / 2 <
+                kContamK;
+  for_each_kmer(seq, [&](std::uint32_t k) {
+    const std::uint64_t lo = static_cast<std::uint64_t>(k) << 32;
+    for (auto it = std::lower_bound(ix.kmers.begin(), ix.kmers.end(), lo);
+         it != ix.kmers.end() && (*it >> 32) == k; ++it)
+      cand[static_cast<std::uint32_t>(*it)] = true;
+  });
+  for (std::size_t i = 0; i < contaminants.size(); ++i) {
+    if (!cand[i])
+      continue;
+    const auto &v = contaminants[i];
+    const std::size_t ov =
+      std::max(get_overlap(v.second, seq), get_overlap(seq, v.second));
+    if (ov >= std::min(std::size(v.first), std::size(seq)) / 2)
+      return false;
+  }
+  return true;
 }
 
 std::string
 ModuleOverrepresentedSequences::get_matching_contaminant(
   const std::string &seq) {
+  // the index pays off once a file has a few dozen such sequences
+  if (overrep_sequences.size() >= kContamIndexMin && surely_no_hit(seq))
+    return "No Hit";
   std::size_t best = 0;
   std::string ret;
   for (const auto &v : contaminants) {
