@@ -25,6 +25,11 @@
   switched off for every read, now runs for all reads; the k-mers of the
   sampled reads (every 50th) are counted in a separate pass with
   prefetching, and single-range slices skip the record count pass.
+- **Read names with tile numbers use the sliced driver.** Per-tile quality
+  forced the whole-buffer driver, which keeps one record per read: on 10
+  million Illumina-named reads it lost to falco 2.0.3 on time. The tile
+  reads and the tile vector lengths are now reconstructed slice by slice
+  in file order, with memory bounded by the slice.
 - **Paired duplicates are counted in either mate order.** A fragment can
   be sequenced from either strand, so its copies carry the mates as (a,b)
   or (b,a); the pair key no longer depends on the order. On 10 million
