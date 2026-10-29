@@ -45,6 +45,13 @@
   counts are allocated as untouched zero pages, and the overrepresented
   sequences' sources are looked up once: a 1,000-read file takes 8-10 MB
   at any thread count (was up to 30 MB at -t 32).
+- **Parallel duplication prefix.** The duplication tracker is filled in
+  file order until it holds 100,000 distinct sequences; in libraries with
+  fewer (amplicons, small RNA) this serial walk covered the whole file. The
+  ranges of a slice now collect their distinct sequences in parallel and
+  are merged in order; the range in which the tracker fills is replayed
+  read by read. Amplicon-like input at -t 32: 0.35 -> 0.22 s on 2 million
+  reads.
 - **Paired duplicates are counted in either mate order.** A fragment can
   be sequenced from either strand, so its copies carry the mates as (a,b)
   or (b,a); the pair key no longer depends on the order. On 10 million

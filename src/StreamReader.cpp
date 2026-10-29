@@ -2947,6 +2947,23 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
     std::uint32_t seqlen, tile, before;
   };
   std::vector<std::vector<TileRec>> rtile(tile_ignore ? 0 : R_MAX);
+  // Parallel duplication prefix (several ranges per slice): every range
+  // collects its distinct keys (first occurrence order) with their counts,
+  // and the ranges are merged in order. A range that would fill the tracker
+  // is replayed read by read, so the cap-filling read is the serial one.
+  struct PfxEnt {
+    std::uint64_t h;
+    const char *key;
+    std::uint32_t klen, count;
+  };
+  struct PfxRange {
+    std::vector<PfxEnt> ents;
+    std::vector<std::uint32_t> slots;  // entry index + 1, 0 = empty
+    std::size_t nreads = 0;
+  };
+  std::vector<PfxRange> pfx;
+  bool par_pfx = false;
+  std::size_t cur_sbytes = 0;
   std::vector<std::size_t> rmax(tile_ignore ? 0 : R_MAX, 0);
   std::unordered_map<std::size_t, std::size_t> tile_len;
   std::size_t tile_maxlen = 0;
@@ -3020,6 +3037,24 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
     if (r == 0) return off;
     if (r >= nranges) return lazy ? lazy_end : plimit;
     return P::find_start(base, plimit, off + r * rstep);
+  };
+  // after the prefix of a slice: which reads are counted against the
+  // tracked keys, and the counting tables
+  auto post_prefix = [&] {
+    count_dup = do_hash && !dup_cont;
+    if (count_dup && nent == 0) {
+      nent = master.sequence_count.size();
+      mbegin = master.sequence_count.begin();
+      dd.init(nent);
+      if (H && H->on_comb_map) {
+        H->on_comb_map(&master.sequence_count);
+        comb_notified = true;
+      }
+    }
+    if (count_dup)
+      dd.reserve(cur_sbytes, mbegin);
+    if (cm)
+      dd2.reserve(cur_sbytes, cmbegin);
   };
   // FA_TIMES=1: per-phase wall times on stderr (diagnostics only)
   static const bool fa_times = std::getenv("FA_TIMES") != nullptr;
@@ -3160,49 +3195,41 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
           // -- duplication prefix continues across slices (global read order) -
           // cap filled earlier: every record here past the prefix is post-cap
           dup_stop = std::max(off, pre_stop);
-          if (do_hash && dup_cont) {
-            std::size_t p = off;
-            const std::size_t dup_end = lazy ? lazy_end : plimit;
-            while (dup_cont && p < dup_end) {
-              const char *key;
-              std::size_t klen;
-              const std::size_t next = P::dup_key(base, plimit, p, key, klen);
-              const auto fe = master.sequence_count.find_or_emplace(key, klen, 1);
-              const auto it = fe.first;
-              if (fe.second) {
-                master.count_at_limit = dup_seen;
-                ++master.num_unique_seen;
-                if (master.num_unique_seen ==
-                    Constants::unique_reads_stop_counting)
-                  dup_cont = false;  // the cap-filling record IS consumed
+          cur_sbytes = sbytes;
+          // several ranges: the prefix runs in parallel after this block
+          par_pfx = do_hash && dup_cont && !lazy && nranges > 1;
+          if (!par_pfx) {
+            if (do_hash && dup_cont) {
+              std::size_t p = off;
+              const std::size_t dup_end = lazy ? lazy_end : plimit;
+              while (dup_cont && p < dup_end) {
+                const char *key;
+                std::size_t klen;
+                const std::size_t next = P::dup_key(base, plimit, p, key, klen);
+                const auto fe = master.sequence_count.find_or_emplace(key, klen, 1);
+                const auto it = fe.first;
+                if (fe.second) {
+                  master.count_at_limit = dup_seen;
+                  ++master.num_unique_seen;
+                  if (master.num_unique_seen ==
+                      Constants::unique_reads_stop_counting)
+                    dup_cont = false;  // the cap-filling record IS consumed
+                }
+                else {
+                  ++it->second;
+                  master.count_at_limit += dup_cont;
+                }
+                ++dup_seen;
+                p = next;  // always step past the consumed record
               }
-              else {
-                ++it->second;
-                master.count_at_limit += dup_cont;
-              }
-              ++dup_seen;
-              p = next;  // always step past the consumed record
+              // First byte the prefix did NOT consume. The prefix eats records
+              // in file order, so "start offset >= dup_stop" holds exactly for
+              // the reads with global index >= dup_seen -- the same set the old
+              // `g >= fill_boundary` gate selected, with no need to know g.
+              dup_stop = p;
             }
-            // First byte the prefix did NOT consume. The prefix eats records
-            // in file order, so "start offset >= dup_stop" holds exactly for
-            // the reads with global index >= dup_seen -- the same set the old
-            // `g >= fill_boundary` gate selected, with no need to know g.
-            dup_stop = p;
+            post_prefix();
           }
-          count_dup = do_hash && !dup_cont;
-          if (count_dup && nent == 0) {
-            nent = master.sequence_count.size();
-            mbegin = master.sequence_count.begin();
-            dd.init(nent);
-            if (H && H->on_comb_map) {
-              H->on_comb_map(&master.sequence_count);
-              comb_notified = true;
-            }
-          }
-          if (count_dup)
-            dd.reserve(sbytes, mbegin);
-          if (cm)
-            dd2.reserve(sbytes, cmbegin);
           slice_open = true;
           ++n_slices;
         }
@@ -3210,6 +3237,128 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
       }  // barrier publishes s_done / plimit / sync / dup_stop / count_dup
       if (s_done)
         break;
+
+      // -- parallel duplication prefix (see PfxRange) ----------------------
+      if (par_pfx) {
+#ifdef _OPENMP
+#pragma omp single
+#endif
+        if (pfx.size() < nranges)
+          pfx.resize(nranges);
+#ifdef _OPENMP
+#pragma omp for schedule(dynamic)
+#endif
+        for (std::size_t r = 0; r < nranges; ++r) {
+          PfxRange &pr = pfx[r];
+          pr.ents.clear();
+          pr.nreads = 0;
+          if (pr.slots.empty())
+            pr.slots.assign(std::size_t(1) << 12, 0);
+          else
+            std::fill(pr.slots.begin(), pr.slots.end(), 0u);
+          std::size_t mask = pr.slots.size() - 1;
+          std::size_t p = bound(r);
+          const std::size_t hi = bound(r + 1);
+          while (p < hi) {
+            const char *key;
+            std::size_t klen;
+            const std::size_t next = P::dup_key(base, plimit, p, key, klen);
+            const std::uint64_t h = DupHashMap::hash_of(key, klen);
+            std::size_t s = static_cast<std::size_t>(h) & mask;
+            for (;;) {
+              const std::uint32_t e = pr.slots[s];
+              if (e == 0) {
+                pr.ents.push_back(PfxEnt{h, key,
+                                         static_cast<std::uint32_t>(klen), 1});
+                pr.slots[s] = static_cast<std::uint32_t>(pr.ents.size());
+                break;
+              }
+              PfxEnt &pe = pr.ents[e - 1];
+              if (pe.h == h && pe.klen == klen &&
+                  std::memcmp(pe.key, key, klen) == 0) {
+                ++pe.count;
+                break;
+              }
+              s = (s + 1) & mask;
+            }
+            if (2 * pr.ents.size() > pr.slots.size()) {  // grow and rehash
+              pr.slots.assign(2 * pr.slots.size(), 0);
+              mask = pr.slots.size() - 1;
+              for (std::size_t k = 0; k < pr.ents.size(); ++k) {
+                std::size_t t = static_cast<std::size_t>(pr.ents[k].h) & mask;
+                while (pr.slots[t] != 0)
+                  t = (t + 1) & mask;
+                pr.slots[t] = static_cast<std::uint32_t>(k + 1);
+              }
+            }
+            ++pr.nreads;
+            p = next;
+          }
+        }
+#ifdef _OPENMP
+#pragma omp single
+#endif
+        {
+          const double tm0 = fa_times ? now() : 0;
+          std::size_t p_end = plimit;  // first byte the prefix did not consume
+          for (std::size_t r = 0; r < nranges && dup_cont; ++r) {
+            PfxRange &pr = pfx[r];
+            std::size_t fresh = 0;
+            for (const PfxEnt &pe : pr.ents)
+              fresh += (master.sequence_count.find_hashed(pe.h, pe.key,
+                                                          pe.klen) ==
+                        master.sequence_count.end());
+            if (master.num_unique_seen + fresh >=
+                Constants::unique_reads_stop_counting) {
+              // the tracker fills in this range: replay it read by read
+              std::size_t p = bound(r);
+              const std::size_t dup_end = bound(r + 1);
+              while (dup_cont && p < dup_end) {
+                const char *key;
+                std::size_t klen;
+                const std::size_t next =
+                  P::dup_key(base, plimit, p, key, klen);
+                const auto fe =
+                  master.sequence_count.find_or_emplace(key, klen, 1);
+                if (fe.second) {
+                  master.count_at_limit = dup_seen;
+                  ++master.num_unique_seen;
+                  if (master.num_unique_seen ==
+                      Constants::unique_reads_stop_counting)
+                    dup_cont = false;
+                }
+                else {
+                  ++fe.first->second;
+                  master.count_at_limit += dup_cont;
+                }
+                ++dup_seen;
+                p = next;
+              }
+              p_end = p;
+              break;
+            }
+            for (const PfxEnt &pe : pr.ents) {
+              const auto it =
+                master.sequence_count.find_hashed(pe.h, pe.key, pe.klen);
+              if (it != master.sequence_count.end()) {
+                it->second += pe.count;
+              }
+              else {
+                master.sequence_count.emplace(pe.key, pe.klen, pe.count);
+                ++master.num_unique_seen;
+              }
+            }
+            // the serial walk leaves count_at_limit one below the reads seen
+            // (it is reset to the read count before each new key)
+            dup_seen += pr.nreads;
+            if (pr.nreads)
+              master.count_at_limit = dup_seen - 1;
+          }
+          dup_stop = p_end;
+          post_prefix();
+          if (fa_times) t_single += now() - tm0;
+        }
+      }
 
       // -- Phase 1, k-mer runs only: count records to know each range's g0 ----
       // (a single range starts at the running total: no count pass)
