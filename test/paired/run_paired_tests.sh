@@ -75,6 +75,28 @@ for t in 1 4; do
   else echo "FAIL combined view differs from R1+R2 (-t $t)"; fail=1; fi
 done
 
+# the same with Illumina read names (per-tile quality): R1 has 150,003 reads,
+# so R2's tile reads in the combined view are offset from its own
+sim tpool --pairs 150003 --dup 0.2 --placement shuffled
+for m in 1 2; do
+  awk -v m=$m 'NR % 4 == 1 { i++; t = (i % 2 ? 1101 : 2104) + int(i / 9) % 40
+                printf "@A00123:8:H5JV2DSXX:1:%d:%d:%d %d:N:0:ACGT\n",
+                       t, 1000 + i % 20000, 1000 + int(i / 20000), m; next }
+              { print }' "$W/tpool_R$m.fastq" > "$W/tpool_t_R$m.fastq"
+done
+for t in 1 4; do
+  mkdir -p "$W/tpool$t" "$W/tcat$t"
+  "$FA" -t "$t" -q --paired-data both -o "$W/tpool$t" "$W/tpool_t_R1.fastq" \
+    --paired-with "$W/tpool_t_R2.fastq" > /dev/null 2>&1
+  cat "$W/tpool_t_R1.fastq" "$W/tpool_t_R2.fastq" > "$W/tpool_cat.fastq"
+  "$FA" -t "$t" -q -o "$W/tcat$t" "$W/tpool_cat.fastq" > /dev/null 2>&1
+  if grep -q '^>>Per tile sequence quality' "$W/tcat$t/fastqc_data.txt" &&
+     diff <(grep -v '^Filename' "$W/tpool$t/fastqc_data.txt") \
+          <(grep -v '^Filename' "$W/tcat$t/fastqc_data.txt") > /dev/null; then
+    echo "ok   combined view = analysis of R1+R2, tiled (-t $t)"
+  else echo "FAIL tiled combined view differs from R1+R2 (-t $t)"; fail=1; fi
+done
+
 # thread invariance of the paired report
 for t in 1 8; do
   mkdir -p "$W/t$t"

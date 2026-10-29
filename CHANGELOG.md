@@ -53,6 +53,12 @@
   are merged in order; the range in which the tracker fills is replayed
   read by read. Amplicon-like input at -t 32: 0.35 -> 0.22 s on 2 million
   reads.
+- **Native paired mode for Illumina read names.** Mates with tile numbers
+  in their names (as written by the Illumina software) fell back to
+  separate passes, 4-7 times slower than falco 2.0.3 on 10 million pairs.
+  They now take the single-read paired mode, read one after the other: the
+  second mate continues the first mate's tile reconstruction for the
+  combined view.
 - **Paired duplicates are counted in either mate order.** A fragment can
   be sequenced from either strand, so its copies carry the mates as (a,b)
   or (b,a); the pair key no longer depends on the order. On 10 million

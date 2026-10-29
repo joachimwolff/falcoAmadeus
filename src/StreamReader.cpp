@@ -2860,6 +2860,16 @@ class TileFold {
     rtile_[r].swap(tr.recs);
     rmax_[r] = tr.lpmax;
   }
+  // continue another reconstruction (the combined view of paired mates)
+  void seed(const std::unordered_map<std::size_t, std::size_t> &len,
+            std::size_t maxlen) {
+    len_ = len;
+    maxlen_ = maxlen;
+  }
+  const std::unordered_map<std::size_t, std::size_t> &len() const {
+    return len_;
+  }
+  std::size_t maxlen() const { return maxlen_; }
   void fold(std::size_t nranges) {
     for (std::size_t r = 0; r < nranges; ++r) {
       const std::vector<std::uint32_t> &v = rtile_[r];
@@ -2905,6 +2915,55 @@ class TileFold {
   std::vector<std::size_t> rmax_;
   std::unordered_map<std::size_t, std::size_t> len_;
   std::size_t maxlen_ = 0;
+};
+
+// [FalcoAmadeus] Per-tile quality sums of the combined view's tile reads of a
+// second mate (see PairedHooks): per thread, merged into the hooks at the end.
+struct CombTileSums {
+  std::unordered_map<std::size_t, std::vector<double>> q;
+  std::unordered_map<std::size_t, std::vector<std::size_t>> c;
+  // the quality line of the FASTQ record at rec (as the quality loop adds
+  // each base's quality to its tile and position)
+  void add(std::size_t tile, const char *rec, const char *end) {
+    const char *l = static_cast<const char *>(std::memchr(rec, '\n', end - rec));
+    for (int k = 0; k < 2 && l; ++k)
+      l = static_cast<const char *>(std::memchr(l + 1, '\n', end - l - 1));
+    if (!l)
+      return;
+    const char *qs = l + 1;
+    const char *qe = static_cast<const char *>(std::memchr(qs, '\n', end - qs));
+    if (!qe)
+      qe = end;
+    const std::size_t n = static_cast<std::size_t>(qe - qs);
+    std::vector<double> &vq = q[tile];
+    std::vector<std::size_t> &vc = c[tile];
+    if (vq.size() < n) {
+      vq.resize(n, 0.0);
+      vc.resize(n, 0);
+    }
+    for (std::size_t i = 0; i < n; ++i) {
+      vq[i] += static_cast<double>(qs[i] - Constants::quality_zero);
+      ++vc[i];
+    }
+  }
+  static void merge_into(std::vector<CombTileSums> &parts, PairedHooks &h) {
+    for (CombTileSums &p : parts) {
+      for (auto &kv : p.q) {
+        auto &d = h.comb_tile_quality[kv.first];
+        if (d.size() < kv.second.size())
+          d.resize(kv.second.size(), 0.0);
+        for (std::size_t i = 0; i < kv.second.size(); ++i)
+          d[i] += kv.second[i];
+      }
+      for (auto &kv : p.c) {
+        auto &d = h.comb_tile_count[kv.first];
+        if (d.size() < kv.second.size())
+          d.resize(kv.second.size(), 0);
+        for (std::size_t i = 0; i < kv.second.size(); ++i)
+          d[i] += kv.second[i];
+      }
+    }
+  }
 };
 
 // [FalcoAmadeus] The duplication prefix (the reads up to the one that fills
@@ -3062,7 +3121,8 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
   const bool do_hash = cfg.do_sequence_hash;
   // Tiled input in native paired mode keeps the whole-buffer driver (the
   // combined view would need the tile reconstruction across both mates).
-  if (size == 0 || (!tile_ignore && config.paired_hooks)) {
+  if (size == 0 ||
+      (!tile_ignore && config.paired_hooks && !config.paired_hooks->tiles_ok)) {
     read_bytesplit_core<P>(config, master, nthreads, base, size,
                            std::move(release_input), can_drop);
     return;
@@ -3182,6 +3242,14 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
   }
   std::vector<FpSpan> rspan(H ? R_MAX : 0);  // fingerprints per range
   std::vector<FpSlab> slabs(nthreads);        // per-thread arena position
+  // second mate of tiled pairs: the combined view's tile reconstruction and
+  // quality sums (see PairedHooks)
+  const bool comb_tiles = H && !tile_ignore && H->comb_tiles;
+  TileFold ctiles(comb_tiles ? R_MAX : 0);
+  if (comb_tiles)
+    ctiles.seed(H->comb_seed_len, H->comb_seed_maxlen);
+  std::vector<CombTileSums> csums(comb_tiles ? nthreads : 0);
+  const std::size_t coff = comb_tiles ? H->comb_tile_off : 0;
   bool comb_notified = false;
   std::size_t pre_stop = 0;  // end of an adopted duplication prefix
   if constexpr (std::is_same<P, FastqPolicy>::value) {
@@ -3285,6 +3353,8 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
               H->take_range(rspan[r]);
           if (!tile_ignore)
             tiles.fold(nranges);
+          if (comb_tiles)
+            ctiles.fold(nranges);
           // Replay + page drop both run on the replay thread while the next
           // slice parses: the replay reads only its GCRecords, and the pages
           // dropped are the fully parsed previous slice (nothing reads them
@@ -3479,6 +3549,7 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
         // g meaningful only for k-mer and tile sampling
         std::size_t g = need_g ? (nranges > 1 ? gstart[r] : total) : 0;
         TileFold::Range trec;  // this range's tile reads
+        TileFold::Range ctrec;  // ... of the combined view (tiled pairs)
         std::size_t n = 0;
         std::size_t tdrop = p;
         const std::size_t DW = std::size_t(1) << 20;
@@ -3504,6 +3575,12 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
                            tail, seqlen, tile_cur, key);
           if (!tile_ignore)
             trec.record(g, seqlen, tile_cur);
+          if (comb_tiles) {
+            ctrec.record(g + coff, seqlen, tile_cur);
+            if ((g + coff) % StreamReader::num_reads_for_tile == 0 &&
+                tile_cur != 0)
+              csums[tid].add(tile_cur, base + rec_start, base + plimit);
+          }
           ++g;
           ++n;
           std::uint64_t hk = 0;
@@ -3557,6 +3634,8 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
         }
         if (!tile_ignore)
           tiles.end_range(r, trec);
+        if (comb_tiles)
+          ctiles.end_range(r, ctrec);
         counts[r] = n;  // == the count pass's value on well-formed input
         if (lazy)
           plimit = p;  // one thread, one range: the slice ends here
@@ -3585,6 +3664,14 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
                      /*tile_ignore=*/true, /*skip_gc=*/true);
   if (!tile_ignore)
     tiles.finish(config, master, wstats);
+  if (H && !tile_ignore) {
+    H->tile_len = tiles.len();
+    H->tile_maxlen = tiles.maxlen();
+  }
+  if (comb_tiles) {
+    H->comb_tile_len = ctiles.len();
+    CombTileSums::merge_into(csums, *H);
+  }
   if (fa_times)
     std::fprintf(stderr,
                  "[FA_TIMES bytes] slices %zu  serial %.3f  parse %.3f  "
@@ -3669,7 +3756,7 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
   const bool do_hash = cfg.do_sequence_hash;
   // Tiled input in native paired mode keeps the dispatcher (the combined
   // view would need the tile reconstruction across both mates).
-  if (!tile_ignore && config.paired_hooks) {
+  if (!tile_ignore && config.paired_hooks && !config.paired_hooks->tiles_ok) {
     read_gz_parallel(config, master, nthreads);
     return;
   }
@@ -3754,6 +3841,14 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
   }
   std::vector<FpSpan> rspan(H ? R_MAX : 0);  // fingerprints per range
   std::vector<FpSlab> slabs(nthreads);        // per-thread arena position
+  // second mate of tiled pairs: the combined view's tile reconstruction and
+  // quality sums (see PairedHooks)
+  const bool comb_tiles = H && !tile_ignore && H->comb_tiles;
+  TileFold ctiles(comb_tiles ? R_MAX : 0);
+  if (comb_tiles)
+    ctiles.seed(H->comb_seed_len, H->comb_seed_maxlen);
+  std::vector<CombTileSums> csums(comb_tiles ? nthreads : 0);
+  const std::size_t coff = comb_tiles ? H->comb_tile_off : 0;
   bool comb_notified = false;
   // shared per-chunk state, written in `single` blocks (barriers publish it)
   std::size_t filled_end = 0, plimit = 0, dup_stop = 0, nranges = 0;
@@ -3824,6 +3919,8 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
                 H->take_range(rspan[r]);
             if (!tile_ignore)
               tiles.fold(nranges);
+            if (comb_tiles)
+              ctiles.fold(nranges);
             replayer.submit(nranges);  // replays while this chunk parses
           }
           left = carry;
@@ -4039,6 +4136,7 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
         // g meaningful only for k-mer
         std::size_t g = need_g ? (nranges > 1 ? gstart[r] : total) : 0;
         TileFold::Range trec;  // this range's tile reads
+        TileFold::Range ctrec;  // ... of the combined view (tiled pairs)
         std::size_t n = 0;
         // Deferred-by-one dup lookup (see read_bytesplit_core). Keys point
         // into `buf`, which stays valid until the next chunk switch, and the
@@ -4062,6 +4160,12 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
                                      tile_ignore, tail, seqlen, tile_cur, key);
           if (!tile_ignore)
             trec.record(g, seqlen, tile_cur);
+          if (comb_tiles) {
+            ctrec.record(g + coff, seqlen, tile_cur);
+            if ((g + coff) % StreamReader::num_reads_for_tile == 0 &&
+                tile_cur != 0)
+              csums[tid].add(tile_cur, buf + rec_start, buf + plimit);
+          }
           ++g;
           ++n;
           std::uint64_t hk = 0;
@@ -4111,6 +4215,8 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
         }
         if (!tile_ignore)
           tiles.end_range(r, trec);
+        if (comb_tiles)
+          ctiles.end_range(r, ctrec);
         counts[r] = n;  // == the count pass's value on well-formed input
       }  // barrier: counts[] complete, next chunk produced
     }
@@ -4134,6 +4240,14 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
                      /*tile_ignore=*/true, /*skip_gc=*/true);
   if (!tile_ignore)
     tiles.finish(config, master, wstats);
+  if (H && !tile_ignore) {
+    H->tile_len = tiles.len();
+    H->tile_maxlen = tiles.maxlen();
+  }
+  if (comb_tiles) {
+    H->comb_tile_len = ctiles.len();
+    CombTileSums::merge_into(csums, *H);
+  }
 }
 #endif  // USE_ISAL || USE_RAPIDGZIP
 

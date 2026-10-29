@@ -1656,7 +1656,19 @@ paired_fused_read(const FalcoConfig &falco_config, const std::string &r1,
     return false;
   const bool hashing = pf.c1->do_duplication || pf.c1->do_overrepresented;
   const std::size_t nt = falco_config.threads;
-  const bool concurrent = nt >= 2 && pf.c1->is_fastq_gz && pf.c2->is_fastq_gz;
+  // Tiled mates (per-tile quality) are read one after the other: the
+  // combined view's tile reads of R2 depend on R1's read count.
+  bool tiled = false;
+  {
+    ParallelWorker p1(*pf.c1, FastqStats::SHORT_READ_THRESHOLD);
+    ParallelWorker p2(*pf.c2, FastqStats::SHORT_READ_THRESHOLD);
+    if (p1.tile_ignore != p2.tile_ignore)
+      return false;  // one mate tiled, the other not: separate passes
+    tiled = !p1.tile_ignore;
+  }
+  pf.h1.tiles_ok = pf.h2.tiles_ok = true;
+  const bool concurrent =
+    nt >= 2 && pf.c1->is_fastq_gz && pf.c2->is_fastq_gz && !tiled;
 
   // R1 publishes its tracked set (used by the concurrent read)
   std::mutex mx;
@@ -1738,6 +1750,12 @@ paired_fused_read(const FalcoConfig &falco_config, const std::string &r1,
       pf.h2.gc2 = pf.comb_gc.data();
       if (hashing)
         pf.h2.comb_map = &pf.s1->sequence_count;
+      if (tiled) {  // R2 continues R1's tile reconstruction
+        pf.h2.comb_tiles = true;
+        pf.h2.comb_tile_off = pf.h1.num_reads % StreamReader::num_reads_for_tile;
+        pf.h2.comb_seed_len = pf.h1.tile_len;
+        pf.h2.comb_seed_maxlen = pf.h1.tile_maxlen;
+      }
     }
     // R1's keys are final: its own duplication counts run on a few threads
     // beside R2's read (which is bound by memory bandwidth more than by CPU)
@@ -1840,7 +1858,29 @@ paired_fused_read(const FalcoConfig &falco_config, const std::string &r1,
 static void
 merge_mate_stats(FastqStats &comb, FastqStats &s2,
                  const std::array<double, 101> &comb_gc,
-                 const std::vector<std::size_t> &comb_counts) {
+                 const std::vector<std::size_t> &comb_counts,
+                 const PairedHooks *h2 = nullptr) {
+  // per-tile quality (tiled mates): R1's tile vectors (comb's own) at the
+  // combined view's lengths, which are at least R1's, plus R2's sums over
+  // the combined view's tile reads; the sums are of whole numbers, so their
+  // order does not matter
+  if (h2 && h2->comb_tiles) {
+    for (const auto &kv : h2->comb_tile_len) {
+      const std::size_t len = kv.second;
+      std::vector<double> &q = comb.tile_position_quality[kv.first];
+      std::vector<std::size_t> &c = comb.tile_position_count[kv.first];
+      q.resize(len, 0.0);
+      c.resize(len, 0);
+      const auto iq = h2->comb_tile_quality.find(kv.first);
+      if (iq != h2->comb_tile_quality.end())
+        for (std::size_t i = 0; i < std::min(len, iq->second.size()); ++i)
+          q[i] += iq->second[i];
+      const auto ic = h2->comb_tile_count.find(kv.first);
+      if (ic != h2->comb_tile_count.end())
+        for (std::size_t i = 0; i < std::min(len, ic->second.size()); ++i)
+          c[i] += ic->second[i];
+    }
+  }
   // fields that writing R1's report derived (recomputed for the combination)
   comb.min_read_length = 0;
   comb.encoding_offset = 0;
@@ -2710,7 +2750,8 @@ main(int argc, char *argv[]) {
             prepare_file_config(falco_config, pooled_in, forced_file_format,
                                 true, " (combined)", std::string{});
             falco_config.do_tile = false;  // as the pooled read of tile-less input
-            merge_mate_stats(*pf.s1, *pf.s2, pf.comb_gc, pf.h2.comb_counts);
+            merge_mate_stats(*pf.s1, *pf.s2, pf.comb_gc, pf.h2.comb_counts,
+                             &pf.h2);
             summarize_and_write(falco_config, *pf.s1, comb_dir,
                                 std::string{}, std::string{}, std::string{},
                                 std::string{}, /*skip_text=*/!want_comb_data,

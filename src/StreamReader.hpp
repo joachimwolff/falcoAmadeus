@@ -21,6 +21,7 @@
 #include <string>
 #include <cmath>
 #include <bitset>
+#include <unordered_map>
 #include <vector>
 #include <functional>
 #include <new>
@@ -174,6 +175,23 @@ struct PairedHooks {
   // Second mate: its duplication prefix (the reads up to the one that fills
   // the tracker), computed ahead while the first mate is read; only the
   // memory-mapped driver adopts it, any other driver ignores it.
+  // Tiled input (per-tile quality). paired_fused_read reads tiled mates one
+  // after the other and sets tiles_ok, which lets the chunked drivers serve
+  // them. Each mate's driver leaves its final tile reconstruction here
+  // (tile_len, tile_maxlen). For the combined view (R1 followed by R2) the
+  // second mate continues R1's reconstruction (comb_seed_*) over its reads j
+  // with (j + comb_tile_off) % num_reads_for_tile == 0, comb_tile_off being
+  // R1's read count modulo num_reads_for_tile, and sums their qualities.
+  bool tiles_ok = false;
+  std::unordered_map<std::size_t, std::size_t> tile_len;
+  std::size_t tile_maxlen = 0;
+  bool comb_tiles = false;
+  std::size_t comb_tile_off = 0;
+  std::unordered_map<std::size_t, std::size_t> comb_seed_len;
+  std::size_t comb_seed_maxlen = 0;
+  std::unordered_map<std::size_t, std::size_t> comb_tile_len;
+  std::unordered_map<std::size_t, std::vector<double>> comb_tile_quality;
+  std::unordered_map<std::size_t, std::vector<std::size_t>> comb_tile_count;
   struct DupPrefix {
     DupHashMap map;
     std::size_t count_at_limit = 0, num_unique_seen = 0;
