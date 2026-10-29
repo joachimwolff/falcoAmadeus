@@ -6414,11 +6414,11 @@ read_bam_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads) {
   ParallelWorker cfg(config, BUF);
   const bool tile_ignore = cfg.tile_ignore;
   const bool do_hash = cfg.do_sequence_hash;
-  if (!tile_ignore) {  // fused path is tile-less; tiled BAM uses the full-buffer driver
-    close(ix.fd);
-    read_bam_chunked(config, master, nthreads);
-    return;
-  }
+  // [FalcoAmadeus] Tiled input (Illumina read names) takes the copying record
+  // parser, which reads the tile from the name; its tile reads are folded in
+  // global read order per chunk (TileFold, as in the byte-split driver).
+  if (tile_ignore)
+    config.do_tile = false;
 
   // ---- group blocks into ~32 MB decompressed chunks (double-buffered) ----
   // [FalcoAmadeus P4] Half the old 64 MB chunks, TWO chunk buffers: the
@@ -6585,6 +6585,7 @@ read_bam_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads) {
   };
   const std::size_t R_MAX_BAM = std::max<std::size_t>(4 * nthreads, 1);
   GCReplayer replayer(master, R_MAX_BAM);
+  TileFold tiles(tile_ignore ? 0 : R_MAX_BAM);
   // pipeline state (aux-thread writes ordered against the main thread by the
   // replayer's mutex: wait_idle() before any read)
   std::vector<char> cbufs2[2];        // compressed bytes per buffer slot
@@ -6732,6 +6733,7 @@ read_bam_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads) {
         const std::size_t r = task - ninfl;
         const std::size_t lo = nrec * r / nranges;
         const std::size_t hi = nrec * (r + 1) / nranges;
+        TileFold::Range trec;
         if (lo >= hi) { replayer.parse_bufs()[r].clear(); }
         else {
           FastqStats &ws = *wstats[tid];
@@ -6744,8 +6746,18 @@ read_bam_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads) {
             const std::size_t g = total + j;
             const std::size_t p = offs[j];
             gc.emplace_back(GCRecord{0, 0, 0});
-            const std::size_t seqlen = w.process_record_parallel_inplace(
-              bp + p + 4, ws, &gc.back(), g);
+            std::size_t seqlen;
+            if (tile_ignore) {
+              seqlen = w.process_record_parallel_inplace(bp + p + 4, ws,
+                                                         &gc.back(), g);
+            }
+            else {
+              std::size_t tile_cur = 0;
+              seqlen = w.process_record_parallel(
+                bp + p + 4, static_cast<uint32_t>(rd_bsz(bp, p)), ws,
+                &gc.back(), g, tile_cur);
+              trec.record(g, seqlen, tile_cur);
+            }
             if (count_dup && g >= fill_boundary) {
               const auto it = master.sequence_count.find(
                 w.buffer, get_truncate_point(seqlen));
@@ -6754,9 +6766,13 @@ read_bam_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads) {
             }
           }
         }
+        if (!tile_ignore)
+          tiles.end_range(r, trec);
       }
     }
     if (fa_times) t_phase += now() - t0;
+    if (!tile_ignore)
+      tiles.fold(nranges);  // chunk order = global read order
     prev_nranges = nranges;
     total += nrec;
     // ---- wait for the aux job (replay + pread + walk) and check failures ---
@@ -6781,6 +6797,8 @@ read_bam_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads) {
   merge_worker_stats(config, master, nthreads, total, wstats, empty_gc, deltas,
                      tilerecs, gstart, count_dup, /*tile_ignore=*/true,
                      /*skip_gc=*/true);
+  if (!tile_ignore)
+    tiles.finish(config, master, wstats);
   munmap(bufmem, 2 * bufcap);
   close(ix.fd);
   return;
