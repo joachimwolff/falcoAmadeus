@@ -40,6 +40,11 @@
   qualities beyond the first 500 positions went through per-base member
   calls with a dead copy of every base; they are now counted in one pass
   over local variables (half the CPU time on 5-15 kb reads).
+- **Small inputs.** Small files are read with at most one thread per MB
+  of input, the duplication tracker's slot table and the adapter position
+  counts are allocated as untouched zero pages, and the overrepresented
+  sequences' sources are looked up once: a 1,000-read file takes 8-10 MB
+  at any thread count (was up to 30 MB at -t 32).
 - **Paired duplicates are counted in either mate order.** A fragment can
   be sequenced from either strand, so its copies carry the mates as (a,b)
   or (b,a); the pair key no longer depends on the order. On 10 million

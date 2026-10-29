@@ -111,7 +111,6 @@ FastqStats::FastqStats(bool need_kmer) {
   // position_quality_count and qual_tile start zeroed (ZeroedArray)
   qual_tile_reads = 0;
   pos_kmer_count.fill(0);
-  pos_adapter_count.fill(0);
   // Only the Kmer Content module touches kmer_count; when it is disabled leave
   // the table empty (the write sites are guarded by do_kmer, the merge bounds
   // itself to master.kmer_count.size(), and the module -- hence every read of

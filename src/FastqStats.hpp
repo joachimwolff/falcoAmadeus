@@ -357,7 +357,9 @@ struct FastqStats {
   std::array<size_t, SHORT_READ_THRESHOLD> pos_kmer_count;
 
   // How many adapters were counted in each position
-  std::array<size_t, Constants::max_adapters * SHORT_READ_THRESHOLD> pos_adapter_count;
+  // (calloc'd: 512 KB of which only the rows of the configured adapters and
+  // the read positions in use are touched)
+  ZeroedArray<size_t, Constants::max_adapters * SHORT_READ_THRESHOLD> pos_adapter_count;
 
   /*********** DUPLICATION ******************/
   // First 100k unique sequences and how often they were seen. Open-addressing

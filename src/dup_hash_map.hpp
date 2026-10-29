@@ -25,8 +25,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <new>
 #include <string>
 #include <utility>
 #include <vector>
@@ -86,7 +88,7 @@ public:
     return hash_key(p, n);
   }
   void prefetch(std::uint64_t h) const {
-    if (slots_.empty())  // never-emplaced map: nothing to prefetch
+    if (!slots_)  // never-emplaced map: nothing to prefetch
       return;
     __builtin_prefetch(&slots_[h & mask_]);
   }
@@ -97,7 +99,7 @@ public:
   // cache misses. Key bytes for the compare come from the flat key store
   // (keys_, fixed 80-byte stride >= the 75-byte max key).
   iterator find_hashed(std::uint64_t hh, const char *p, std::size_t n) {
-    if (slots_.empty())  // never-emplaced map holds nothing: no alloc, no UB
+    if (!slots_)  // never-emplaced map holds nothing: no alloc, no UB
       return end();
     const std::uint32_t tag = (static_cast<std::uint32_t>(hh >> 56) | 1u) << 24;
     std::size_t h = static_cast<std::size_t>(hh) & mask_;
@@ -123,7 +125,7 @@ public:
   // element exists) never reallocates, so pointer/iterator stability -- which
   // the hot loops rely on -- is exactly as before.
   void emplace(const char *p, std::size_t n, std::size_t value) {
-    if (slots_.empty())
+    if (!slots_)
       allocate();
     const std::uint64_t hh = hash_key(p, n);
     const std::uint32_t tag = (static_cast<std::uint32_t>(hh >> 56) | 1u) << 24;
@@ -146,7 +148,7 @@ public:
   // identical to find() followed by emplace(). Returns {entry, inserted}.
   std::pair<iterator, bool> find_or_emplace(const char *p, std::size_t n,
                                             std::size_t value) {
-    if (slots_.empty())
+    if (!slots_)
       allocate();
     const std::uint64_t hh = hash_key(p, n);
     const std::uint32_t tag = (static_cast<std::uint32_t>(hh >> 56) | 1u) << 24;
@@ -179,7 +181,11 @@ private:
     std::size_t nslots = 1;
     while (nslots < (cap_ << 2))
       nslots <<= 1;  // >= 4x cap -> load factor < 0.25
-    slots_.assign(nslots, 0);
+    // calloc: zero pages, so only the slots in use occupy memory
+    slots_.reset(static_cast<std::uint32_t *>(
+      std::calloc(nslots, sizeof(std::uint32_t))));
+    if (!slots_)
+      throw std::bad_alloc();
     mask_ = nslots - 1;
     entries_.reserve(cap_);
     // written before it is read (a slot points to an entry only after its
@@ -263,7 +269,11 @@ private:
                                               // get_truncate_point)
   // All four containers are empty until the first emplace() (see allocate())
   std::vector<value_type> entries_;   // contiguous, reserved to cap (stable)
-  std::vector<std::uint32_t> slots_;  // (tag<<24)|(idx+1); 0 = empty
+  struct FreeDeleter {
+    void operator()(std::uint32_t *p) const { std::free(p); }
+  };
+  // (tag<<24)|(idx+1); 0 = empty
+  std::unique_ptr<std::uint32_t[], FreeDeleter> slots_;
   std::unique_ptr<char[]> keys_;      // key bytes, KSTRIDE apart
   std::vector<std::uint8_t> klen_;    // shadow key lengths
   std::size_t mask_ = 0;
