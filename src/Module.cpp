@@ -2169,7 +2169,7 @@ ModuleOverrepresentedSequences::get_matching_contaminant(
   const std::string &seq) {
   std::size_t best = 0;
   std::string ret;
-  for (auto v : contaminants) {
+  for (const auto &v : contaminants) {
     const std::size_t cand =
       std::max(get_overlap(v.second, seq), get_overlap(seq, v.second));
     if (cand > best) {
@@ -2241,14 +2241,24 @@ ModuleOverrepresentedSequences::make_grade() {
   }
 }
 
+const std::string &
+ModuleOverrepresentedSequences::source_of(const std::size_t i) {
+  if (overrep_sources.size() != overrep_sequences.size())
+    overrep_sources.assign(overrep_sequences.size(), std::string());
+  if (overrep_sources[i].empty())
+    overrep_sources[i] = get_matching_contaminant(overrep_sequences[i].first);
+  return overrep_sources[i];
+}
+
 void
 ModuleOverrepresentedSequences::write_module(std::ostream &os) {
   if (std::size(overrep_sequences) > 0)
     os << "#Sequence\tCount\tPercentage\tPossible Source\n";
-  for (auto seq : overrep_sequences) {
+  for (std::size_t i = 0; i < overrep_sequences.size(); ++i) {
+    const auto &seq = overrep_sequences[i];
     os << seq.first << "\t" << seq.second << "\t"
        << 100.0 * seq.second / std::max(static_cast<std::size_t>(1), num_reads)
-       << "\t" << get_matching_contaminant(seq.first) << "\n";
+       << "\t" << source_of(i) << "\n";
   }
 }
 
@@ -2267,13 +2277,14 @@ ModuleOverrepresentedSequences::make_html_data() {
   data << "</tr></thead><tbody>";
 
   // All overrep sequences
-  for (auto v : overrep_sequences) {
+  for (std::size_t i = 0; i < overrep_sequences.size(); ++i) {
+    const auto &v = overrep_sequences[i];
     data << "<tr><td>" << v.first << "</td>";
     data << "<td>" << v.second << "</td>";
     data << "<td>"
          << 100.0 * v.second / std::max(static_cast<std::size_t>(1), num_reads)
          << "</td>";
-    data << "<td>" << get_matching_contaminant(v.first) << "</td>";
+    data << "<td>" << source_of(i) << "</td>";
     data << "</tr>";
   }
   data << "</tbody></table>";

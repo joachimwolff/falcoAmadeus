@@ -371,6 +371,10 @@ struct ModuleOverrepresentedSequences : public Module {
 
   std::size_t num_reads{};
   std::vector<std::pair<std::string, std::size_t>> overrep_sequences;
+  // [FalcoAmadeus] possible source of each overrepresented sequence, looked
+  // up once for the text and the HTML report
+  std::vector<std::string> overrep_sources;
+  const std::string &source_of(std::size_t i);
   double grade_warn{};
   double grade_error{};
   std::vector<std::pair<std::string, std::string>> contaminants;
