@@ -103,15 +103,17 @@ struct FpSpan {
 // exact counts; the parse threads count each bucket as they write the keys.
 constexpr unsigned FP_BUCKET_BITS = 12;
 
-// Bump allocator for fingerprints in large anonymous regions, backed by huge
-// pages where available: tens of millions of entries are written once by the
-// parse threads and read by the pairing report, and 4 KB first-touch faults
-// from 32 threads were a large part of the paired parse time. Regions are
-// reserved, not committed: only the entries a thread writes become resident,
-// so each thread takes one large region and appends its ranges to it.
+// Bump allocator for fingerprints in large anonymous regions: tens of millions
+// of entries are written once by the parse threads and read by the pairing
+// report. Regions are reserved, not committed: only the entries a thread
+// writes become resident, so each thread takes one large region and appends
+// its ranges to it. No huge-page advice: where transparent huge pages are
+// defragmented on demand (defrag "madvise", a common default), the first
+// touch of an advised region compacts memory synchronously, which on a host
+// with a full page cache stalled the paired read for up to a second.
 class FpArena {
  public:
-  explicit FpArena(bool huge = true) : huge_(huge) {}
+  FpArena() = default;
   FpArena(const FpArena &) = delete;
   FpArena &operator=(const FpArena &) = delete;
   ~FpArena() { release(); }
@@ -120,10 +122,6 @@ class FpArena {
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (p == MAP_FAILED)
       throw std::bad_alloc();
-#ifdef MADV_HUGEPAGE
-    if (huge_)
-      madvise(p, bytes, MADV_HUGEPAGE);
-#endif
     std::lock_guard<std::mutex> lk(m_);
     blocks_.emplace_back(p, bytes);
     return p;
@@ -135,7 +133,6 @@ class FpArena {
   }
 
  private:
-  bool huge_;
   std::mutex m_;
   std::vector<std::pair<void *, std::size_t>> blocks_;
 };
@@ -143,9 +140,7 @@ class FpArena {
 struct PairedHooks {
   // Fingerprints of every read in file order, as spans (one per parse range)
   // into the arenas; the names are released once the mates are compared.
-  // (names are small and short-lived: regular pages, no per-thread 2 MB
-  // remainder)
-  FpArena key_arena{true}, name_arena{false};
+  FpArena key_arena, name_arena;
   std::vector<FpSpan> spans;
   // per parse thread: number of keys in each bucket (see FP_BUCKET_BITS)
   std::vector<std::vector<std::uint32_t>> key_hist;

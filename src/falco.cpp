@@ -963,17 +963,9 @@ exact_from_groups(const KeyGroups &g, const std::size_t n,
     }
     bstart[b1] = acc;
     if (tmp.size() < acc) {
-      tmp.resize(acc);  // scratch, reused by the caller across calls
-#ifdef MADV_HUGEPAGE
-      // the scratch is filled by all threads at once: 2 MB pages keep the
-      // first-touch faults few
-      const std::uintptr_t a0 = reinterpret_cast<std::uintptr_t>(tmp.data());
-      const std::uintptr_t lo = (a0 + 4095) & ~std::uintptr_t(4095);
-      const std::uintptr_t hi =
-        (a0 + acc * sizeof(std::uint64_t)) & ~std::uintptr_t(4095);
-      if (hi > lo)
-        madvise(reinterpret_cast<void *>(lo), hi - lo, MADV_HUGEPAGE);
-#endif
+      // scratch, reused by the caller across calls. No huge-page advice
+      // (see FpArena): its first touch could stall on memory compaction.
+      tmp.resize(acc);
     }
 #ifdef _OPENMP
 #pragma omp parallel for num_threads(nthreads) schedule(dynamic, 1)

@@ -5022,9 +5022,6 @@ decompress_bgzf_libdeflate(const std::string &path, std::size_t nthreads) {
     void *m = mmap(nullptr, utotal, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (m != MAP_FAILED) {
-#ifdef MADV_HUGEPAGE  // Linux-only optimization hint; skipped elsewhere
-      madvise(m, utotal, MADV_HUGEPAGE);
-#endif
       out = static_cast<char *>(m); huge = true;
     }
   }
@@ -6541,9 +6538,6 @@ read_bam_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads) {
     bam_read_serial(config, master);
     return;
   }
-#ifdef MADV_HUGEPAGE  // Linux-only optimization hint; skipped elsewhere
-  madvise(bufmem, 2 * bufcap, MADV_HUGEPAGE);
-#endif
   char *const bufs2[2] = { bufmem, bufmem + bufcap };
   char *buf = bufs2[0];  // the dup-prefix pass below runs single-buffered
   auto rd_bsz = [&](const char *bp, std::size_t q) {
