@@ -57,6 +57,7 @@
 #endif
 
 #include "FalcoConfig.hpp"
+#include "PairDupAware.hpp"
 #include "FastqStats.hpp"
 
 /*************************************************************
@@ -201,6 +202,20 @@ struct PairedHooks {
   };
   std::unique_ptr<DupPrefix> prefix;
 
+  // Error- and UMI-aware duplication (opt-in): when set, the drivers also
+  // keep each read's packed key and UMI for mate number aware_mate (1 or
+  // 2), one part per parsed range in file order (MateSeqs::concat joins
+  // them).
+  const AwareDupOptions *aware = nullptr;
+  int aware_mate = 0;
+  std::vector<MateSeqs> aware_parts;
+  std::size_t aware_reads() const {
+    std::size_t n = 0;
+    for (const MateSeqs &p : aware_parts)
+      n += p.size();
+    return n;
+  }
+
   // Called by a driver, in file order, for each parsed range.
   void take_range(const FpSpan &sp) {
     if (sp.n == 0)
@@ -208,6 +223,40 @@ struct PairedHooks {
     spans.push_back(sp);
     num_reads += sp.n;
   }
+};
+
+// A range's aware-duplication records, moved to the parsing thread for the
+// range (as LocalGCBuf: neighbouring ranges' vectors share cache lines).
+struct LocalAwareBuf {
+  LocalAwareBuf(PairedHooks *h, std::vector<MateSeqs> &parts, std::size_t r)
+    : on(h && h->aware), h_(h), shared_(on ? &parts[r] : nullptr) {
+    if (on) {
+      std::swap(v, *shared_);
+      v.clear();
+    }
+  }
+  ~LocalAwareBuf() {
+    if (on) {
+      v.shrink();  // the part is kept until the end of the read
+      std::swap(v, *shared_);
+    }
+  }
+  LocalAwareBuf(const LocalAwareBuf &) = delete;
+  LocalAwareBuf &operator=(const LocalAwareBuf &) = delete;
+  // one record: header from rec to the sequence, the sequence of seqlen
+  // bytes (a trailing '\r' is dropped)
+  void add(const char *rec, const char *seq, std::size_t seqlen) {
+    if (seqlen && seq[seqlen - 1] == '\r')
+      --seqlen;
+    v.add(rec, static_cast<std::size_t>(seq - rec), seq, seqlen, *h_->aware,
+          h_->aware_mate);
+  }
+  const bool on;
+  MateSeqs v;
+
+ private:
+  PairedHooks *h_;
+  MateSeqs *shared_;
 };
 
 // Per-thread write position into a PairedHooks' arenas.

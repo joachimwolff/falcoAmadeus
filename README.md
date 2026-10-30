@@ -36,6 +36,13 @@ original apart from the corrected N-content grade.
   where a pair is a copy only when *both* mates match, counted exactly over
   all reads and therefore independent of read order, next to the per-mate
   rates and the FastQC-style estimates for comparison with FastQC/falco.
+  On request the report adds an **error- and UMI-aware rate**:
+  `--dup-mismatches N` lets the mates of two copies differ in up to N bases in
+  total (copies with sequencing errors), and `--umi-r1`/`--umi-r2 START:LEN`
+  or `--umi-in-name` keep pairs with different unique molecular identifiers
+  apart (`--umi-mismatches` tolerates errors in the UMI). Candidates are found
+  through k-mer blocks shared by both mates and confirmed base by base, so the
+  rate stays exact for the stated tolerance and independent of read order.
   Sequence duplication reflects PCR duplicates as well as natural redundancy
   (deep coverage, highly expressed or enriched loci). Per-mate
   `fastqc_data.txt` files are kept for MultiQC.
@@ -272,6 +279,14 @@ This generates three files in the output directory:
 $ falcoAmadeus R1.fastq.gz --paired-with R2.fastq.gz -o out/
 ```
 
+with copies allowed to differ in two bases, and an 8 nt UMI at the start of
+read 2 that may carry one error:
+
+```
+$ falcoAmadeus R1.fastq.gz --paired-with R2.fastq.gz --dup-mismatches 2 \
+    --umi-r2 1:8 --umi-mismatches 1 -o out/
+```
+
 **Assay-aware grading** (here for a bisulfite / EM-seq library):
 
 ```
@@ -286,6 +301,10 @@ FalcoAmadeus-specific options:
 | --- | --- |
 | `--paired-with R2` | Analyse the R2 mate together with the R1 positional input; write one combined report and `paired_duplication.txt`. Rejects mates whose read identifiers disagree. |
 | `--allow-unmatched-pairs` | With `--paired-with`, proceed even when R1/R2 read identifiers disagree. |
+| `--dup-mismatches N` | With `--paired-with`, also report a paired duplicate rate in which copies may differ in up to N bases over both mates (at most 8). |
+| `--umi-r1 START:LEN`, `--umi-r2 START:LEN` | The UMI lies in read 1 or read 2 at a 1-based position; pairs are copies only when their UMIs agree, and the UMI bases are left out of the sequence comparison. |
+| `--umi-in-name` | The UMI is the last `:` or `_` separated field of the read 1 name (bcl-convert, UMI-tools extract, fastp). |
+| `--umi-mismatches N` | Bases in which the UMIs of two copies may differ (default 0). |
 | `--paired-data mates\|combined\|both` | With `--paired-with`, which `fastqc_data.txt` files to emit for MultiQC: separate mates (default), a single pooled sample, or both. |
 | `--assay TYPE` | Assay-aware pass/warn/fail grading (`rnaseq`, `amplicon`, `wgbs`/`emseq`/`rrbs`, `chipseq`, `atac`, `smallrna`, `wgs`, …; default `generic` is byte-identical to falco). |
 | `--conversion-residual F` | For bisulfite assays, the residual unmethylated-base fraction (0–1) above which a possible incomplete-conversion warning is emitted. |

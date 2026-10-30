@@ -2,6 +2,24 @@
 
 ## FalcoAmadeus 4
 
+### Added
+
+- **Error- and UMI-aware paired duplication** (opt-in). An exact paired
+  count misses PCR copies that carry a sequencing error and merges distinct
+  molecules that share a sequence. `--dup-mismatches N` adds a rate to
+  `paired_duplication.txt` in which the mates of two copies may differ in up
+  to N bases in total, in either mate order; `--umi-r1`/`--umi-r2
+  START:LEN` (UMI in the read, left out of the comparison) or
+  `--umi-in-name` (UMI as the last field of the read name) require the UMIs
+  to agree, up to `--umi-mismatches` bases. Candidate pairs share one
+  k-mer block of each mate (each mate split into N + 1 blocks) and are
+  confirmed base by base; copies are grouped transitively, so the rate does
+  not depend on read order. The records are collected during the normal
+  parse. Against Picard MarkDuplicates on mouse RNA-seq (DRR041223) the
+  paired rate with two mismatches finds 97.9% of Picard's duplicates (exact
+  matching: 80%), and 99.1% of the copies it counts are Picard duplicates.
+  Tested against an all-pairs oracle (`test/aware`).
+
 ### Changed
 
 - **Paired-end duplication is counted exactly.** `paired_duplication.txt`

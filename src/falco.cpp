@@ -25,6 +25,7 @@
 
 #include "OptionParser.hpp"
 #include "StreamReader.hpp"
+#include "PairDupAware.hpp"
 #include "smithlab_utils.hpp"
 
 #include "config.h"
@@ -575,10 +576,12 @@ class FastqByteSource {
 #endif
 };
 
-static MateFingerprints
-fingerprint_mate(const std::string &file) {
+// Calls f(name, name_len, seq, seq_len) for every FASTQ record of the file
+// (name = the header line), in file order. Throws on a truncated record.
+template <class F>
+static void
+for_each_fastq_record(const std::string &file, F f) {
   FastqByteSource src(file);
-  MateFingerprints m;
   const std::size_t BLOCK = std::size_t(4) << 20;
   std::vector<char> buf(BLOCK);
   std::size_t beg = 0, end = 0;
@@ -615,11 +618,7 @@ fingerprint_mate(const std::string &file) {
       if (!line(beg, h_e, h_n) || !line(h_n, s_e, s_n) ||
           !line(s_n, p_e, p_n) || !line(p_n, q_e, q_n))
         break;
-      // the same fingerprints the parse drivers compute (PairedHooks)
-      const std::size_t slen = s_e - h_n;
-      m.name_fp.push_back(pair_name_fp(buf.data() + beg, buf.data() + h_e));
-      m.key_fp.push_back(
-        DupHashMap::fingerprint(buf.data() + h_n, get_truncate_point(slen)));
+      f(buf.data() + beg, h_e - beg, buf.data() + h_n, s_e - h_n);
       beg = q_n;
     }
     if (at_eof) {
@@ -638,6 +637,17 @@ fingerprint_mate(const std::string &file) {
       at_eof = true;
     end += got;
   }
+}
+
+static MateFingerprints
+fingerprint_mate(const std::string &file) {
+  MateFingerprints m;
+  // the same fingerprints the parse drivers compute (PairedHooks)
+  for_each_fastq_record(file, [&](const char *h, const std::size_t hl,
+                                  const char *seq, const std::size_t sl) {
+    m.name_fp.push_back(pair_name_fp(h, h + hl));
+    m.key_fp.push_back(DupHashMap::fingerprint(seq, get_truncate_point(sl)));
+  });
   return m;
 }
 
@@ -1330,6 +1340,93 @@ paired_duplication_report(FpView &k1, FpView &k2,
   return pstats;
 }
 
+// [FalcoAmadeus] --umi-in-name: throws unless the first read name of the
+// file carries a UMI.
+void
+check_umi_in_first_name(const std::string &file) {
+  gzFile f = gzopen(file.c_str(), "rb");
+  if (f == nullptr)
+    throw std::runtime_error("cannot open " + file);
+  char line[4096];
+  const bool got = gzgets(f, line, sizeof line) != nullptr;
+  gzclose(f);
+  MateSeqs probe;
+  AwareDupOptions o;
+  o.umi_in_name = true;
+  const std::string seq = "A";
+  if (got)
+    probe.add(line, std::strlen(line), seq.data(), seq.size(), o, 1);
+  if (!got || probe.no_umi > 0)
+    throw std::runtime_error(
+      "--umi-in-name: the read names of " + file + " do not end in a UMI "
+      "(a last ':' or '_' separated field of bases), e.g. " +
+      std::string(got ? line : "") );
+}
+
+// [FalcoAmadeus] Error- and UMI-aware paired duplication (opt-in): reads
+// both mates once more on two threads and appends its section to the
+// paired report.
+void
+append_aware_duplication(const std::string &r1_file,
+                         const std::string &r2_file,
+                         const std::string &out_file,
+                         const AwareDupOptions &opt, const bool quiet,
+                         const std::size_t nthreads,
+                         MateSeqs *pre1 = nullptr, MateSeqs *pre2 = nullptr) {
+  MateSeqs own1, own2;
+  MateSeqs &m1 = pre1 ? *pre1 : own1, &m2 = pre2 ? *pre2 : own2;
+  if (!pre1 || !pre2) {
+    std::exception_ptr err2;
+    std::thread t2([&] {
+      try {
+        for_each_fastq_record(r2_file, [&](const char *h,
+                                           const std::size_t hl,
+                                           const char *q,
+                                           const std::size_t ql) {
+          m2.add(h, hl, q, ql, opt, 2);
+        });
+      }
+      catch (...) {
+        err2 = std::current_exception();
+      }
+    });
+    try {
+      for_each_fastq_record(r1_file, [&](const char *h, const std::size_t hl,
+                                         const char *q, const std::size_t ql) {
+        m1.add(h, hl, q, ql, opt, 1);
+      });
+    }
+    catch (...) {
+      t2.join();
+      throw;
+    }
+    t2.join();
+    if (err2)
+      std::rethrow_exception(err2);
+  }
+  if (std::getenv("FA_TIMES"))
+    std::fprintf(stderr, "[FA_TIMES aware] scan done\n");
+  if (m1.size() != m2.size())
+    throw std::runtime_error("paired-end inputs have different numbers of "
+                             "reads: " + r1_file + " and " + r2_file);
+  if (opt.umi_in_name && m1.size() > 0 && m1.no_umi == m1.size())
+    throw std::runtime_error("--umi-in-name: no read name in " + r1_file +
+                             " ends in a UMI (a last ':' or '_' separated "
+                             "field of bases)");
+  const char *dump = std::getenv("FA_AWARE_CLUSTERS");
+  const AwareDupResult r =
+    aware_duplication(m1, m2, opt, nthreads, dump ? dump : "");
+  std::ofstream os(out_file, std::ofstream::binary | std::ofstream::app);
+  write_aware_section(os, r, opt);
+  if (!os.good())
+    throw std::runtime_error("Failed to write paired duplication file: " +
+                             out_file);
+  if (!quiet)
+    std::cerr << "[paired-end duplication] error/UMI-aware rate "
+              << r.duplicate_rate() << " % (" << r.clusters << " groups of "
+              << r.pairs << " pairs)\n";
+}
+
 }  // namespace
 
 // Case-insensitive check that `s` ends with `suf`.
@@ -1689,6 +1786,9 @@ paired_fused_read(const FalcoConfig &falco_config, const std::string &r1,
   pf.h1.on_comb_map = publish;
   pf.c1->paired_hooks = &pf.h1;
   pf.c2->paired_hooks = &pf.h2;
+  pf.h1.aware = pf.h2.aware = falco_config.aware_dup;
+  pf.h1.aware_mate = 1;
+  pf.h2.aware_mate = 2;
   pf.s1.reset(new FastqStats(pf.c1->do_kmer));
   pf.s2.reset(new FastqStats(pf.c2->do_kmer));
   std::exception_ptr err1;
@@ -2149,6 +2249,8 @@ main(int argc, char *argv[]) {
 
     // [FalcoAmadeus] optional R2 file for corrected paired-end duplication
     std::string paired_with_file = "";
+    AwareDupOptions aware_opt;
+    std::string umi_r1_arg, umi_r2_arg;
 
     /****************** COMMAND LINE OPTIONS ********************/
     OptionParser opt_parse(argv[0],
@@ -2370,6 +2472,42 @@ main(int argc, char *argv[]) {
       false, falco_config.allow_unmatched_pairs);
 
     opt_parse.add_opt(
+      "-dup-mismatches", '\0',
+      "[FalcoAmadeus] With --paired-with, also report a paired duplicate rate "
+      "in which two pairs are copies when their duplication keys differ in at "
+      "most this many bases over both mates (sequencing errors), in either "
+      "mate order. 0 (default) adds no such rate unless a UMI is given. At "
+      "most 8.",
+      false, aware_opt.mismatches);
+
+    opt_parse.add_opt(
+      "-umi-r1", '\0',
+      "[FalcoAmadeus] With --paired-with, the UMI lies in read 1 at START:LEN "
+      "(1-based, e.g. 1:8). Pairs are copies only when their UMIs agree "
+      "(see --umi-mismatches); the UMI bases are left out of the sequence "
+      "comparison.",
+      false, umi_r1_arg);
+
+    opt_parse.add_opt(
+      "-umi-r2", '\0',
+      "[FalcoAmadeus] As --umi-r1, for a UMI in read 2.",
+      false, umi_r2_arg);
+
+    opt_parse.add_opt(
+      "-umi-in-name", '\0',
+      "[FalcoAmadeus] With --paired-with, the UMI is the last ':' or '_' "
+      "separated field of the read 1 name (as written by bcl-convert, "
+      "umi_tools extract or fastp); '+' and '-' between UMI parts are "
+      "ignored.",
+      false, aware_opt.umi_in_name);
+
+    opt_parse.add_opt(
+      "-umi-mismatches", '\0',
+      "[FalcoAmadeus] Bases in which the UMIs of two copies may differ "
+      "(default 0).",
+      false, aware_opt.umi_mismatches);
+
+    opt_parse.add_opt(
       "-legacy-n-content-grade", '\0',
       "[FalcoAmadeus] Grade Per base N content as falco 1.x does, where the "
       "module never warns or fails. By default it is graded as in FastQC: "
@@ -2407,6 +2545,25 @@ main(int argc, char *argv[]) {
       std::cerr << opt_parse.help_message() << '\n';
       return EXIT_SUCCESS;
     }
+
+    if (!umi_r1_arg.empty())
+      parse_umi_region(umi_r1_arg, aware_opt.umi1_start, aware_opt.umi1_len);
+    if (!umi_r2_arg.empty())
+      parse_umi_region(umi_r2_arg, aware_opt.umi2_start, aware_opt.umi2_len);
+    if (aware_opt.enabled() && paired_with_file.empty())
+      throw std::runtime_error("--dup-mismatches, --umi-r1, --umi-r2 and "
+                               "--umi-in-name require --paired-with");
+    if (aware_opt.umi_in_name &&
+        (aware_opt.umi1_len > 0 || aware_opt.umi2_len > 0))
+      throw std::runtime_error("--umi-in-name cannot be combined with "
+                               "--umi-r1 or --umi-r2");
+    if (aware_opt.umi_mismatches > 0 && !aware_opt.has_umi())
+      throw std::runtime_error("--umi-mismatches requires a UMI (--umi-r1, "
+                               "--umi-r2 or --umi-in-name)");
+    if (aware_opt.mismatches > 8)
+      throw std::runtime_error("--dup-mismatches must be at most 8");
+    if (aware_opt.enabled())
+      falco_config.aware_dup = &aware_opt;
 
     // [FalcoAmadeus] validate --assay (case-insensitive) before doing any work.
     std::transform(std::begin(falco_config.assay), std::end(falco_config.assay),
@@ -2592,6 +2749,10 @@ main(int argc, char *argv[]) {
                        std::chrono::duration<double>(now - pmark).count());
           pmark = now;
         };
+        // a UMI requested from the read names must be there before the
+        // reads are analysed
+        if (aware_opt.umi_in_name)
+          check_umi_in_first_name(filename);
         PairedFused pf;
         std::size_t fused_matching = 0;
         const bool fused =
@@ -2812,6 +2973,25 @@ main(int argc, char *argv[]) {
         if (report_err)
           std::rethrow_exception(report_err);
         plap("pairing report");
+        if (aware_opt.enabled()) {
+          // the mates' records come from the fused read when it collected
+          // them, otherwise from a separate scan
+          const bool have = fused && !pf.h1.failed && !pf.h2.failed &&
+                            pf.h1.aware_reads() == ps.pairs &&
+                            pf.h2.aware_reads() == ps.pairs;
+          MateSeqs a1, a2;
+          if (have) {
+            a1 = MateSeqs::concat(pf.h1.aware_parts, falco_config.threads);
+            a2 = MateSeqs::concat(pf.h2.aware_parts, falco_config.threads);
+          }
+          std::vector<MateSeqs>().swap(pf.h1.aware_parts);
+          std::vector<MateSeqs>().swap(pf.h2.aware_parts);
+          append_aware_duplication(filename, paired_with_file, paired_out,
+                                   aware_opt, falco_config.quiet,
+                                   falco_config.threads, have ? &a1 : nullptr,
+                                   have ? &a2 : nullptr);
+          plap("aware duplication");
+        }
       }
 
       /************************** TIME SUMMARY *****************************/

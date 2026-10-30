@@ -48,6 +48,8 @@ falcoAmadeus_SOURCES = \
 	src/FalcoConfig.cpp \
 	src/OptionParser.cpp \
 	src/smithlab_utils.cpp \
+	src/PairDupAware.cpp \
+	src/PairDupAware.hpp \
 	src/Module.hpp \
 	src/FastqStats.hpp \
 	src/HtmlMaker.hpp \

@@ -90,6 +90,7 @@ std::string valid_assay_list();
 
 // config from options, constants, magic numbers, etc
 struct PairedHooks;  // StreamReader.hpp
+struct AwareDupOptions;  // PairDupAware.hpp
 
 struct FalcoConfig {
   static const std::string FalcoVersion;
@@ -209,6 +210,9 @@ struct FalcoConfig {
   // [FalcoAmadeus] per-read outputs for native paired-end mode (falco.cpp);
   // honoured by the FASTQ parse drivers, null otherwise
   PairedHooks *paired_hooks = nullptr;
+  // [FalcoAmadeus] error- and UMI-aware paired duplication options, when
+  // requested: the paired hooks then also collect its per-read records
+  const AwareDupOptions *aware_dup = nullptr;
 
   /*********** FUNCTIONS TO READ FILES *************/
   void define_file_format();

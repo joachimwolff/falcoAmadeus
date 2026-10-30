@@ -3425,6 +3425,8 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
   }
   std::vector<FpSpan> rspan(H ? R_MAX : 0);  // fingerprints per range
   std::vector<FpSlab> slabs(nthreads);        // per-thread arena position
+  // aware-duplication records per range (opt-in, see PairedHooks)
+  std::vector<MateSeqs> raware(H && H->aware ? R_MAX : 0);
   // second mate of tiled pairs: the combined view's tile reconstruction and
   // quality sums (see PairedHooks)
   const bool comb_tiles = H && !tile_ignore && H->comb_tiles;
@@ -3534,6 +3536,8 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
           if (H)
             for (std::size_t r = 0; r < nranges; ++r)
               H->take_range(rspan[r]);
+          for (std::size_t r = 0; r < raware.size() && r < nranges; ++r)
+            H->aware_parts.push_back(std::move(raware[r]));
           if (!tile_ignore)
             tiles.fold(nranges);
           if (comb_tiles)
@@ -3763,6 +3767,7 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
         const std::size_t fp0 =
           H ? slabs[tid].reserve(*H, (pend - p) / 6 + 2) : 0;
         std::uint32_t *const khist = H ? H->key_hist[tid].data() : nullptr;
+        LocalAwareBuf abuf(H, raware, r);
         std::uint64_t chh = 0;
         const char *cpp = nullptr;
         std::size_t cpn = 0;
@@ -3789,6 +3794,8 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
             hk = pair_fingerprints(base + rec_start, base + plimit, key,
                                    seqlen, slabs[tid].key[fp0 + n - 1],
                                    slabs[tid].name[fp0 + n - 1]);
+            if (abuf.on)
+              abuf.add(base + rec_start, key, seqlen);
             ++khist[slabs[tid].key[fp0 + n - 1] >> (64 - FP_BUCKET_BITS)];
             if (cm) {  // combined view, deferred by one read like the
                        // mate's own count below
@@ -4049,6 +4056,8 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
   }
   std::vector<FpSpan> rspan(H ? R_MAX : 0);  // fingerprints per range
   std::vector<FpSlab> slabs(nthreads);        // per-thread arena position
+  // aware-duplication records per range (opt-in, see PairedHooks)
+  std::vector<MateSeqs> raware(H && H->aware ? R_MAX : 0);
   // second mate of tiled pairs: the combined view's tile reconstruction and
   // quality sums (see PairedHooks)
   const bool comb_tiles = H && !tile_ignore && H->comb_tiles;
@@ -4125,6 +4134,8 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
             if (H)
               for (std::size_t r = 0; r < nranges; ++r)
                 H->take_range(rspan[r]);
+            for (std::size_t r = 0; r < raware.size() && r < nranges; ++r)
+              H->aware_parts.push_back(std::move(raware[r]));
             if (!tile_ignore)
               tiles.fold(nranges);
             if (comb_tiles)
@@ -4355,6 +4366,7 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
         const std::size_t fp0 =
           H ? slabs[tid].reserve(*H, (pend - p) / 6 + 2) : 0;
         std::uint32_t *const khist = H ? H->key_hist[tid].data() : nullptr;
+        LocalAwareBuf abuf(H, raware, r);
         std::uint64_t chh = 0;
         const char *cpp = nullptr;
         std::size_t cpn = 0;
@@ -4381,6 +4393,8 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
             hk = pair_fingerprints(buf + rec_start, buf + plimit, key,
                                    seqlen, slabs[tid].key[fp0 + n - 1],
                                    slabs[tid].name[fp0 + n - 1]);
+            if (abuf.on)
+              abuf.add(buf + rec_start, key, seqlen);
             ++khist[slabs[tid].key[fp0 + n - 1] >> (64 - FP_BUCKET_BITS)];
             if (cm) {  // combined view, deferred by one read like the
                        // mate's own count below
