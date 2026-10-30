@@ -1,0 +1,121 @@
+assay	run	bioproject	biosample	library_strategy	library_selection	layout	spots	avg_length	instrument	study_title
+rnaseq	SRR39821100	PRJNA30709	SAMN61851190	RNA-Seq	cDNA	PAIRED	41498703	150	Illumina HiSeq 2500	GSE35585: RIP-seq from ENCODE/SUNY Albany
+rnaseq	SRR39821026	PRJNA30709	SAMN61850987	RNA-Seq	cDNA	PAIRED	45299969	150	Illumina HiSeq 2500	GSE35585: RIP-seq from ENCODE/SUNY Albany
+rnaseq	SRR39821025	PRJNA30709	SAMN61851441	RNA-Seq	cDNA	PAIRED	45911446	150	Illumina HiSeq 2500	GSE35585: RIP-seq from ENCODE/SUNY Albany
+rnaseq	SRR39821016	PRJNA30709	SAMN61851413	RNA-Seq	cDNA	PAIRED	38634180	150	Illumina HiSeq 2500	GSE35585: RIP-seq from ENCODE/SUNY Albany
+rnaseq	SRR39821001	PRJNA30709	SAMN18814451	RNA-Seq	cDNA	PAIRED	41298496	150	Illumina HiSeq 2500	GSE35585: RIP-seq from ENCODE/SUNY Albany
+rnaseq	SRR39820989	PRJNA30709	SAMN61851227	RNA-Seq	cDNA	SINGLE	368873614	264	NextSeq 2000	GSE35585: RIP-seq from ENCODE/SUNY Albany
+rnaseq	SRR41291435	PRJNA1548185	SAMN64332777	RNA-Seq	PolyA	PAIRED	15975551	92	Illumina NovaSeq X Plus	Specificity of TIGR-Tas mediated transcription activation
+rnaseq	SRR33544476	PRJNA1262438	SAMN48454631	RNA-Seq	PolyA	PAIRED	45743354	302	Illumina NovaSeq 6000	PROTACs therapeutically target the polyglutamine androgen receptor in spinal and bulbar muscular atrophy models
+rnaseq	SRR41262580	PRJNA1546160	SAMN64305325	RNA-Seq	cDNA	PAIRED	27042508	300	Illumina NovaSeq 6000	Metabolic, viral, and immune phenotypes in long COVID
+rnaseq	SRR41265068	PRJNA1546978	SAMN64308874	RNA-Seq	PolyA	PAIRED	29548094	302	Illumina NovaSeq 5000	Effect of cannabidiol (CBD) on human periodontal ligament and gingival fibroblast cells
+rnaseq	SRR41247469	PRJNA1545749	SAMN64280538	RNA-Seq	PolyA	PAIRED	23180599	302	Illumina NovaSeq X	Transcriptomic responses to cordycepin in human dental pulp stem cells under inflammatory osteogenic conditions
+rnaseq	SRR41253893	PRJNA1545930	SAMN64299327	RNA-Seq	cDNA	PAIRED	20564133	302	Illumina NovaSeq X Plus	Transcriptome profiling of human trophoblast cells under hypoxic conditions with three treatment groups
+smallrna	ERR6044599	PRJEB45607	SAMEA9147878	miRNA-Seq	PCR	SINGLE	8688076	75	NextSeq 500	Cross-platform standardization for the identification of circulating miRNAs associated with a risk of distant recurrence in oestrogen receptor-positive breast cancers.
+smallrna	SRR40694654	PRJNA1528503	SAMN63167706	miRNA-Seq	cDNA_oligo_dT	PAIRED	14645514	302	Illumina NovaSeq 6000	Panel of seven-miRNA as a robust predictive biomarker to predict adjuvant chemotherapy response in stage II and III Gastric Cancer
+smallrna	ERR15652171	PRJEB98210	SAMEA120263598	miRNA-Seq	RT-PCR	SINGLE	21035567	72	NextSeq 2000	Small RNA seq of HepG2 cells expressing shRNA targeting wild-type, mutated or both ß-catenin versus shRNA control
+smallrna	DRR1089395	PRJDB43024	SAMD01959811	miRNA-Seq	size fractionation	PAIRED	16360779	300	Illumina NovaSeq 6000	ADAR1p150-mediated regulation of Dicer-dependent microRNA processing in response to interferon
+smallrna	ERR17751212	PRJEB123123	SAMEA123284393	miRNA-Seq	size fractionation	SINGLE	11467067	50	Illumina NovaSeq 6000	Identification and functional characterization of novel microRNAs from human umbilical cord mesenchymal stem cell-derived extracellular vesicles
+smallrna	SRR41158166	PRJNA1543036	SAMN64169366	miRNA-Seq	size fractionation	SINGLE	21482577	50	Illumina NovaSeq 6000	Molecular Heterogeneity within Normozoospermia: A Pilot Pooled Small RNA Sequencing Study
+smallrna	SRR40422693	PRJNA1497052	SAMN61768641	miRNA-Seq	cDNA	PAIRED	23046857	202	Illumina NovaSeq X	SHED exosomes treating Alzheimers disease cerebral organoids
+smallrna	SRR40572125	PRJNA1525742	SAMN63018567	miRNA-Seq	size fractionation	PAIRED	36879950	100	Illumina NovaSeq X	miRNA and mRNA sequencing from RENCA and ACHN cells
+smallrna	SRR40960793	PRJNA1537705	SAMN63701240	miRNA-Seq	size fractionation	SINGLE	45645710	76	Illumina NovaSeq X Plus	Small RNA sequencing of exosomes
+smallrna	ERR6044598	PRJEB45607	SAMEA9147877	miRNA-Seq	PCR	SINGLE	8001988	75	NextSeq 500	Cross-platform standardization for the identification of circulating miRNAs associated with a risk of distant recurrence in oestrogen receptor-positive breast cancers.
+smallrna	SRR40694507	PRJNA1528503	SAMN63167522	miRNA-Seq	cDNA_oligo_dT	PAIRED	11334995	302	Illumina NovaSeq 6000	Panel of seven-miRNA as a robust predictive biomarker to predict adjuvant chemotherapy response in stage II and III Gastric Cancer
+smallrna	ERR15652170	PRJEB98210	SAMEA120263597	miRNA-Seq	RT-PCR	SINGLE	23105455	72	NextSeq 2000	Small RNA seq of HepG2 cells expressing shRNA targeting wild-type, mutated or both ß-catenin versus shRNA control
+atac	ERR17885947	PRJEB115769	SAMEA123355423	ATAC-seq	other	PAIRED	1100256	120	Illumina NovaSeq X Plus	accessibility profiling reveals genome-epigenome coevolution in colorectal cancer
+atac	SRR41206965	PRJNA1544558	SAMN64227841	ATAC-seq	cDNA	PAIRED	44337983	300	Illumina NovaSeq X	Chromatin accessibility profiling of NIPBL-suppressed human endothelial cells under high-glucose stress
+atac	DRR1144556	PRJDB45772	SAMD02109246	ATAC-seq	other	PAIRED	26624850	300	Illumina NovaSeq X Plus	Integrated RNA-seq and ATAC-seq profi ling for the assessment of chemically induced infl ammatory responses in human TK6 cells
+atac	SRR41018566	PRJNA1539810	SAMN63992140	ATAC-seq	DNase	PAIRED	51958636	300	NextSeq 550	Molecular memory programs osmoadaptive resilience in glioblastoma stem cells
+atac	SRR39821097	PRJNA63443	SAMN30347978	ATAC-seq	other	SINGLE	79271981	198	Illumina NovaSeq 6000	GSE59395: Genome-wide map of regulatory interactions in the human genome
+atac	ERR17885940	PRJEB115769	SAMEA123355423	ATAC-seq	other	PAIRED	1249214	120	Illumina NovaSeq X Plus	accessibility profiling reveals genome-epigenome coevolution in colorectal cancer
+atac	SRR41206964	PRJNA1544558	SAMN64227842	ATAC-seq	cDNA	PAIRED	42425157	300	Illumina NovaSeq X	Chromatin accessibility profiling of NIPBL-suppressed human endothelial cells under high-glucose stress
+atac	DRR1144555	PRJDB45772	SAMD02109245	ATAC-seq	other	PAIRED	28639340	300	Illumina NovaSeq X Plus	Integrated RNA-seq and ATAC-seq profi ling for the assessment of chemically induced infl ammatory responses in human TK6 cells
+atac	SRR41018565	PRJNA1539810	SAMN63992139	ATAC-seq	DNase	PAIRED	54187899	300	NextSeq 550	Molecular memory programs osmoadaptive resilience in glioblastoma stem cells
+atac	SRR40668046	PRJNA1529387	SAMN63140874	ATAC-seq	other	PAIRED	38555512	225	Illumina NovaSeq 6000	SCGFb Mediates Actin Cytoskeletal Remodeling in CAFs
+atac	SRR40248545	PRJNA1257785	SAMN62529590	ATAC-seq	other	PAIRED	43489364	300	Illumina NovaSeq 6000	E2F1 induces a G0-G1 re-entry transcriptional program without changing chromatin accessibility [ATAC-seq]
+atac	SRR39864081	PRJNA1502992	SAMN62000536	ATAC-seq	other	PAIRED	114041826	75	Illumina NovaSeq 6000	CTCFL(BORIS) contributes to the transcriptional program of ovarian cancer by relaxing CTCF-mediated three-dimensional genome organization
+chipseq	SRR39821074	PRJNA63443	SAMN61851453	ChIP-Seq	ChIP	PAIRED	27077478	202	Illumina NovaSeq 6000	GSE59395: Genome-wide map of regulatory interactions in the human genome
+chipseq	SRR39952986	PRJNA1298184	SAMN62099324	ChIP-Seq	ChIP	PAIRED	194474423	120	Illumina NovaSeq X	An unbiased survey of distal element-gene regulatory interactions with direct-capture targeted Perturb-seq
+chipseq	SRR33972983	PRJNA1276584	SAMN49077744	ChIP-Seq	ChIP	PAIRED	28482968	301	Illumina NovaSeq X Plus	KOLF2.1J iTF-Microglia: A standardized platform to study microglial transcriptional regulatory networks in CNS disease [ChIP-seq]
+chipseq	SRR39821073	PRJNA63443	SAMN61851081	ChIP-Seq	ChIP	PAIRED	43402077	202	Illumina NovaSeq 6000	GSE59395: Genome-wide map of regulatory interactions in the human genome
+chipseq	SRR39952985	PRJNA1298184	SAMN62099323	ChIP-Seq	ChIP	PAIRED	222916860	120	Illumina NovaSeq X	An unbiased survey of distal element-gene regulatory interactions with direct-capture targeted Perturb-seq
+chipseq	SRR33972982	PRJNA1276584	SAMN49077743	ChIP-Seq	ChIP	PAIRED	28940244	301	Illumina NovaSeq X Plus	KOLF2.1J iTF-Microglia: A standardized platform to study microglial transcriptional regulatory networks in CNS disease [ChIP-seq]
+wgbs	SRR11072715	PRJNA606237	SAMN14087897	Bisulfite-Seq	RANDOM	PAIRED	8635445	252	Illumina HiSeq 2500	Hemispheric asymmetry in the human brain and in Parkinson's disease is linked to divergent epigenetic patterns in neurons [Bisulfite_Seq_discovery_cohort]
+wgbs	SRR9854758	PRJNA557204	SAMN12390605	Bisulfite-Seq	RANDOM	PAIRED	2937107	252	Illumina HiSeq 2500	Hemispheric asymmetry in the human brain and in Parkinson's disease is linked to divergent epigenetic patterns in neurons [Bisulfite_Seq_replication_cohort]
+wgbs	SRR35230503	PRJNA1313921	SAMN50929217	Bisulfite-Seq	RANDOM	PAIRED	62015112	302	Illumina NovaSeq X	Integrated epigenetic and genetic programming of primary human T cells [WGBS]
+wgbs	SRR6742932	PRJNA434432	SAMN08557909	Bisulfite-Seq	RANDOM	PAIRED	17744728	252	Illumina HiSeq 2500	Epigenetic dysregulation of enhancers in neurons is associated with Alzheimer's disease pathology and cognitive symptoms (Bisulfite-Seq)
+wgbs	SRR28106288	PRJNA1080627	SAMN40144470	Bisulfite-Seq	RANDOM	PAIRED	66138131	300	Illumina NovaSeq 6000	Cell-free DNA Methylation Patterns in Aging and Their Association with Inflamm-aging
+wgbs	SRR34103767	PRJNA1280811	SAMN49535234	Bisulfite-Seq	RANDOM	PAIRED	148781131	251	Illumina NovaSeq 6000	Memory-like T cells emerge early in circulation after gene therapy for SCID-X1 [Bisulfite-Seq]
+wgbs	SRR38846081	PRJNA63443	SAMN60162594	Bisulfite-Seq	RANDOM	SINGLE	2426254062	100	Illumina HiSeq 2500	GSE59395: Genome-wide map of regulatory interactions in the human genome
+wgbs	SRR32906428	PRJNA1243307	SAMN47623405	Bisulfite-Seq	RANDOM	PAIRED	118073344	302	Illumina NovaSeq 6000	Silencing TET1 expression alters the epigenomic landscape and amplifies transcriptomic responses to allergen in airway epithelial cells
+wgbs	SRR34325725	PRJNA1284948	SAMN49743314	Bisulfite-Seq	RANDOM	PAIRED	304009894	294	Illumina HiSeq 4000	Disordered DNA methylation leads to targetable transcriptional plasticity in ATRT [WGBS cell line]
+wgbs	SRR20318450	PRJNA860202	SAMN29835402	Bisulfite-Seq	RANDOM	PAIRED	166925629	222	Illumina NovaSeq 6000	Accurate simultaneous sequencing of genetic and epigenetic bases in DNA
+wgbs	SRR27696466	PRJNA1068062	SAMN39575488	Bisulfite-Seq	RANDOM	PAIRED	348359645	300	Illumina NovaSeq 6000	PRC2-AgeIndex: a universal biomarker of aging and rejuvenation [WGBS]
+wgbs	SRR33438783	PRJNA1009117	SAMN48349529	Bisulfite-Seq	RANDOM	PAIRED	533163796	300	Illumina NovaSeq 6000	The role of HELLS in human induced pluripotent stem cells
+emseq	SRR37217442	PRJNA1422842	SAMN55324086	Bisulfite-Seq	RANDOM	PAIRED	644155280	302	Illumina NovaSeq X Plus	Using genome-wide DNA methylation patterns to predict age in the zebra shark (Stegostoma tigrinum)
+emseq	SRR34743778	PRJNA1297800	SAMN50238848	Bisulfite-Seq	PCR	PAIRED	12298263	302	Illumina HiSeq 4000	Whole-Genome Enzymatic methyl-seq of Prunus Dulcis: Epicormic and Axillary RAVT Samples
+emseq	SRR13051271	PRJNA200694	SAMN16727315	Bisulfite-Seq	RANDOM	PAIRED	147290500	302	Illumina NovaSeq 6000	A public-private-academic consortium, Genome-in-a-Bottle (GIAB), hosted by NIST to develop reference materials and standards for clinical sequencing
+emseq	ERR15943609	PRJEB104207	SAMEA120587722	Bisulfite-Seq	RANDOM	PAIRED	25214288	277	Illumina NovaSeq 6000	Whole-genome methylome sequencing (EM-seq) of Arabidopsis thaliana Col-0, nuclear-envelope mutants crwn1–4, crwn1 crwn4 and kaku4 at 12 and 150 days after sowing under short-day conditions
+emseq	SRR35280603	PRJNA1321113	SAMN51198292	Bisulfite-Seq	RANDOM	PAIRED	76144232	302	Illumina NovaSeq 6000	Genetic and Epigenetic Stability of Cannabis Micropropagation
+emseq	SRR37887786	PRJNA1446745	SAMN56830503	Bisulfite-Seq	RANDOM	PAIRED	65103456	302	HiSeq X Ten	GEO accession GSE326675 is currently private and is scheduled to be released on Apr 05, 2027.
+emseq	SRR35858135	PRJNA1348328	SAMN52896917	Bisulfite-Seq	RANDOM	PAIRED	17631357	300	Illumina NovaSeq X Plus	Development of a Simple and Locus-Restricted DNA Methylation Editing System Using Direct Fusion of a Nickase-Type SpCas9 and DNA Methylation-Related Enzymes in Arabidopsis thaliana
+emseq	SRR30812846	PRJNA1164696	SAMN43905728	Bisulfite-Seq	RANDOM	PAIRED	261370118	200	Illumina NovaSeq 6000	Small RNA and epigenetic silencing of transposons in Spirodela polyrhiza 9509
+emseq	SRR37304395	PRJNA1405057	SAMN54731360	Bisulfite-Seq	RANDOM	PAIRED	391898975	300	Illumina NovaSeq 6000	Small RNA biology and Transposon silencing in Wolffia brasiliensis #7522
+emseq	SRR23020114	PRJNA600820	SAMN13831871	Bisulfite-Seq	RANDOM PCR	PAIRED	380295402	302	Illumina NovaSeq 6000	REH MultiOmics
+emseq	SRR23020321	PRJNA834955	SAMN28088056	Bisulfite-Seq	RANDOM PCR	PAIRED	683884277	302	Illumina NovaSeq 6000	GM12878 MultiOmics
+emseq	SRR35878071	PRJNA1348917	SAMN52921649	Bisulfite-Seq	RANDOM	PAIRED	94368452	300	Illumina NovaSeq X Plus	Presence and characteristics of Coconut cfDNA
+rrbs	SRR36114658	PRJNA1367017	SAMN53332789	Bisulfite-Seq	Reduced Representation	PAIRED	67457406	109	NextSeq 2000	Repeated Disuse Atrophy in Adult Human Skeletal Muscle (Reduced Representation Bisulfite-Seq / Methylome)
+rrbs	SRR35488094	PRJNA1330287	SAMN51504838	Bisulfite-Seq	RANDOM	PAIRED	117426257	302	Illumina NovaSeq 6000	RRBS-seq of single-cell clones of four cell Lines reveals highly-conserved methylated sites in DNA
+rrbs	SRR34901922	PRJNA1302776	SAMN50491004	Bisulfite-Seq	Reduced Representation	SINGLE	49947331	101	Illumina HiSeq 2500	Precision Medicine Study of Post-Exertional Malaise epigenetic changes in Myalgic Encephalomyelitis/Chronic Fatigue patients during Exercise
+rrbs	SRR35082582	PRJNA1309099	SAMN50738806	Bisulfite-Seq	Reduced Representation	PAIRED	33007884	300	Illumina NovaSeq 6000	mrRNA-directed DNA methylation enables selective mutant oncogene silencing therapy without exogenous proteins [RRBS]
+rrbs	SRR36184714	PRJNA1369207	SAMN53385449	Bisulfite-Seq	Reduced Representation	PAIRED	60103868	300	Illumina NovaSeq 6000	DNA methylation analysis of 293T cells expressing wild-type RUNX1 and a chimera protein RUNX11-299-SPI11-102
+rrbs	SRR35168607	PRJNA1311825	SAMN50842827	Bisulfite-Seq	Reduced Representation	SINGLE	41217910	57	Illumina HiSeq 2500	Comparison of enzymatic and bisulfite-based methods for sequencing-based cell-free DNA methylation profiling
+rrbs	SRR36114657	PRJNA1367017	SAMN53332788	Bisulfite-Seq	Reduced Representation	PAIRED	49688439	109	NextSeq 2000	Repeated Disuse Atrophy in Adult Human Skeletal Muscle (Reduced Representation Bisulfite-Seq / Methylome)
+rrbs	SRR35488093	PRJNA1330287	SAMN51504837	Bisulfite-Seq	RANDOM	PAIRED	84683620	302	Illumina NovaSeq 6000	RRBS-seq of single-cell clones of four cell Lines reveals highly-conserved methylated sites in DNA
+rrbs	SRR34901921	PRJNA1302776	SAMN50491003	Bisulfite-Seq	Reduced Representation	SINGLE	32439058	101	Illumina HiSeq 2500	Precision Medicine Study of Post-Exertional Malaise epigenetic changes in Myalgic Encephalomyelitis/Chronic Fatigue patients during Exercise
+rrbs	SRR35082581	PRJNA1309099	SAMN50738805	Bisulfite-Seq	Reduced Representation	PAIRED	32763063	300	Illumina NovaSeq 6000	mrRNA-directed DNA methylation enables selective mutant oncogene silencing therapy without exogenous proteins [RRBS]
+rrbs	SRR36184713	PRJNA1369207	SAMN53385448	Bisulfite-Seq	Reduced Representation	PAIRED	112659703	300	Illumina NovaSeq 6000	DNA methylation analysis of 293T cells expressing wild-type RUNX1 and a chimera protein RUNX11-299-SPI11-102
+rrbs	SRR35168606	PRJNA1311825	SAMN50842826	Bisulfite-Seq	Reduced Representation	SINGLE	53918915	56	Illumina HiSeq 2500	Comparison of enzymatic and bisulfite-based methods for sequencing-based cell-free DNA methylation profiling
+amplicon16s	SRR41298237	PRJNA1548544	SAMN64343081	AMPLICON	PCR	PAIRED	1438348	600	Illumina MiSeq	Agricultural management is associated with gut microbiota restructuring in the native bumblebee Bombus pauloensis
+amplicon16s	SRR36349488	PRJNA1377205	SAMN53759826	AMPLICON	PCR	PAIRED	1301038	602	NextSeq 2000	Patterns of microbial load and assembly in leaf microbiomes of summer and overwintering crops
+amplicon16s	ERR15599485	PRJEB97765	SAMEA120223713	AMPLICON	PCR	PAIRED	1003545	602	Illumina HiSeq 2500	Biogeography of symbionts associated with adult hydrothermal shrimps Rimicaris exoculata and Rimicaris chacei revealed by 16S rRNA gene metabarcoding, based on samples collected during the MoMARdream-Naut 2007, BioBaz 2013, and BICOSE 2014 cruises, within the framework of the Ifremer REMIMA project (20142029).
+amplicon16s	SRR6292385	PRJNA418034	SAMN08013538	AMPLICON	PCR	PAIRED	4020729	253	Illumina MiSeq	Porcellio scaber Variation
+amplicon16s	SRR40988316	PRJNA1441658	SAMN63832748	AMPLICON	PCR	PAIRED	1310975	602	Illumina MiSeq	Pacific coral species are susceptible to stony coral tissue loss disease
+amplicon16s	SRR2952726	PRJNA298882	SAMN04286850	AMPLICON	PCR	PAIRED	1924303	449	Illumina MiSeq	Bacterial 16S DNA raw sequence reads
+amplicon16s	DRR1158537	PRJDB44529	SAMD02008529	AMPLICON	PCR	PAIRED	1102466	452	Illumina NovaSeq 6000	human 16s gut microbiome data of WELL-China cohort (PRJCA056533)
+amplicon16s	SRR41298236	PRJNA1548544	SAMN64343082	AMPLICON	PCR	PAIRED	1249361	600	Illumina MiSeq	Agricultural management is associated with gut microbiota restructuring in the native bumblebee Bombus pauloensis
+amplicon16s	SRR36349447	PRJNA1377205	SAMN53759812	AMPLICON	PCR	PAIRED	1376861	602	NextSeq 2000	Patterns of microbial load and assembly in leaf microbiomes of summer and overwintering crops
+amplicon16s	ERR15599432	PRJEB97765	SAMEA120223666	AMPLICON	PCR	PAIRED	1028774	602	Illumina HiSeq 2500	Biogeography of symbionts associated with adult hydrothermal shrimps Rimicaris exoculata and Rimicaris chacei revealed by 16S rRNA gene metabarcoding, based on samples collected during the MoMARdream-Naut 2007, BioBaz 2013, and BICOSE 2014 cruises, within the framework of the Ifremer REMIMA project (20142029).
+amplicon16s	SRR41298235	PRJNA1548544	SAMN64343091	AMPLICON	PCR	PAIRED	1955483	600	Illumina MiSeq	Agricultural management is associated with gut microbiota restructuring in the native bumblebee Bombus pauloensis
+amplicon16s	SRR36349440	PRJNA1377205	SAMN53759833	AMPLICON	PCR	PAIRED	1163863	602	NextSeq 2000	Patterns of microbial load and assembly in leaf microbiomes of summer and overwintering crops
+exome	SRR100449	PRJNA60155	SAMN00006529	WXS	Hybrid Selection	PAIRED	2578688	160	Illumina HiSeq 2000	Exome sequencing of (CHS) Southern Han Chinese population HapMap population
+exome	SRR107087	PRJNA59817	SAMN00006595	WXS	Hybrid Selection	PAIRED	166988978	152	Illumina HiSeq 2000	Exome sequencing of (PUR) Puerto Rican in Puerto Rico HapMap population
+exome	SRR107088	PRJNA60153	SAMN00000921	WXS	Hybrid Selection	PAIRED	148764641	152	Illumina HiSeq 2000	Exome sequencing of (CHB) Han Chinese in Beijing, China HapMap population
+exome	SRR100448	PRJNA60155	SAMN00006528	WXS	Hybrid Selection	PAIRED	2129068	160	Illumina HiSeq 2000	Exome sequencing of (CHS) Southern Han Chinese population HapMap population
+exome	SRR107086	PRJNA59817	SAMN00006590	WXS	Hybrid Selection	PAIRED	154238596	152	Illumina HiSeq 2000	Exome sequencing of (PUR) Puerto Rican in Puerto Rico HapMap population
+exome	SRR100447	PRJNA60155	SAMN00006528	WXS	Hybrid Selection	PAIRED	2098392	160	Illumina HiSeq 2000	Exome sequencing of (CHS) Southern Han Chinese population HapMap population
+exome	SRR23683460	PRJNA940110	SAMN33553062	WXS	PCR	PAIRED	2161732	202	Illumina HiSeq 2500	Cytokine storm based mechanisms for extra-pulmonary manifestations of SARS-CoV-2 infection
+exome	SRR16085504	PRJNA765779	SAMN21583927	WXS	PCR	SINGLE	22926834	249	HiSeq X Ten	Identification of a Novel Heterozygous Variant Associated with Congenital Complete Heart Block in a Chinese Family
+exome	SRR18590370	PRJNA822821	SAMN27279246	WXS	RANDOM	PAIRED	58226229	202	Illumina HiSeq 4000	Genetics of congenital heart diseases
+exome	SRR31522375	PRJNA1190204	SAMN45068548	WXS	Hybrid Selection	SINGLE	33640083	302	Illumina HiSeq X	Homo sapiens Genome sequencing
+wgs	ERR5029122	PRJEB31736	SAMN01761636	WGS	RANDOM	PAIRED	29678571	300	Illumina NovaSeq 6000	30X whole genome sequencing coverage of the 2504 Phase 3 1000 Genome samples.
+wgs	ERR1055549	PRJEB11005	SAMN00259766	WGS	RANDOM	PAIRED	88603106	180	Illumina HiSeq 2000	High-coverage whole genome sequencing of Han Chinese populations (1000 Genomes Project)
+wgs	SRR22567119	PRJNA909799	SAMN32096766	WGS	PCR	PAIRED	19368860	147	Illumina NovaSeq 6000	Low pass sequencing of 1000 Genomes samples on the Element AVITI system and the Illumina NovaSeq 6000
+wgs	SRR13339907	PRJNA686136	SAMN17107159	WGS	PCR	PAIRED	7261103	302	HiSeq X Ten	Low-pass resequencing of Europeans and Africans from the 1000 Genomes Phase 3
+wgs	SRR071223	PRJNA28919	SAMN00001694	WGS	RANDOM	PAIRED	4407450	72	Illumina Genome Analyzer II	1000 Genomes Project Pilot 2. High coverage sequencing of 2 Trios (6 individuals).
+wgs	DRR878434	PRJDB37317	SAMD01618629	WGS	RANDOM	PAIRED	583173631	302	Illumina NovaSeq 6000	APOBEC3A, not APOBEC3B, drives deaminase mutagenesis in human gastric epithelium (KAP240815)
+wgs	SRR14140307	PRJNA719582	SAMN18613402	WGS	RANDOM	SINGLE	36636051	300	HiSeq X Ten	CEP128 mutations impair spermatogenesis in humans and mice
+wgs	DRR878433	PRJDB37317	SAMD01618628	WGS	RANDOM	PAIRED	402373820	302	Illumina NovaSeq 6000	APOBEC3A, not APOBEC3B, drives deaminase mutagenesis in human gastric epithelium (KAP240815)
+wgs	SRR14140306	PRJNA719582	SAMN18613401	WGS	RANDOM	SINGLE	31040198	300	HiSeq X Ten	CEP128 mutations impair spermatogenesis in humans and mice
+wgs	ERR5029116	PRJEB31736	SAMN01761636	WGS	RANDOM	PAIRED	39099816	300	Illumina NovaSeq 6000	30X whole genome sequencing coverage of the 2504 Phase 3 1000 Genome samples.
+wgs	ERR1055543	PRJEB11005	SAMN00259766	WGS	RANDOM	PAIRED	73201438	200	Illumina HiSeq 2000	High-coverage whole genome sequencing of Han Chinese populations (1000 Genomes Project)
+wgs	SRR22567113	PRJNA909799	SAMN32096869	WGS	PCR	PAIRED	5767852	302	Illumina NovaSeq 6000	Low pass sequencing of 1000 Genomes samples on the Element AVITI system and the Illumina NovaSeq 6000
+chipseq	ERR17625718	PRJEB108635	SAMEA121726018	ChIP-Seq	ChIP	PAIRED	55366822	300	Illumina NovaSeq X	Nested TAD hierarchy defines cohesion zones on replicated chromosomes
+chipseq	ERR17625690	PRJEB108635	SAMEA121725998	ChIP-Seq	ChIP	PAIRED	49518617	300	Illumina NovaSeq X	Nested TAD hierarchy defines cohesion zones on replicated chromosomes
+chipseq	ERR14173346	PRJEB85096	SAMEA117615566	ChIP-Seq	ChIP	SINGLE	25067653	51	Illumina HiSeq 2000	Histone ChIP-seq for the detection of active elements (H3K4me1, H3K4me3, H3K27ac, input control) in a selection of cancer cell lines
+chipseq	ERR14173425	PRJEB85096	SAMEA117615645	ChIP-Seq	ChIP	SINGLE	26433024	51	Illumina HiSeq 2000	Histone ChIP-seq for the detection of active elements (H3K4me1, H3K4me3, H3K27ac, input control) in a selection of cancer cell lines
+chipseq	SRR40426886	PRJNA1241844	SAMN62799269	ChIP-Seq	ChIP	SINGLE	18874623	75	NextSeq 500	Selective CDK7 Inhibition Sensitizes Tumors to Topoisomerase I Inhibitor-Antibody Drug Conjugates by Blocking The Transition of The RNA polymerase II Initiation Complex into Elongation [ChIP-seq]
+chipseq	SRR39864086	PRJNA1502992	SAMN62000544	ChIP-Seq	ChIP	PAIRED	67232253	102	Illumina NovaSeq 6000	CTCFL(BORIS) contributes to the transcriptional program of ovarian cancer by relaxing CTCF-mediated three-dimensional genome organization
+exome	ERR17636242	PRJEB122863	SAMEA123191412	WXS	Hybrid Selection	PAIRED	124094048	199	Illumina NovaSeq 6000	RNA-seq, WES and miRNA-array for GCT cell lines and their cisplatin-resistant variants
+exome	DRR1069328	PRJDB42630	SAMD01935954	WXS	Hybrid Selection	PAIRED	185521550	300	Illumina NovaSeq 6000	Single-cell multiome, whole-exome profiling of EGFR-TKI-resistant PC9 cells

@@ -1,0 +1,127 @@
+assay	profile	annotation	runs
+amplicon16s	emseq	bisulfite/EM conversion shifts the GC distribution down; expected, not treated as failure 	12
+amplicon16s	emseq	bisulfite/EM library: C->T Read# depletion expected	12
+amplicon16s	emseq	possible incomplete bisulfite conversion (residual C # > #); verify with CHH/spike-in conv	12
+amplicon16s	rrbs	bisulfite/EM conversion shifts the GC distribution down; expected, not treated as failure 	12
+amplicon16s	rrbs	bisulfite/EM library: C->T Read# depletion expected	12
+amplicon16s	rrbs	possible incomplete bisulfite conversion (residual C # > #); verify with CHH/spike-in conv	12
+amplicon16s	wgbs	bisulfite/EM conversion shifts the GC distribution down; expected, not treated as failure 	12
+amplicon16s	wgbs	bisulfite/EM library: C->T Read# depletion expected	12
+amplicon16s	wgbs	possible incomplete bisulfite conversion (residual C # > #); verify with CHH/spike-in conv	12
+atac	emseq	bisulfite/EM conversion shifts the GC distribution down; expected, not treated as failure 	1
+atac	emseq	bisulfite/EM library: C->T Read# depletion expected	8
+atac	emseq	bisulfite/EM library: G->A Read# depletion expected	4
+atac	emseq	possible incomplete bisulfite conversion (residual C # > #); verify with CHH/spike-in conv	8
+atac	emseq	possible incomplete bisulfite conversion (residual G # > #); verify with CHH/spike-in conv	4
+atac	rrbs	bisulfite/EM conversion shifts the GC distribution down; expected, not treated as failure 	1
+atac	rrbs	bisulfite/EM library: C->T Read# depletion expected	8
+atac	rrbs	bisulfite/EM library: G->A Read# depletion expected	4
+atac	rrbs	possible incomplete bisulfite conversion (residual C # > #); verify with CHH/spike-in conv	8
+atac	rrbs	possible incomplete bisulfite conversion (residual G # > #); verify with CHH/spike-in conv	4
+atac	wgbs	bisulfite/EM conversion shifts the GC distribution down; expected, not treated as failure 	1
+atac	wgbs	bisulfite/EM library: C->T Read# depletion expected	8
+atac	wgbs	bisulfite/EM library: G->A Read# depletion expected	4
+atac	wgbs	possible incomplete bisulfite conversion (residual C # > #); verify with CHH/spike-in conv	8
+atac	wgbs	possible incomplete bisulfite conversion (residual G # > #); verify with CHH/spike-in conv	4
+chipseq	emseq	bisulfite/EM conversion shifts the GC distribution down; expected, not treated as failure 	3
+chipseq	emseq	bisulfite/EM library: C->T Read# depletion expected	5
+chipseq	emseq	bisulfite/EM library: G->A Read# depletion expected	7
+chipseq	emseq	possible incomplete bisulfite conversion (residual C # > #); verify with CHH/spike-in conv	5
+chipseq	emseq	possible incomplete bisulfite conversion (residual G # > #); verify with CHH/spike-in conv	7
+chipseq	rrbs	bisulfite/EM conversion shifts the GC distribution down; expected, not treated as failure 	3
+chipseq	rrbs	bisulfite/EM library: C->T Read# depletion expected	5
+chipseq	rrbs	bisulfite/EM library: G->A Read# depletion expected	7
+chipseq	rrbs	possible incomplete bisulfite conversion (residual C # > #); verify with CHH/spike-in conv	5
+chipseq	rrbs	possible incomplete bisulfite conversion (residual G # > #); verify with CHH/spike-in conv	7
+chipseq	wgbs	bisulfite/EM conversion shifts the GC distribution down; expected, not treated as failure 	3
+chipseq	wgbs	bisulfite/EM library: C->T Read# depletion expected	5
+chipseq	wgbs	bisulfite/EM library: G->A Read# depletion expected	7
+chipseq	wgbs	possible incomplete bisulfite conversion (residual C # > #); verify with CHH/spike-in conv	5
+chipseq	wgbs	possible incomplete bisulfite conversion (residual G # > #); verify with CHH/spike-in conv	7
+emseq	emseq	bisulfite/EM conversion shifts the GC distribution down; expected, not treated as failure 	2
+emseq	emseq	bisulfite/EM library: C->T Read# depletion expected	12
+emseq	emseq	possible incomplete bisulfite conversion (residual C # > #); verify with CHH/spike-in conv	2
+emseq	rrbs	bisulfite/EM conversion shifts the GC distribution down; expected, not treated as failure 	2
+emseq	rrbs	bisulfite/EM library: C->T Read# depletion expected	12
+emseq	rrbs	possible incomplete bisulfite conversion (residual C # > #); verify with CHH/spike-in conv	2
+emseq	wgbs	bisulfite/EM conversion shifts the GC distribution down; expected, not treated as failure 	2
+emseq	wgbs	bisulfite/EM library: C->T Read# depletion expected	12
+emseq	wgbs	possible incomplete bisulfite conversion (residual C # > #); verify with CHH/spike-in conv	2
+exome	emseq	bisulfite/EM conversion shifts the GC distribution down; expected, not treated as failure 	3
+exome	emseq	bisulfite/EM library: C->T Read# depletion expected	3
+exome	emseq	bisulfite/EM library: G->A Read# depletion expected	9
+exome	emseq	possible incomplete bisulfite conversion (residual C # > #); verify with CHH/spike-in conv	3
+exome	emseq	possible incomplete bisulfite conversion (residual G # > #); verify with CHH/spike-in conv	9
+exome	rrbs	bisulfite/EM conversion shifts the GC distribution down; expected, not treated as failure 	3
+exome	rrbs	bisulfite/EM library: C->T Read# depletion expected	3
+exome	rrbs	bisulfite/EM library: G->A Read# depletion expected	9
+exome	rrbs	possible incomplete bisulfite conversion (residual C # > #); verify with CHH/spike-in conv	3
+exome	rrbs	possible incomplete bisulfite conversion (residual G # > #); verify with CHH/spike-in conv	9
+exome	wgbs	bisulfite/EM conversion shifts the GC distribution down; expected, not treated as failure 	3
+exome	wgbs	bisulfite/EM library: C->T Read# depletion expected	3
+exome	wgbs	bisulfite/EM library: G->A Read# depletion expected	9
+exome	wgbs	possible incomplete bisulfite conversion (residual C # > #); verify with CHH/spike-in conv	3
+exome	wgbs	possible incomplete bisulfite conversion (residual G # > #); verify with CHH/spike-in conv	9
+rnaseq	emseq	bisulfite/EM library: C->T Read# depletion expected	11
+rnaseq	emseq	bisulfite/EM library: G->A Read# depletion expected	1
+rnaseq	emseq	possible incomplete bisulfite conversion (residual C # > #); verify with CHH/spike-in conv	11
+rnaseq	emseq	possible incomplete bisulfite conversion (residual G # > #); verify with CHH/spike-in conv	1
+rnaseq	rrbs	bisulfite/EM library: C->T Read# depletion expected	11
+rnaseq	rrbs	bisulfite/EM library: G->A Read# depletion expected	1
+rnaseq	rrbs	possible incomplete bisulfite conversion (residual C # > #); verify with CHH/spike-in conv	11
+rnaseq	rrbs	possible incomplete bisulfite conversion (residual G # > #); verify with CHH/spike-in conv	1
+rnaseq	wgbs	bisulfite/EM library: C->T Read# depletion expected	11
+rnaseq	wgbs	bisulfite/EM library: G->A Read# depletion expected	1
+rnaseq	wgbs	possible incomplete bisulfite conversion (residual C # > #); verify with CHH/spike-in conv	11
+rnaseq	wgbs	possible incomplete bisulfite conversion (residual G # > #); verify with CHH/spike-in conv	1
+rrbs	emseq	bisulfite/EM conversion shifts the GC distribution down; expected, not treated as failure 	2
+rrbs	emseq	bisulfite/EM library: C->T Read# depletion expected	10
+rrbs	emseq	bisulfite/EM library: G->A Read# depletion expected	2
+rrbs	emseq	possible incomplete bisulfite conversion (residual C # > #); verify with CHH/spike-in conv	8
+rrbs	rrbs	bisulfite/EM conversion shifts the GC distribution down; expected, not treated as failure 	2
+rrbs	rrbs	bisulfite/EM library: C->T Read# depletion expected	10
+rrbs	rrbs	bisulfite/EM library: G->A Read# depletion expected	2
+rrbs	rrbs	possible incomplete bisulfite conversion (residual C # > #); verify with CHH/spike-in conv	8
+rrbs	wgbs	bisulfite/EM conversion shifts the GC distribution down; expected, not treated as failure 	2
+rrbs	wgbs	bisulfite/EM library: C->T Read# depletion expected	10
+rrbs	wgbs	bisulfite/EM library: G->A Read# depletion expected	2
+rrbs	wgbs	possible incomplete bisulfite conversion (residual C # > #); verify with CHH/spike-in conv	8
+smallrna	emseq	bisulfite/EM conversion shifts the GC distribution down; expected, not treated as failure 	6
+smallrna	emseq	bisulfite/EM library: C->T Read# depletion expected	7
+smallrna	emseq	bisulfite/EM library: G->A Read# depletion expected	5
+smallrna	emseq	possible incomplete bisulfite conversion (residual C # > #); verify with CHH/spike-in conv	7
+smallrna	emseq	possible incomplete bisulfite conversion (residual G # > #); verify with CHH/spike-in conv	5
+smallrna	rrbs	bisulfite/EM conversion shifts the GC distribution down; expected, not treated as failure 	6
+smallrna	rrbs	bisulfite/EM library: C->T Read# depletion expected	7
+smallrna	rrbs	bisulfite/EM library: G->A Read# depletion expected	5
+smallrna	rrbs	possible incomplete bisulfite conversion (residual C # > #); verify with CHH/spike-in conv	7
+smallrna	rrbs	possible incomplete bisulfite conversion (residual G # > #); verify with CHH/spike-in conv	5
+smallrna	wgbs	bisulfite/EM conversion shifts the GC distribution down; expected, not treated as failure 	6
+smallrna	wgbs	bisulfite/EM library: C->T Read# depletion expected	7
+smallrna	wgbs	bisulfite/EM library: G->A Read# depletion expected	5
+smallrna	wgbs	possible incomplete bisulfite conversion (residual C # > #); verify with CHH/spike-in conv	7
+smallrna	wgbs	possible incomplete bisulfite conversion (residual G # > #); verify with CHH/spike-in conv	5
+wgbs	emseq	bisulfite/EM conversion shifts the GC distribution down; expected, not treated as failure 	1
+wgbs	emseq	bisulfite/EM library: C->T Read# depletion expected	9
+wgbs	emseq	bisulfite/EM library: G->A Read# depletion expected	3
+wgbs	rrbs	bisulfite/EM conversion shifts the GC distribution down; expected, not treated as failure 	1
+wgbs	rrbs	bisulfite/EM library: C->T Read# depletion expected	9
+wgbs	rrbs	bisulfite/EM library: G->A Read# depletion expected	3
+wgbs	wgbs	bisulfite/EM conversion shifts the GC distribution down; expected, not treated as failure 	1
+wgbs	wgbs	bisulfite/EM library: C->T Read# depletion expected	9
+wgbs	wgbs	bisulfite/EM library: G->A Read# depletion expected	3
+wgs	emseq	bisulfite/EM conversion shifts the GC distribution down; expected, not treated as failure 	4
+wgs	emseq	bisulfite/EM library: C->T Read# depletion expected	6
+wgs	emseq	bisulfite/EM library: G->A Read# depletion expected	6
+wgs	emseq	possible incomplete bisulfite conversion (residual C # > #); verify with CHH/spike-in conv	6
+wgs	emseq	possible incomplete bisulfite conversion (residual G # > #); verify with CHH/spike-in conv	6
+wgs	rrbs	bisulfite/EM conversion shifts the GC distribution down; expected, not treated as failure 	4
+wgs	rrbs	bisulfite/EM library: C->T Read# depletion expected	6
+wgs	rrbs	bisulfite/EM library: G->A Read# depletion expected	6
+wgs	rrbs	possible incomplete bisulfite conversion (residual C # > #); verify with CHH/spike-in conv	6
+wgs	rrbs	possible incomplete bisulfite conversion (residual G # > #); verify with CHH/spike-in conv	6
+wgs	wgbs	bisulfite/EM conversion shifts the GC distribution down; expected, not treated as failure 	4
+wgs	wgbs	bisulfite/EM library: C->T Read# depletion expected	6
+wgs	wgbs	bisulfite/EM library: G->A Read# depletion expected	6
+wgs	wgbs	possible incomplete bisulfite conversion (residual C # > #); verify with CHH/spike-in conv	6
+wgs	wgbs	possible incomplete bisulfite conversion (residual G # > #); verify with CHH/spike-in conv	6
