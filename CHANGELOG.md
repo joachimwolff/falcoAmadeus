@@ -103,6 +103,29 @@
   `--assay emseq` leaves the first and last 10 read positions out of the
   composition grade, as the Bismark documentation recommends clipping them
   for NEB EM-seq libraries.
+- **Assay profiles checked on 120 public runs and recalibrated.** Each
+  profile was run on 12 public runs of its assay, clean and with six injected
+  defects, and every profile on every assay. The weak points were fixed with
+  limits set on a separate calibration set (70 runs from other BioProjects;
+  `paper/scripts/assay_validation`):
+  - the relaxed GC and duplication grades never failed, so a contamination
+    that fails a generic grade went unseen (a 20 % high-GC contaminant in
+    WGBS: 3 of 12 runs graded worse than the clean library, now 11). Each
+    relaxed profile now has its own FAIL limit above every clean calibration
+    run (amplicon and 16S: no GC limit, their GC distribution is a few
+    discrete products);
+  - the conversion estimate counted every C, including the C of methylated
+    CpGs, and warned on 8 of 12 RRBS runs. It now counts C among C+T
+    followed by a base other than G (G among G+A for G->A reads), deciding
+    each read's converted strand from its composition, which also covers
+    non-directional libraries; the limit is 20 % (converted calibration
+    runs 0.3 to 15 %, unconverted 30 % or more), and the estimate is always
+    reported;
+  - `--assay rrbs` no longer grades per-base composition (MspI fragments
+    lock it along the whole read, not only at the 3-base motif);
+  - `--assay atac` masks 15 instead of 11 leading positions (Tn5 bias);
+  - `--assay smallrna` grades adapter read-through FAIL as WARN, annotated:
+    raw small-RNA reads always end in the 3' adapter.
 
 ### Fixed
 

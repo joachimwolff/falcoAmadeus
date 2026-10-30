@@ -2045,6 +2045,8 @@ merge_mate_stats(FastqStats &comb, FastqStats &s2,
   comb.num_reads += s2.num_reads;
   comb.max_read_length = std::max(comb.max_read_length, s2.max_read_length);
   comb.lowest_char = std::min(comb.lowest_char, s2.lowest_char);
+  for (std::size_t k = 0; k < 4; ++k)
+    comb.conv_ctx[k] += s2.conv_ctx[k];
   add_vec(comb.long_base_count, s2.long_base_count);
   add_vec(comb.long_n_base_count, s2.long_n_base_count);
   add_vec(comb.long_position_quality_count, s2.long_position_quality_count);
@@ -2398,9 +2400,12 @@ main(int argc, char *argv[]) {
     opt_parse.add_opt(
       "conversion-residual", '\0',
       "[FalcoAmadeus] For methylation assays (--assay wgbs/emseq/rrbs): "
-      "residual unmethylated-base fraction (0-1) above which a possible "
-      "incomplete-conversion warning is emitted. Heuristic only; the "
-      "authoritative check is the post-alignment non-CpG conversion rate.",
+      "unconverted fraction outside CpG (0-1; C among C+T followed by a "
+      "base other than G in C->T reads, G among G+A preceded by a base other "
+      "than C in G->A reads) above which a possible incomplete-conversion "
+      "warning is emitted (default 0.2). A raw-read "
+      "estimate; the authoritative check is the post-alignment non-CpG "
+      "conversion rate.",
       false, falco_config.conversion_residual);
 
     opt_parse.add_opt(

@@ -353,7 +353,10 @@ class StreamReader{
              do_gc_sequence,
              do_quality_sequence,
              do_tile,
-             do_sequence_length;
+             do_sequence_length,
+             // [FalcoAmadeus] bisulfite/EM profiles: count bases by their
+             // CpG context (FastqStats::conv_ctx)
+             do_conversion_context;
 
   // This will tell me which character to look for to go to the next field
   const char field_separator;

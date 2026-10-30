@@ -14,7 +14,7 @@ atac	atac	Basic Statistics	12	0	0	0	0
 atac	atac	Per base sequence quality	12	0	0	0	0
 atac	atac	Per tile sequence quality	12	1	1	0	0
 atac	atac	Per sequence quality scores	12	0	0	0	0
-atac	atac	Per base sequence content	12	12	9	11	7
+atac	atac	Per base sequence content	12	12	7	11	7
 atac	atac	Per sequence GC content	12	3	3	1	1
 atac	atac	Per base N content	12	0	0	0	0
 atac	atac	Sequence Length Distribution	12	1	1	0	0
@@ -36,8 +36,8 @@ emseq	emseq	Basic Statistics	12	0	0	0	0
 emseq	emseq	Per base sequence quality	12	0	0	0	0
 emseq	emseq	Per tile sequence quality	12	2	2	2	2
 emseq	emseq	Per sequence quality scores	12	0	0	0	0
-emseq	emseq	Per base sequence content	12	12	2	8	0
-emseq	emseq	Per sequence GC content	12	9	9	2	0
+emseq	emseq	Per base sequence content	12	12	0	8	0
+emseq	emseq	Per sequence GC content	12	9	9	2	2
 emseq	emseq	Per base N content	12	0	0	0	0
 emseq	emseq	Sequence Length Distribution	12	1	1	0	0
 emseq	emseq	Sequence Duplication Levels	12	0	0	0	0
@@ -69,7 +69,7 @@ rrbs	rrbs	Basic Statistics	12	0	0	0	0
 rrbs	rrbs	Per base sequence quality	12	0	0	0	0
 rrbs	rrbs	Per tile sequence quality	12	3	3	3	3
 rrbs	rrbs	Per sequence quality scores	12	0	0	0	0
-rrbs	rrbs	Per base sequence content	12	12	12	12	6
+rrbs	rrbs	Per base sequence content	12	12	2	12	0
 rrbs	rrbs	Per sequence GC content	12	9	9	2	0
 rrbs	rrbs	Per base N content	12	1	1	0	0
 rrbs	rrbs	Sequence Length Distribution	12	2	2	0	0
@@ -86,13 +86,13 @@ smallrna	smallrna	Per base N content	12	0	0	0	0
 smallrna	smallrna	Sequence Length Distribution	12	0	0	0	0
 smallrna	smallrna	Sequence Duplication Levels	12	7	7	6	0
 smallrna	smallrna	Overrepresented sequences	12	8	8	8	0
-smallrna	smallrna	Adapter Content	12	12	12	12	12
+smallrna	smallrna	Adapter Content	12	12	12	12	0
 wgbs	wgbs	Basic Statistics	12	0	0	0	0
 wgbs	wgbs	Per base sequence quality	12	0	0	0	0
 wgbs	wgbs	Per tile sequence quality	12	1	1	0	0
 wgbs	wgbs	Per sequence quality scores	12	0	0	0	0
 wgbs	wgbs	Per base sequence content	12	12	8	11	4
-wgbs	wgbs	Per sequence GC content	12	9	9	1	0
+wgbs	wgbs	Per sequence GC content	12	9	9	1	1
 wgbs	wgbs	Per base N content	12	0	0	0	0
 wgbs	wgbs	Sequence Length Distribution	12	2	2	0	0
 wgbs	wgbs	Sequence Duplication Levels	12	0	0	0	0

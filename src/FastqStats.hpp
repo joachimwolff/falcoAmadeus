@@ -232,6 +232,11 @@ struct FastqStats {
  public:
   /*********** SINGLE NUMBERS FROM THE ENTIRE FASTQ ****************/
 
+  // [FalcoAmadeus] bases by CpG context for the bisulfite/EM conversion
+  // estimate (bisulfite/EM profiles only): C, T followed by non-G; G, A
+  // preceded by non-C (StreamReader count_conversion_context)
+  std::array<std::size_t, 4> conv_ctx{};
+
   // lowest quality char to infer encoding
   char lowest_char;
   char encoding_offset;

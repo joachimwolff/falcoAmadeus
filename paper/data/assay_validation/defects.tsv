@@ -7,7 +7,7 @@ amplicon16s	16s	ncontent	Per base N content	12	11	11	0	0	0
 amplicon16s	16s	dupspike	Sequence Duplication Levels	12	12	12	12	0	11
 atac	atac	adapter	Adapter Content	12	12	12	12	12	8
 atac	atac	qualtail	Per base sequence quality	12	12	12	12	12	0
-atac	atac	midbias	Per base sequence content	12	12	12	12	12	9
+atac	atac	midbias	Per base sequence content	12	12	12	12	12	7
 atac	atac	gccontam	Per sequence GC content	12	12	12	11	11	3
 atac	atac	ncontent	Per base N content	12	11	11	3	3	0
 atac	atac	dupspike	Sequence Duplication Levels	12	12	12	6	0	4
@@ -19,16 +19,16 @@ chipseq	chipseq	ncontent	Per base N content	12	12	12	6	6	0
 chipseq	chipseq	dupspike	Sequence Duplication Levels	12	12	12	1	0	0
 emseq	emseq	adapter	Adapter Content	12	12	12	12	12	7
 emseq	emseq	qualtail	Per base sequence quality	12	12	12	12	12	0
-emseq	emseq	midbias	Per base sequence content	12	12	12	12	12	2
-emseq	emseq	gccontam	Per sequence GC content	12	12	12	12	0	9
+emseq	emseq	midbias	Per base sequence content	12	12	12	12	12	0
+emseq	emseq	gccontam	Per sequence GC content	12	12	12	12	12	9
 emseq	emseq	ncontent	Per base N content	12	11	11	0	0	0
 emseq	emseq	dupspike	Sequence Duplication Levels	12	12	12	0	0	0
 exome	exome	adapter	Adapter Content	12	12	12	12	12	3
 exome	exome	qualtail	Per base sequence quality	12	12	12	12	12	6
 exome	exome	midbias	Per base sequence content	12	12	12	12	12	3
-exome	exome	gccontam	Per sequence GC content	12	11	11	7	0	12
+exome	exome	gccontam	Per sequence GC content	12	11	11	7	1	12
 exome	exome	ncontent	Per base N content	12	12	12	0	0	0
-exome	exome	dupspike	Sequence Duplication Levels	12	12	12	1	0	0
+exome	exome	dupspike	Sequence Duplication Levels	12	12	12	1	1	0
 rnaseq	rnaseq	adapter	Adapter Content	12	12	12	12	12	5
 rnaseq	rnaseq	qualtail	Per base sequence quality	12	12	12	12	12	1
 rnaseq	rnaseq	midbias	Per base sequence content	12	12	12	12	12	1
@@ -37,20 +37,20 @@ rnaseq	rnaseq	ncontent	Per base N content	12	11	11	5	5	0
 rnaseq	rnaseq	dupspike	Sequence Duplication Levels	12	12	12	10	0	6
 rrbs	rrbs	adapter	Adapter Content	12	12	12	12	12	8
 rrbs	rrbs	qualtail	Per base sequence quality	12	12	12	12	12	0
-rrbs	rrbs	midbias	Per base sequence content	12	12	12	12	12	12
+rrbs	rrbs	midbias	Per base sequence content	12	12	2	12	0	2
 rrbs	rrbs	gccontam	Per sequence GC content	12	12	12	12	0	9
 rrbs	rrbs	ncontent	Per base N content	12	12	12	2	2	1
 rrbs	rrbs	dupspike	Sequence Duplication Levels	12	12	12	12	0	9
-smallrna	smallrna	adapter	Adapter Content	12	12	12	12	12	12
+smallrna	smallrna	adapter	Adapter Content	12	12	12	12	0	12
 smallrna	smallrna	qualtail	Per base sequence quality	12	12	12	12	12	3
 smallrna	smallrna	midbias	Per base sequence content	12	12	0	12	0	0
-smallrna	smallrna	gccontam	Per sequence GC content	12	12	12	12	0	7
+smallrna	smallrna	gccontam	Per sequence GC content	12	12	12	12	1	7
 smallrna	smallrna	ncontent	Per base N content	12	12	12	7	7	0
-smallrna	smallrna	dupspike	Sequence Duplication Levels	12	12	12	9	0	7
+smallrna	smallrna	dupspike	Sequence Duplication Levels	12	12	12	9	1	7
 wgbs	wgbs	adapter	Adapter Content	12	12	12	12	12	4
 wgbs	wgbs	qualtail	Per base sequence quality	12	12	12	12	12	0
 wgbs	wgbs	midbias	Per base sequence content	12	12	12	12	12	8
-wgbs	wgbs	gccontam	Per sequence GC content	12	12	12	12	0	9
+wgbs	wgbs	gccontam	Per sequence GC content	12	12	12	12	12	9
 wgbs	wgbs	ncontent	Per base N content	12	12	12	0	0	0
 wgbs	wgbs	dupspike	Sequence Duplication Levels	12	12	12	2	2	0
 wgs	wgs	adapter	Adapter Content	12	12	12	12	12	3

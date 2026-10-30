@@ -1217,6 +1217,16 @@ ModulePerSequenceQualityScores::make_html_data() {
   return data.str();
 }
 
+// [FalcoAmadeus] With FA_GRADE_METRICS set, each graded module writes the
+// value its grade is based on to stderr ("FA_METRIC<TAB>module<TAB>value"),
+// for calibrating the assay limits.
+static void
+report_grade_metric(const std::string &module, const double value) {
+  static const bool on = std::getenv("FA_GRADE_METRICS") != nullptr;
+  if (on)
+    std::fprintf(stderr, "FA_METRIC\t%s\t%.4f\n", module.c_str(), value);
+}
+
 /******************* PER BASE SEQUENCE CONTENT **********************/
 // [FalcoAmadeus] "#Assay(<type>): " prefix for grade-explanation comment lines.
 static inline std::string
@@ -1294,7 +1304,16 @@ ModulePerBaseSequenceContent::summarize_module(FastqStats &stats) {
     // more-depleted base => that strand's converted base
     is_reverse_complement = (mean_g_frac < mean_c_frac);  // G-depleted => OB/R2
     methyl_depleted_base = is_reverse_complement ? 'G' : 'C';
-    methyl_residual = is_reverse_complement ? mean_g_frac : mean_c_frac;
+    // unconverted share outside CpG (methylated CpGs keep their C), over the
+    // reads of both conversion strands: C among C+T followed by a non-G in
+    // C->T reads, G among G+A preceded by a non-C in G->A reads; see
+    // count_conversion_context
+    const auto &cx = stats.conv_ctx;
+    const double all =
+      static_cast<double>(cx[0] + cx[1] + cx[2] + cx[3]);
+    methyl_residual =
+      all > 0 ? static_cast<double>(cx[0] + cx[2]) / all
+              : (is_reverse_complement ? mean_g_frac : mean_c_frac);
 
     // the library's mean composition (percent, N included in the total, as
     // for the per-position values) over the graded positions
@@ -1419,6 +1438,7 @@ ModulePerBaseSequenceContent::summarize_module(FastqStats &stats) {
 
 void
 ModulePerBaseSequenceContent::make_grade() {
+  report_grade_metric(module_name, max_diff);
   if (max_diff > sequence_error) {
     grade = "fail";
   }
@@ -1441,12 +1461,21 @@ ModulePerBaseSequenceContent::make_grade() {
       is_reverse_complement ? "G->A Read2" : "C->T Read1";
     assay_annotations.push_back(
       tag + "bisulfite/EM library: " + role + " depletion expected");
-
-    if (methyl_residual > incomplete_conversion_residual) {
-      const std::string base(1, methyl_depleted_base);
+    if (assay.suppress_per_base && grade != "pass") {
+      grade = "pass";
       assay_annotations.push_back(
-        tag + "possible incomplete bisulfite conversion (residual " + base +
-        " " + fmt_pct(100.0 * methyl_residual) + "% > " +
+        tag + "per-base composition follows the selected fragments for this "
+              "assay; not graded");
+    }
+
+    assay_annotations.push_back(
+      tag + "conversion estimate: unconverted C outside CpG " +
+      fmt_pct(100.0 * methyl_residual) + "% (limit " +
+      fmt_pct(100.0 * incomplete_conversion_residual) + "%)");
+    if (methyl_residual > incomplete_conversion_residual) {
+      assay_annotations.push_back(
+        tag + "possible incomplete bisulfite conversion (unconverted C "
+              "outside CpG " + fmt_pct(100.0 * methyl_residual) + "% > " +
         fmt_pct(100.0 * incomplete_conversion_residual) +
         "%); verify with CHH/spike-in conversion rate downstream");
       // soft-flag only; NEVER hard-FAIL on a raw-read conversion estimate.
@@ -1625,6 +1654,7 @@ ModulePerSequenceGCContent::summarize_module(FastqStats &stats) {
 
 void
 ModulePerSequenceGCContent::make_grade() {
+  report_grade_metric(module_name, gc_deviation);
   if (gc_deviation >= gc_error) {
     grade = "fail";
   }
@@ -1639,8 +1669,16 @@ ModulePerSequenceGCContent::make_grade() {
   if (assay.name == "generic")
     return;
   if (assay.relax_gc && grade == "fail") {
-    grade = "warn";
     const std::string tag = assay_tag(assay);
+    if (assay.gc_fail > 0 && gc_deviation >= assay.gc_fail) {
+      // beyond what the assay's own shift explains (e.g. a contaminant)
+      assay_annotations.push_back(
+        tag + "GC deviation " + fmt_pct(gc_deviation) + "% exceeds the " +
+        fmt_pct(assay.gc_fail) +
+        "% expected for this assay at most; graded FAIL");
+      return;
+    }
+    grade = "warn";
     if (assay.methylation)
       assay_annotations.push_back(
         tag + "bisulfite/EM conversion shifts the GC distribution down; "
@@ -2036,6 +2074,7 @@ ModuleSequenceDuplicationLevels::summarize_module(FastqStats &stats) {
 
 void
 ModuleSequenceDuplicationLevels::make_grade() {
+  report_grade_metric(module_name, total_deduplicated_pct);
   // pass warn fail criteria : unique reads must be >80%
   // (otherwise warn) or >50% (otherwisefail)
   if (total_deduplicated_pct <= grade_dup_error) {
@@ -2054,6 +2093,14 @@ ModuleSequenceDuplicationLevels::make_grade() {
   if (assay.name == "generic")
     return;
   if (assay.downgrade_dup && grade == "fail") {
+    if (assay.dup_fail > 0 && total_deduplicated_pct <= assay.dup_fail) {
+      assay_annotations.push_back(
+        assay_tag(assay) + "only " + fmt_pct(total_deduplicated_pct) +
+        "% of reads would remain after deduplication, below the " +
+        fmt_pct(assay.dup_fail) +
+        "% expected for this assay at least; graded FAIL");
+      return;
+    }
     grade = "warn";
     assay_annotations.push_back(
       assay_tag(assay) +
@@ -2456,6 +2503,7 @@ ModuleAdapterContent::ModuleAdapterContent(const FalcoConfig &config) :
   grade_error = grade_adapter.find("error")->second;
 
   adapter_size = config.adapter_size;
+  assay = config.assay_profile;
 }
 
 void
@@ -2502,6 +2550,13 @@ ModuleAdapterContent::summarize_module(FastqStats &stats) {
 
 void
 ModuleAdapterContent::make_grade() {
+  {
+    double mx = 0;
+    for (const auto &v : adapter_pos_pct)
+      for (const double x : v)
+        mx = std::max(mx, x);
+    report_grade_metric(module_name, mx);
+  }
   for (std::size_t i = 0; i < std::size(adapter_pos_pct); ++i) {
     for (std::size_t j = 0; j < std::size(adapter_pos_pct[0]); ++j) {
       if (grade != "fail") {
@@ -2513,6 +2568,16 @@ ModuleAdapterContent::make_grade() {
         }
       }
     }
+  }
+  // [FalcoAmadeus] small RNA: the molecules are shorter than the reads, so
+  // raw reads end in the 3' adapter. Kept visible (it must be trimmed) but
+  // not a library failure. generic == stock behavior.
+  if (assay.expect_adapter && grade == "fail") {
+    grade = "warn";
+    assay_annotations.push_back(
+      assay_tag(assay) +
+      "3' adapter read-through is expected in raw reads of molecules "
+      "shorter than the read; trim it before alignment (FAIL->WARN)");
   }
 }
 

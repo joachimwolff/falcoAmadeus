@@ -80,6 +80,42 @@ min8(const T a, const T b) {
   return (a < b) ? a : b;
 }
 
+// [FalcoAmadeus] Bases of a read (its first n, within the buffer) by CpG
+// context, for the bisulfite/EM conversion estimate. Each read is taken as
+// converted on the strand its composition shows: with fewer C than G it is a
+// C->T read, and its C and T followed by a base other than G are counted;
+// otherwise a G->A read, and its G and A preceded by a base other than C.
+// Cytosines outside CpG are rarely methylated, so the C (or G) share in these
+// contexts approximates the unconverted fraction; methylated CpGs, which keep
+// their C, do not enter it. Deciding per read also covers non-directional
+// libraries, whose reads come from both converted strands.
+static void
+count_conversion_context(FastqStats &stats, const char *s,
+                         const std::size_t n) {
+  std::size_t c = 0, t = 0, g = 0, a = 0, nc = 0, ng = 0;
+  for (std::size_t i = 0; i + 1 < n; ++i) {
+    const char x = s[i], y = s[i + 1];
+    nc += (x == 'C');
+    ng += (x == 'G');
+    if (y != 'G' && y != 'N') {
+      c += (x == 'C');
+      t += (x == 'T');
+    }
+    if (x != 'C' && x != 'N') {
+      g += (y == 'G');
+      a += (y == 'A');
+    }
+  }
+  if (nc <= ng) {
+    stats.conv_ctx[0] += c;
+    stats.conv_ctx[1] += t;
+  }
+  else {
+    stats.conv_ctx[2] += g;
+    stats.conv_ctx[3] += a;
+  }
+}
+
 /****************************************************/
 /***************** STREAMREADER *********************/
 /****************************************************/
@@ -201,6 +237,7 @@ StreamReader::StreamReader(FalcoConfig &config, const std::size_t _buffer_size,
   do_sequence(config.do_sequence), do_gc_sequence(config.do_gc_sequence),
   do_quality_sequence(config.do_quality_sequence), do_tile(config.do_tile),
   do_sequence_length(config.do_sequence_length),
+  do_conversion_context(config.assay_profile.methylation),
 
   // Here are the usual stream reader configs
   field_separator(_field_separator), line_separator(_line_separator),
@@ -1178,6 +1215,8 @@ StreamReader::read_sequence_line(FastqStats &stats) {
       ++stats.pos_kmer_count[idx[j] >> Constants::bit_shift_kmer];
     }
   }
+  if (do_conversion_context)
+    count_conversion_context(stats, buf, rp);
   // publish the locals back to the members
   read_pos = rp;
   cur_gc_count = gc;
@@ -2150,6 +2189,8 @@ read_parallel_impl(FalcoConfig &config, FastqStats &master,
     master.max_read_length =
       std::max(master.max_read_length, ws.max_read_length);
     master.lowest_char = std::min(master.lowest_char, ws.lowest_char);
+    for (std::size_t k = 0; k < 4; ++k)
+      master.conv_ctx[k] += ws.conv_ctx[k];
     add_vec(master.long_base_count, ws.long_base_count);
     add_vec(master.long_n_base_count, ws.long_n_base_count);
     add_vec(master.long_read_length_freq, ws.long_read_length_freq);
@@ -2418,6 +2459,8 @@ merge_worker_stats(
     master.max_read_length =
       std::max(master.max_read_length, ws.max_read_length);
     master.lowest_char = std::min(master.lowest_char, ws.lowest_char);
+    for (std::size_t k = 0; k < 4; ++k)
+      master.conv_ctx[k] += ws.conv_ctx[k];
     add_vec(master.long_base_count, ws.long_base_count);
     add_vec(master.long_n_base_count, ws.long_n_base_count);
     add_vec(master.long_read_length_freq, ws.long_read_length_freq);

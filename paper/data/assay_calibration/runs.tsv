@@ -1,0 +1,71 @@
+assay	run	bioproject	biosample	library_strategy	library_selection	layout	spots	avg_length	instrument	study_title
+rnaseq	SRR41451237	PRJNA1545945	SAMN64300077	RNA-Seq	RT-PCR	PAIRED	21297838	300	Illumina NovaSeq X Plus	HeLa Transcriptomic Sequencing Analysis
+rnaseq	SRR41438672	PRJNA1517770	SAMN64508308	RNA-Seq	PolyA	PAIRED	41663563	201	Illumina NovaSeq X Plus	Genomic and transcriptomic profiling of lenvatinib resistance in Huh7 hepatocellular carcinoma cells
+rnaseq	SRR41438445	PRJNA1552406	SAMN64508128	RNA-Seq	PolyA	PAIRED	24953192	202	Illumina NovaSeq X	Transcriptomic analysis of U-251 cells harboring S93L and A275D variants under heat stress
+rnaseq	SRR41434714	PRJNA1552263	SAMN64502139	RNA-Seq	PolyA	PAIRED	26229158	302	Illumina NovaSeq 6000	Schaftoside Protects against Calcium Oxalate Crystal-Induced Kidney Injury by Inhibiting FTH-NCOA4-Mediated Ferritinophagy via Binding to TAX1BP1
+rnaseq	SRR41428956	PRJNA1552142	SAMN64490717	RNA-Seq	PolyA	PAIRED	22500979	300	Illumina NovaSeq 6000	Transcriptome profiling of control and ACO1-knockout HK-2 cells
+rnaseq	SRR41422355	PRJNA1551724	SAMN64483076	RNA-Seq	Oligo-dT	PAIRED	20032133	300	Illumina NovaSeq 6000	RNA-seq of A549 cells with HRH3/HRH4 knockdown upon Calycosin treatment
+rnaseq	SRR40784284	PRJNA1291646	SAMN49974652	RNA-Seq	cDNA	SINGLE	21178189	300	Illumina NovaSeq X Plus	Tumor-associated macrophages (TAMs) with or without HRS knockdown (KD)
+rnaseq	SRR33217896	PRJNA1252772	SAMN48059754	RNA-Seq	cDNA	PAIRED	2345479	302	Illumina NovaSeq X	Disambiguating Transcriptional Effects from Post-Transcriptional Effects of Genetic Variants with an Inferred Stability Optimized Massively Parallel Reporter Assay (ISOMPRA).
+smallrna	SRR41413611	PRJNA1551645	SAMN64473922	miRNA-Seq	PCR	PAIRED	4841073	122	NextSeq 550	Effects of fentanyl, heroin, THC on host gene expression in HBV-producing hepatocyte cells
+smallrna	ERR14374042	PRJEB85858	SAMEA117693833	miRNA-Seq	other	SINGLE	4910249	51	Illumina NovaSeq 6000	Comparison of microRNA expression after AF-Ablation with Cryo balloon vs. Pulsed field ablation
+smallrna	SRR36601428	PRJNA1393344	SAMN54307010	miRNA-Seq	size fractionation	SINGLE	35871203	51	Illumina HiSeq 2000	Integrated Analysis of Homologous Recombination Repair Gene Alterations and Plasma Exosomal miRNAs Associated with Neoadjuvant Therapy Response in Breast Cancer
+smallrna	SRR36515558	PRJNA1390977	SAMN54210104	miRNA-Seq	cDNA	SINGLE	17536417	75	Illumina NovaSeq 6000	Integrated Clinical and microRNA Signatures for Predicting Altitude-Related Hypertension
+smallrna	SRR36469936	PRJNA1382517	SAMN54120507	miRNA-Seq	Oligo-dT	PAIRED	11486268	300	Illumina NovaSeq 6000	Homo sapiens Raw sequence reads
+smallrna	SRR36432801	PRJNA1380502	SAMN53915901	miRNA-Seq	size fractionation	SINGLE	15521104	76	NextSeq 500	Circulating angiogenic profiles in ischemic stroke and intracranial atherosclerosis (ICAD)
+smallrna	DRR506546	PRJDB16746	SAMD00647887	miRNA-Seq	size fractionation	SINGLE	16717394	71	NextSeq 2000	IGF2BP3-mediated microRNA diversity control impacts on the malignancy in early-stage lung adenocarcinoma
+smallrna	SRR31748244	PRJNA1199373	SAMN45872171	miRNA-Seq	size fractionation	SINGLE	16004470	85	NextSeq 500	Circulating MicroRNAs Do Not Provide a Diagnostic Benefit Over Tissue Biopsy in Patients with Brain Metastases
+atac	SRR36625746	PRJNA1394694	SAMN54345181	ATAC-seq	Hybrid Selection	PAIRED	39112725	300	Illumina NovaSeq X Plus	doxycycline response gene signature
+atac	SRR34954623	PRJNA1304574	SAMN50564894	ATAC-seq	other	PAIRED	400142935	97	Illumina NovaSeq X	Waves of cell death modulate the abundance and maturation of human retinal ganglion cells
+atac	SRR34756595	PRJNA1298297	SAMN50264381	ATAC-seq	other	PAIRED	1658612	165	Illumina NovaSeq 6000	Genome accessibility profile at single cell level for conventional dendritic cells in human metastatic melanoma samples [snATAC-Seq]
+atac	ERR12910420	PRJEB74995	SAMEA115495639	ATAC-seq	PCR	PAIRED	480864060	131	Illumina NovaSeq 6000	Single nuclear ATAC sequencing of Benign Prostate Hyperplasia tissue
+atac	SRR32702172	PRJNA1236401	SAMN47387132	ATAC-seq	other	SINGLE	598110103	98	Illumina NovaSeq 6000	DIO3 coordinates photoreceptor development timing and fate stability in human retinal organoids
+atac	SRR31648808	PRJNA1195914	SAMN45231656	ATAC-seq	other	PAIRED	78190768	202	Illumina NovaSeq 6000	Evolution of the human autopod skeleton [ATAC-seq]
+atac	SRR30712896	PRJNA1160410	SAMN43811773	ATAC-seq	PCR	PAIRED	6429304	100	Illumina NovaSeq 6000	Pooled CRISPR screens with joint single-nucleus chromatin accessibility and transcriptome profiling
+atac	SRR28237202	PRJNA1084014	SAMN40268928	ATAC-seq	other	SINGLE	261236737	134	Illumina NovaSeq 6000	scMultiome-seq and single-cell spatial HD data for the developing human knee
+chipseq	SRR40896959	PRJNA1535861	SAMN63627055	ChIP-Seq	ChIP	PAIRED	25709865	300	Illumina NovaSeq X Plus	Homo sapiens Raw sequence reads
+chipseq	SRR40896630	PRJNA1534554	SAMN63649940	ChIP-Seq	ChIP	PAIRED	11830869	300	Illumina NovaSeq 6000	Integrated profiling reveals a portable mural-contractile stromal programme in gastric cancer
+chipseq	ERR13195495	PRJEB76390	SAMEA115705597	ChIP-Seq	ChIP	SINGLE	64253564	75	NextSeq 500	ChIP-seq against RUNX2, RNA-Polymerase II and Histone Marks (H3K27ac, H3K4me1, H3K4me3) in human Papillary Thyroid Cancer cell line (MDA-T41)
+chipseq	ERR14650783	PRJEB86037	SAMEA117742039	ChIP-Seq	ChIP	SINGLE	11448456	75	Illumina NovaSeq 6000	Role of Hypoxia-Inducible Factor-a and prolyl-4 hydroxylases in prostate cancer development and progression
+chipseq	ERR13993939	PRJEB82777	SAMEA117380305	ChIP-Seq	ChIP	PAIRED	27909236	102	Illumina NovaSeq 6000	ChIP-seq INA-6
+chipseq	SRR35260254	PRJNA1315419	SAMN51126307	ChIP-Seq	ChIP	PAIRED	36344607	300	Illumina HiSeq 1500	Transcriptional repression of embryonic globin gene by SKI on the distal repressive element [ChIP-seq]
+chipseq	SRR31837094	PRJNA1203357	SAMN45991482	ChIP-Seq	ChIP	SINGLE	57776127	50	Illumina HiSeq 4000	MED12-related XLID disorders are dose-dependent of immediate early genes (IEGs) expression
+chipseq	DRR587182	PRJDB16282	SAMD00808010	ChIP-Seq	ChIP	PAIRED	24762697	72	NextSeq 2000	Genome-wide localization of the chromosomal protein DEK in mice
+wgbs	SRR39134064	PRJNA1477994	SAMN60825973	Bisulfite-Seq	RANDOM	PAIRED	171161452	300	Illumina NovaSeq X Plus	Reconstructing the emergence of the human chorion via HIPPO-mediated trophoblast induction
+wgbs	SRR35982342	PRJNA1356354	SAMN53056809	Bisulfite-Seq	RANDOM	PAIRED	671862828	302	Illumina NovaSeq 6000	WGBS data from a DNA dilution series (K562 in NA12878 background) with pUC19 and Lambda spike-in controls.
+wgbs	SRR34359015	PRJNA1285902	SAMN49783015	Bisulfite-Seq	RANDOM	PAIRED	186990530	283	Illumina NovaSeq 6000	Methylation variability and LINE-1 activation in multiple myeloma
+wgbs	SRR33916611	PRJNA1125505	SAMN48988211	Bisulfite-Seq	RANDOM	PAIRED	833263776	302	Illumina NovaSeq X	Enriched Methylome
+wgbs	SRR33757574	PRJNA1269449	SAMN48799097	Bisulfite-Seq	RANDOM	PAIRED	103744393	280	Illumina NovaSeq X	Three Dimensional Matrigel Endows Human Formative Pluripotent Stem Cells with Pre-gastrula Stage Epiblast Features [WGBS]
+wgbs	SRR33419954	PRJNA1258705	SAMN48328394	Bisulfite-Seq	other	PAIRED	333399109	300	Illumina NovaSeq 6000	Hotspot DNMT3A mutations in acute myeloid leukemia (WGBS)
+wgbs	SRR32577050	PRJNA1232142	SAMN47226128	Bisulfite-Seq	RANDOM	PAIRED	552424275	300	Illumina NovaSeq X Plus	High-Fidelity, Efficient Human Post-Implantation Embryo Models Generated by STAT3-Induced Cell Plasticity [WGBS]
+wgbs	SRR31714866	PRJNA1198121	SAMN44289457	Bisulfite-Seq	5-methylcytidine antibody	PAIRED	202734315	300	Illumina NovaSeq 6000	Clonorchis sinensis infection alters the methylation and hydroxymethylation of hepatocellular carcinoma
+emseq	SRR13076814	PRJNA591788	SAMN16823522	Bisulfite-Seq	RANDOM	PAIRED	443512072	198	Illumina NovaSeq 6000	Comparison of EM-seq and WGBS results
+emseq	SRR21727860	PRJNA884710	SAMN31038435	Bisulfite-Seq	size fractionation	PAIRED	257498597	302	NextSeq 550	Long-term epigenetic and metabolomic changes in the mouse ventricular myocardium after exertional heat stroke
+emseq	SRR21160495	PRJNA872013	SAMN30437993	Bisulfite-Seq	RANDOM	PAIRED	165331169	122	NextSeq 2000	Whole genome enzymatic methyl-seq of A20 mouse cells using a novel TETact activation of CD4
+emseq	SRR13076815	PRJNA591788	SAMN16823522	Bisulfite-Seq	RANDOM	PAIRED	451003594	197	Illumina NovaSeq 6000	Comparison of EM-seq and WGBS results
+emseq	SRR21727861	PRJNA884710	SAMN31038435	Bisulfite-Seq	size fractionation	PAIRED	282772639	302	NextSeq 550	Long-term epigenetic and metabolomic changes in the mouse ventricular myocardium after exertional heat stroke
+emseq	SRR21160496	PRJNA872013	SAMN30437994	Bisulfite-Seq	RANDOM	PAIRED	231295822	122	NextSeq 2000	Whole genome enzymatic methyl-seq of A20 mouse cells using a novel TETact activation of CD4
+rrbs	SRR41080386	PRJNA1541251	SAMN64059593	Bisulfite-Seq	Reduced Representation	PAIRED	39836421	300	Illumina HiSeq 2500	Peripheral blood DNA methylation biomarkers for diagnosing pneumoconiosis
+rrbs	SRR32762580	PRJNA1237886	SAMN47442824	Bisulfite-Seq	Restriction Digest	PAIRED	27874730	137	Illumina NovaSeq 6000	Reduced Representation Bisulfite Sequencing of LPS - treated HT29 Cells
+rrbs	SRR31480457	PRJNA1190049	SAMN45023911	Bisulfite-Seq	Reduced Representation	PAIRED	30602498	300	HiSeq X Ten	Concentration-dependent effect of delta-9-tetrahydrocannabinol on epigenetic DNA modifiers in human peripheral blood mononuclear cells
+rrbs	SRR26678957	PRJNA1036147	SAMN38114526	Bisulfite-Seq	RANDOM	PAIRED	62177078	300	Illumina NovaSeq 6000	Highly cooperative chimeric super-SOX induces naïve pluripotency across species [RRBS]
+rrbs	SRR24036118	PRJNA950967	SAMN34030450	Bisulfite-Seq	Reduced Representation	PAIRED	31965948	300	Illumina NovaSeq 6000	Reduced representation bisulfite sequencing (RRBS) profiles of human induced pluripotent stem cells exposed to varied chemicals
+rrbs	SRR16639100	PRJNA776281	SAMN22785478	Bisulfite-Seq	Reduced Representation	SINGLE	189534182	51	Illumina HiSeq 2500	ERRBS of WT and TET TKO cells from stem cell (SC) to cardiomyocyte (CM)
+rrbs	ERR7017667	PRJEB48076	SAMEA10335158	Bisulfite-Seq	Restriction Digest	PAIRED	33753109	300	Illumina HiSeq 1000	RRBS of hESCs harboring imprinting-related genetic perturbations
+rrbs	SRR10336785	PRJNA578952	SAMN13088890	Bisulfite-Seq	Reduced Representation	PAIRED	28565472	300	HiSeq X Ten	H358 cells reduced representation bisulfite sequencing
+amplicon16s	SRR1619438	PRJNA264350	SAMN03135056	AMPLICON	PCR	SINGLE	1695445	200	Illumina HiSeq 2000	22V-SMAR-TVG10 Targeted Locus (Loci)
+amplicon16s	SRR1614720	PRJNA262656	SAMN03084975	AMPLICON	PCR	PAIRED	1715123	202	Illumina HiSeq 1000	Mount Hope Bay bacteria Targeted Locus (Loci)
+amplicon16s	SRR1614683	PRJNA207080	SAMN03077694	AMPLICON	PCR	PAIRED	1287028	216	Illumina HiSeq 1000	Plastisphere Targeted Locus (Loci)
+amplicon16s	SRR1614628	PRJNA262654	SAMN03084953	AMPLICON	PCR	PAIRED	1198772	216	Illumina HiSeq 1000	Nauset Marsh System Targeted Locus (Loci)
+amplicon16s	SRR981224	PRJNA219042	SAMN02354093	AMPLICON	PCR	SINGLE	31353040	101	Illumina HiSeq 2000	Rectal Mucosal Microbiota in HIV
+amplicon16s	SRR455132	PRJNA271708	SAMN03277125	AMPLICON	PCR	PAIRED	94535854	202	Illumina Genome Analyzer IIx	Microbial diversity on amphibian skin
+amplicon16s	SRR1614719	PRJNA262656	SAMN03084974	AMPLICON	PCR	PAIRED	1415140	202	Illumina HiSeq 1000	Mount Hope Bay bacteria Targeted Locus (Loci)
+amplicon16s	SRR1614682	PRJNA207080	SAMN03077693	AMPLICON	PCR	PAIRED	1070476	216	Illumina HiSeq 1000	Plastisphere Targeted Locus (Loci)
+exome	SRR41127230	PRJNA1542262	SAMN64117174	WXS	Hybrid Selection	PAIRED	66767787	302	Illumina NovaSeq 6000	Novel compound heterozygous mutations of DOCK2 associated with early-onset recurrent infections
+exome	SRR41031147	PRJNA1540175	SAMN64008568	WXS	Hybrid Selection	PAIRED	24695929	150	Illumina NovaSeq 6000	Whole exome sequencing of a Noonan syndrome patient with a rare KRAS p.Val14Ile variant: integrative phenotypic analysis and molecular dynamics simulation
+exome	SRR40881680	PRJNA1536390	SAMN63633117	WXS	Hybrid Selection	PAIRED	29122756	202	HiSeq X Ten	WGS and WES of matched blood and tumor samples from esophageal squamous cell carcinoma patients
+exome	SRR40845345	PRJNA1534998	SAMN63519841	WXS	Hybrid Selection	PAIRED	28612118	302	Illumina NovaSeq X	Whole Exome Sequencing of a Young Man With Brunner Syndrome and Intellectual Disability
+exome	SRR40816377	PRJNA1533956	SAMN63423027	WXS	Hybrid Selection	PAIRED	19054803	293	Illumina NovaSeq X Plus	KDM6B-Related Neurodevelopmental Disorder Presenting with Behavioural Disturbances in an Indian Adolescent: A Case Report
+exome	ERR12080429	PRJEB66307	SAMEA114439631	WXS	PCR	PAIRED	26622176	300	Illumina NovaSeq 6000	xxx
+exome	SRR40665675	PRJNA1529302	SAMN63114053	WXS	Hybrid Selection	PAIRED	41886239	300	Illumina NovaSeq 6000	PPOX mutations in Chinese variegate porphyria
+exome	SRR40541280	PRJNA1524369	SAMN62971968	WXS	PCR	PAIRED	64457160	300	Illumina NovaSeq 6000	Whole-Exome Sequencing Identifies Susceptibility Genes for Vestibular Migraine: A Preliminary Study

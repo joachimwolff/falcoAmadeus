@@ -1,0 +1,18 @@
+limit	assay	value
+atac_mask	atac	15
+gc_fail	exome	45
+gc_fail	amplicon16s	0
+gc_fail	rnaseq	70
+gc_fail	smallrna	95
+gc_fail	wgbs	40
+gc_fail	emseq	30
+gc_fail	rrbs	95
+dup_fail	exome	50
+dup_fail	amplicon16s	0
+dup_fail	rnaseq	3
+dup_fail	smallrna	2
+dup_fail	atac	13
+dup_fail	chipseq	22
+dup_fail	rrbs	34
+conversion_max_bisulfite		37.1
+conversion_min_other		30.4

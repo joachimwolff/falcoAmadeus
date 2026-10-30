@@ -67,15 +67,27 @@ struct AssayProfile {
   // ignore this many trailing read positions when grading (3' end-repair /
   // fill-in artifacts of methylation libraries)
   std::size_t mask_3p{0};
+
+  // --- relaxed FAIL limits (0: the module never FAILs under relax_gc /
+  // downgrade_dup). An expected shift is graded WARN, but a deviation beyond
+  // this limit still FAILs, so a gross contamination stays visible.
+  double gc_fail{0};   // Per sequence GC: deviation from normal (percent)
+  double dup_fail{0};  // Duplication: deduplicated percentage at or below
+
+  // --- Adapter Content ---
+  // reads are longer than the molecules (small RNA): 3' adapter read-through
+  // is expected in raw reads; FAIL -> WARN, annotated
+  bool expect_adapter{false};
 };
 
-// Residual unmethylated-C (or -G) fraction below which a bisulfite/EM library
-// is considered adequately converted. This is only a raw-read HEURISTIC: the
-// genuine residual C scales with the sample's true methylation level, so the
-// authoritative check is the post-alignment non-CpG conversion rate (>99.5%),
-// which a raw-read tool cannot compute. Above this fraction we emit a soft
-// WARN annotation, never a hard FAIL.
-static constexpr double kIncompleteConversionResidual = 0.05;
+// Unconverted fraction outside CpG (C among C+T followed by a non-G in C->T
+// reads, likewise G in G->A reads) above which a bisulfite/EM library is
+// flagged as possibly incompletely converted. On the calibration runs
+// converted libraries lay at 0.3-15 % (non-CpG methylation, e.g. in stem
+// cells, raises it) and unconverted ones at 30 % or more. A raw-read estimate
+// only: the authoritative check is the post-alignment non-CpG conversion rate
+// (>99.5 %). Above this fraction a soft WARN annotation, never a hard FAIL.
+static constexpr double kIncompleteConversionResidual = 0.20;
 
 // Populate `profile` for `assay` (assumed already lower-cased). Returns false
 // for an unknown assay so the caller can print the valid list and exit.

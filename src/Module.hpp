@@ -418,6 +418,7 @@ struct ModuleAdapterContent : public Module {
   // min minimum cutoffs for warn/fail (percentages)
   double grade_warn{};
   double grade_error{};
+  AssayProfile assay;  // [FalcoAmadeus] assay-aware grading
 
   // Aux function to count adapter in a position
   double
