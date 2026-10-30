@@ -79,6 +79,7 @@ inline T
 min8(const T a, const T b) {
   return (a < b) ? a : b;
 }
+
 /****************************************************/
 /***************** STREAMREADER *********************/
 /****************************************************/
@@ -673,6 +674,18 @@ StreamReader::seq_simd_chunks(FastqStats &stats, const char *&c, std::size_t &rp
         std::memcpy(&w, buf + i, 8);
         k = (k << 16) | _pext_u64(__builtin_bswap64(w), 0x0606060606060606ULL);
       }
+      // the last (fewer than eight) warm-up bases at once when eight bytes
+      // can be read: their codes are the top of the word's codes
+      if (i < end && nb != asz && i + 8 <= bsz) {
+        const std::size_t m = std::min(end - i, asz - nb);  // 1..7
+        std::uint64_t w;
+        std::memcpy(&w, buf + i, 8);
+        const std::uint64_t g =
+            _pext_u64(__builtin_bswap64(w), 0x0606060606060606ULL);
+        k = (k << (2 * m)) | (g >> (2 * (8 - m)));
+        i += m;
+        nb += m;
+      }
       for (; i < end && nb != asz; ++i) {
         k = (k << Constants::bit_shift_base) |
             (static_cast<std::size_t>(buf[i] >> 1) & 3);
@@ -707,7 +720,7 @@ StreamReader::seq_simd_chunks(FastqStats &stats, const char *&c, std::size_t &rp
         // runs the probes above, in position order, so the counts and
         // adapters_found evolve exactly as when every base is probed (a probe
         // changes state only on an exact match).
-        if (nad <= kVecAdapters) {
+        if (nad <= kVecAdapters && i + 8 <= end) {
           const __m512i shl = _mm512_setr_epi64(2, 4, 6, 8, 10, 12, 14, 16);
           const __m512i shr = _mm512_setr_epi64(14, 12, 10, 8, 6, 4, 2, 0);
           const __m512i vam = _mm512_set1_epi64(static_cast<long long>(amask));
@@ -2443,6 +2456,24 @@ dup_prefix_scan(FastqStats &master, std::size_t start, NextKey next_key,
 // a range, pull the dup key, decode one record's stats. Everything else (chunking,
 // global read indexing, dup cap, GC replay, tile, merge) lives once in the driver.
 // BAM cannot use this (no delimiter to split on) and keeps its own walk driver.
+// The first '\n' in [p, end) (end when there is none): a header line is
+// short, and an inline 16-byte scan costs less than a memchr call per read.
+static inline const char *
+find_newline(const char *p, const char *const end) {
+#if defined(__SSE2__)
+  const __m128i nl = _mm_set1_epi8('\n');
+  while (end - p >= 16) {
+    const int m = _mm_movemask_epi8(_mm_cmpeq_epi8(
+        _mm_loadu_si128(reinterpret_cast<const __m128i *>(p)), nl));
+    if (m)
+      return p + __builtin_ctz(static_cast<unsigned>(m));
+    p += 16;
+  }
+#endif
+  const void *q = memchr(p, '\n', static_cast<std::size_t>(end - p));
+  return q ? static_cast<const char *>(q) : end;
+}
+
 struct FastqPolicy {
   using Worker = ParallelWorker;
   static std::size_t find_start(const char *base, std::size_t size,
@@ -2476,7 +2507,7 @@ struct FastqPolicy {
                                GCRecord *gc, bool tile_ignore, bool can_be_last,
                                std::size_t &seqlen_out, std::size_t &tile_out,
                                const char *&key_out) {
-    const char *h = static_cast<const char *>(memchr(base + p, '\n', size - p));
+    const char *h = find_newline(base + p, base + size);
     const std::size_t seq_off = static_cast<std::size_t>(h - base) + 1;
     std::size_t tile_cur = 0;
     if (!tile_ignore) {
@@ -2492,8 +2523,10 @@ struct FastqPolicy {
     const std::size_t seqlen = w.read_pos;
     const char *seq_nl = w.cur_char;
     const std::size_t plus_off = static_cast<std::size_t>(seq_nl - base) + 1;
-    const char *pl = static_cast<const char *>(
-      memchr(base + plus_off, '\n', size - plus_off));
+    // the separator line is almost always a lone '+'
+    const char *pl = (plus_off + 1 < size && base[plus_off + 1] == '\n')
+                       ? base + plus_off + 1
+                       : find_newline(base + plus_off, base + size);
     const std::size_t qual_off = static_cast<std::size_t>(pl - base) + 1;
     bool qual_no_nl = false;
     if (can_be_last)

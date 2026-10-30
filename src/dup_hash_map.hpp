@@ -290,8 +290,28 @@ private:
       i += 8;
     }
     if (i < n) {
+      // the 1 to 7 remaining bytes, as memcpy into a zeroed word would place
+      // them (a variable-length memcpy is a library call per key, which
+      // dominated the hash of short reads)
+      const std::size_t r = n - i;
+      const char *q = p + i;
       std::uint64_t tail = 0;
-      std::memcpy(&tail, p + i, n - i);
+      unsigned off = 0;
+      if (r & 4) {
+        std::uint32_t x;
+        std::memcpy(&x, q, 4);
+        tail = x;
+        off = 4;
+      }
+      if (r & 2) {
+        std::uint16_t x;
+        std::memcpy(&x, q + off, 2);
+        tail |= static_cast<std::uint64_t>(x) << (8 * off);
+        off += 2;
+      }
+      if (r & 1)
+        tail |= static_cast<std::uint64_t>(static_cast<unsigned char>(q[off]))
+                << (8 * off);
       b = (b ^ tail) * C2;
     }
     a_out = a;
