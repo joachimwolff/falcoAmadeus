@@ -647,144 +647,215 @@ StreamReader::seq_simd_chunks(FastqStats &stats, const char *&c, std::size_t &rp
     // the adapter probes nothing, and its bases leave the masked window
     // before the next probe, so it is skipped: the probes and the run counter
     // are the serial ones (only k-mer bits that every probe masks differ).
-    std::size_t seg = rp0;
-    std::size_t blk = 0;
-    __mmask64 pend_n = any_n ? nblk[0] : 0;
-    for (;;) {
-      std::size_t end = rp;
-      if (any_n) {  // the next N at or after seg
-        while (!pend_n && ++blk < nblocks)
-          pend_n = nblk[blk];
-        if (pend_n) {
-          end = rp0 + 64 * blk +
-                static_cast<std::size_t>(__builtin_ctzll(pend_n));
-          pend_n &= pend_n - 1;
-        }
-      }
-      if (seg != rp0 && end != rp && end - seg < asz) {
-        seg = end + 1;  // nb stays 1: the N at end
-        continue;
-      }
-      std::size_t i = seg;
-      // warm-up: until the window fills (nba saturates), at most adapter_size.
-      // Eight bases at a time while at least eight remain to fill: eight steps
-      // of the unmasked k = (k << 2) | code are k << 16 | (the eight codes).
-      for (; i + 8 <= end && nb + 8 <= asz; i += 8, nb += 8) {
+    // A short read (at most 32 bases from the read start, no N): its codes
+    // fit one word, so every window is a shift of it, all windows are
+    // compared with every adapter at once, and the probes run in order only
+    // when one matches. k and the run counter end as the serial loop leaves
+    // them.
+    bool done = false;
+    const std::size_t L = rp - rp0;
+    if (!any_n && adap && nad <= kVecAdapters && rp0 == 0 && nb == 1 &&
+        L > 0 && L <= 32 && asz >= 2 && asz <= 32) {
+      std::uint64_t C = 0;
+      std::size_t q = 0;
+      for (; q + 8 <= L; q += 8) {
         std::uint64_t w;
-        std::memcpy(&w, buf + i, 8);
-        k = (k << 16) | _pext_u64(__builtin_bswap64(w), 0x0606060606060606ULL);
-      }
-      // the last (fewer than eight) warm-up bases at once when eight bytes
-      // can be read: their codes are the top of the word's codes
-      if (i < end && nb != asz && i + 8 <= bsz) {
-        const std::size_t m = std::min(end - i, asz - nb);  // 1..7
-        std::uint64_t w;
-        std::memcpy(&w, buf + i, 8);
-        const std::uint64_t g =
+        std::memcpy(&w, buf + q, 8);
+        C = (C << 16) |
             _pext_u64(__builtin_bswap64(w), 0x0606060606060606ULL);
-        k = (k << (2 * m)) | (g >> (2 * (8 - m)));
-        i += m;
-        nb += m;
       }
-      for (; i < end && nb != asz; ++i) {
-        k = (k << Constants::bit_shift_base) |
-            (static_cast<std::size_t>(buf[i] >> 1) & 3);
-        nb += (nb != asz);
+      if (q < L) {  // the bytes past the region are in the buffer, unused
+        const std::size_t r = L - q;
+        std::uint64_t w;
+        std::memcpy(&w, buf + q, 8);
+        C = (C << (2 * r)) |
+            (_pext_u64(__builtin_bswap64(w), 0x0606060606060606ULL) >>
+             (2 * (8 - r)));
       }
-      if (adap && i < end) {  // empty region must leave k byte-exact (unmasked)
-        // Steady state, chain-free: the serial recurrence k = ((k<<2)|code)&mask
-        // costs ~3 dependent cycles per base. Instead refill 8 codes at once
-        // (bswap orders the newest base lowest, pext pulls bits 1..2 of each
-        // ASCII byte, i.e. (ch>>1)&3) and form the window ending at lane j
-        // directly from the pre-group k and the fresh codes:
-        //   window_j = ((k << 2*(j+1)) | (g >> 2*(7-j))) & amask
-        // The mask cuts every bit where a masked and an unmasked k history
-        // differ, so each window equals the serial loop's masked value, and the
-        // eight probes are independent immediate-shift expressions out-of-order
-        // hardware can overlap. Probes fire on every steady-state base in
-        // ascending position order: byte-identical trajectory.
-        const auto probe = [&](std::size_t kk, std::size_t pos)
-            __attribute__((always_inline)) {
-          const std::size_t bmb = kk & bmask;
-          if (bm[bmb >> 6] & (static_cast<std::uint64_t>(1) << (bmb & 63))) {
-            for (std::size_t a = 0; a != nad; ++a)
-              if (kk == ad[a] && !adapters_found[a]) {
-                ++stats
-                    .pos_adapter_count[(pos << Constants::bit_shift_adapter) | a];
-                adapters_found[a] = true;
-              }
+      if (L >= asz) {
+        // windows end at asz - 1 .. L - 1; lane l of group v ends at
+        // asz - 1 + 8v + l (lanes past the end shift by a negative, i.e.
+        // huge, count and are masked out)
+        const std::size_t P = L - asz + 1;
+        const __m512i vam = _mm512_set1_epi64(static_cast<long long>(amask));
+        const __m512i vc = _mm512_set1_epi64(static_cast<long long>(C));
+        const __m512i lane2 = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
+        bool hit = false;
+        for (std::size_t v = 0; v * 8 < P && !hit; ++v) {
+          const __m512i sh = _mm512_sub_epi64(
+              _mm512_set1_epi64(static_cast<long long>(2 * (L - asz) - 16 * v)),
+              lane2);
+          const __m512i win = _mm512_and_si512(_mm512_srlv_epi64(vc, sh), vam);
+          const std::size_t left = P - 8 * v;
+          const __mmask8 lanes =
+              left >= 8 ? static_cast<__mmask8>(0xff)
+                        : static_cast<__mmask8>((1u << left) - 1);
+          for (std::size_t a = 0; a != nad && !hit; ++a)
+            hit = _mm512_mask_cmpeq_epi64_mask(
+                      lanes, win,
+                      _mm512_set1_epi64(static_cast<long long>(ad[a]))) != 0;
+        }
+        if (hit)
+          for (std::size_t j = asz - 1; j < L; ++j) {
+            const std::size_t kk = (C >> (2 * (L - 1 - j))) & amask;
+            const std::size_t bmb = kk & bmask;
+            if (bm[bmb >> 6] & (static_cast<std::uint64_t>(1) << (bmb & 63)))
+              for (std::size_t a = 0; a != nad; ++a)
+                if (kk == ad[a] && !adapters_found[a]) {
+                  ++stats.pos_adapter_count[
+                      (j << Constants::bit_shift_adapter) | a];
+                  adapters_found[a] = true;
+                }
           }
-        };
-        // With a few adapters the eight windows of a group are formed in one
-        // vector and compared with every adapter; only a group holding a match
-        // runs the probes above, in position order, so the counts and
-        // adapters_found evolve exactly as when every base is probed (a probe
-        // changes state only on an exact match).
-        if (nad <= kVecAdapters && i + 8 <= end) {
-          const __m512i shl = _mm512_setr_epi64(2, 4, 6, 8, 10, 12, 14, 16);
-          const __m512i shr = _mm512_setr_epi64(14, 12, 10, 8, 6, 4, 2, 0);
-          const __m512i vam = _mm512_set1_epi64(static_cast<long long>(amask));
-          __m512i vad[kVecAdapters];
-          for (std::size_t a = 0; a != nad; ++a)
-            vad[a] = _mm512_set1_epi64(static_cast<long long>(ad[a]));
+        k = C & amask;
+        nb = asz;
+      }
+      else {
+        k = (k << (2 * L)) | C;
+        nb = 1 + L;
+      }
+      done = true;
+    }
+    if (!done) {
+      std::size_t seg = rp0;
+      std::size_t blk = 0;
+      __mmask64 pend_n = any_n ? nblk[0] : 0;
+      for (;;) {
+        std::size_t end = rp;
+        if (any_n) {  // the next N at or after seg
+          while (!pend_n && ++blk < nblocks)
+            pend_n = nblk[blk];
+          if (pend_n) {
+            end = rp0 + 64 * blk +
+                  static_cast<std::size_t>(__builtin_ctzll(pend_n));
+            pend_n &= pend_n - 1;
+          }
+        }
+        if (seg != rp0 && end != rp && end - seg < asz) {
+          seg = end + 1;  // nb stays 1: the N at end
+          continue;
+        }
+        std::size_t i = seg;
+        // warm-up: until the window fills (nba saturates), at most adapter_size.
+        // Eight bases at a time while at least eight remain to fill: eight steps
+        // of the unmasked k = (k << 2) | code are k << 16 | (the eight codes).
+        for (; i + 8 <= end && nb + 8 <= asz; i += 8, nb += 8) {
+          std::uint64_t w;
+          std::memcpy(&w, buf + i, 8);
+          k = (k << 16) | _pext_u64(__builtin_bswap64(w), 0x0606060606060606ULL);
+        }
+        // the last (fewer than eight) warm-up bases at once when eight bytes
+        // can be read: their codes are the top of the word's codes
+        if (i < end && nb != asz && i + 8 <= bsz) {
+          const std::size_t m = std::min(end - i, asz - nb);  // 1..7
+          std::uint64_t w;
+          std::memcpy(&w, buf + i, 8);
+          const std::uint64_t g =
+              _pext_u64(__builtin_bswap64(w), 0x0606060606060606ULL);
+          k = (k << (2 * m)) | (g >> (2 * (8 - m)));
+          i += m;
+          nb += m;
+        }
+        for (; i < end && nb != asz; ++i) {
+          k = (k << Constants::bit_shift_base) |
+              (static_cast<std::size_t>(buf[i] >> 1) & 3);
+          nb += (nb != asz);
+        }
+        if (adap && i < end) {  // empty region must leave k byte-exact (unmasked)
+          // Steady state, chain-free: the serial recurrence k = ((k<<2)|code)&mask
+          // costs ~3 dependent cycles per base. Instead refill 8 codes at once
+          // (bswap orders the newest base lowest, pext pulls bits 1..2 of each
+          // ASCII byte, i.e. (ch>>1)&3) and form the window ending at lane j
+          // directly from the pre-group k and the fresh codes:
+          //   window_j = ((k << 2*(j+1)) | (g >> 2*(7-j))) & amask
+          // The mask cuts every bit where a masked and an unmasked k history
+          // differ, so each window equals the serial loop's masked value, and the
+          // eight probes are independent immediate-shift expressions out-of-order
+          // hardware can overlap. Probes fire on every steady-state base in
+          // ascending position order: byte-identical trajectory.
+          const auto probe = [&](std::size_t kk, std::size_t pos)
+              __attribute__((always_inline)) {
+            const std::size_t bmb = kk & bmask;
+            if (bm[bmb >> 6] & (static_cast<std::uint64_t>(1) << (bmb & 63))) {
+              for (std::size_t a = 0; a != nad; ++a)
+                if (kk == ad[a] && !adapters_found[a]) {
+                  ++stats
+                      .pos_adapter_count[(pos << Constants::bit_shift_adapter) | a];
+                  adapters_found[a] = true;
+                }
+            }
+          };
+          // With a few adapters the eight windows of a group are formed in one
+          // vector and compared with every adapter; only a group holding a match
+          // runs the probes above, in position order, so the counts and
+          // adapters_found evolve exactly as when every base is probed (a probe
+          // changes state only on an exact match).
+          if (nad <= kVecAdapters && i + 8 <= end) {
+            const __m512i shl = _mm512_setr_epi64(2, 4, 6, 8, 10, 12, 14, 16);
+            const __m512i shr = _mm512_setr_epi64(14, 12, 10, 8, 6, 4, 2, 0);
+            const __m512i vam = _mm512_set1_epi64(static_cast<long long>(amask));
+            __m512i vad[kVecAdapters];
+            for (std::size_t a = 0; a != nad; ++a)
+              vad[a] = _mm512_set1_epi64(static_cast<long long>(ad[a]));
+            for (; i + 8 <= end; i += 8) {
+              std::uint64_t w;
+              std::memcpy(&w, buf + i, 8);
+              const std::uint64_t g =
+                  _pext_u64(__builtin_bswap64(w), 0x0606060606060606ULL);
+              const __m512i win = _mm512_and_si512(
+                  _mm512_or_si512(
+                      _mm512_sllv_epi64(_mm512_set1_epi64(static_cast<long long>(k)), shl),
+                      _mm512_srlv_epi64(_mm512_set1_epi64(static_cast<long long>(g)), shr)),
+                  vam);
+              __mmask8 hit = 0;
+              for (std::size_t a = 0; a != nad; ++a)
+                hit |= _mm512_cmpeq_epi64_mask(win, vad[a]);
+              if (hit) {
+                probe(((k << 2) | (g >> 14)) & amask, i);
+                probe(((k << 4) | (g >> 12)) & amask, i + 1);
+                probe(((k << 6) | (g >> 10)) & amask, i + 2);
+                probe(((k << 8) | (g >> 8)) & amask, i + 3);
+                probe(((k << 10) | (g >> 6)) & amask, i + 4);
+                probe(((k << 12) | (g >> 4)) & amask, i + 5);
+                probe(((k << 14) | (g >> 2)) & amask, i + 6);
+                probe(((k << 16) | g) & amask, i + 7);
+              }
+              k = (k << 16) | g;
+            }
+          }
           for (; i + 8 <= end; i += 8) {
             std::uint64_t w;
             std::memcpy(&w, buf + i, 8);
             const std::uint64_t g =
                 _pext_u64(__builtin_bswap64(w), 0x0606060606060606ULL);
-            const __m512i win = _mm512_and_si512(
-                _mm512_or_si512(
-                    _mm512_sllv_epi64(_mm512_set1_epi64(static_cast<long long>(k)), shl),
-                    _mm512_srlv_epi64(_mm512_set1_epi64(static_cast<long long>(g)), shr)),
-                vam);
-            __mmask8 hit = 0;
-            for (std::size_t a = 0; a != nad; ++a)
-              hit |= _mm512_cmpeq_epi64_mask(win, vad[a]);
-            if (hit) {
-              probe(((k << 2) | (g >> 14)) & amask, i);
-              probe(((k << 4) | (g >> 12)) & amask, i + 1);
-              probe(((k << 6) | (g >> 10)) & amask, i + 2);
-              probe(((k << 8) | (g >> 8)) & amask, i + 3);
-              probe(((k << 10) | (g >> 6)) & amask, i + 4);
-              probe(((k << 12) | (g >> 4)) & amask, i + 5);
-              probe(((k << 14) | (g >> 2)) & amask, i + 6);
-              probe(((k << 16) | g) & amask, i + 7);
-            }
+            probe(((k << 2) | (g >> 14)) & amask, i);
+            probe(((k << 4) | (g >> 12)) & amask, i + 1);
+            probe(((k << 6) | (g >> 10)) & amask, i + 2);
+            probe(((k << 8) | (g >> 8)) & amask, i + 3);
+            probe(((k << 10) | (g >> 6)) & amask, i + 4);
+            probe(((k << 12) | (g >> 4)) & amask, i + 5);
+            probe(((k << 14) | (g >> 2)) & amask, i + 6);
+            probe(((k << 16) | g) & amask, i + 7);
             k = (k << 16) | g;
           }
+          // remaining < 8 bases: original masked chain
+          for (; i < end; ++i) {
+            k = ((k << Constants::bit_shift_base) |
+                 (static_cast<std::size_t>(buf[i] >> 1) & 3)) & amask;
+            probe(k, i);
+          }
+          k &= amask;  // the serial loop leaves k masked after its last probe
         }
-        for (; i + 8 <= end; i += 8) {
-          std::uint64_t w;
-          std::memcpy(&w, buf + i, 8);
-          const std::uint64_t g =
-              _pext_u64(__builtin_bswap64(w), 0x0606060606060606ULL);
-          probe(((k << 2) | (g >> 14)) & amask, i);
-          probe(((k << 4) | (g >> 12)) & amask, i + 1);
-          probe(((k << 6) | (g >> 10)) & amask, i + 2);
-          probe(((k << 8) | (g >> 8)) & amask, i + 3);
-          probe(((k << 10) | (g >> 6)) & amask, i + 4);
-          probe(((k << 12) | (g >> 4)) & amask, i + 5);
-          probe(((k << 14) | (g >> 2)) & amask, i + 6);
-          probe(((k << 16) | g) & amask, i + 7);
-          k = (k << 16) | g;
+        else {
+          for (; i < end; ++i)
+            k = (k << Constants::bit_shift_base) |
+                (static_cast<std::size_t>(buf[i] >> 1) & 3);
         }
-        // remaining < 8 bases: original masked chain
-        for (; i < end; ++i) {
-          k = ((k << Constants::bit_shift_base) |
-               (static_cast<std::size_t>(buf[i] >> 1) & 3)) & amask;
-          probe(k, i);
-        }
-        k &= amask;  // the serial loop leaves k masked after its last probe
+        if (end == rp)
+          break;
+        nb = 1;  // the N at end
+        seg = end + 1;
       }
-      else {
-        for (; i < end; ++i)
-          k = (k << Constants::bit_shift_base) |
-              (static_cast<std::size_t>(buf[i] >> 1) & 3);
-      }
-      if (end == rp)
-        break;
-      nb = 1;  // the N at end
-      seg = end + 1;
     }
     kmer = k;
     nba = nb;
