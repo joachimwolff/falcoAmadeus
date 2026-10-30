@@ -78,7 +78,8 @@ struct MateSeqs {
 };
 
 struct AwareDupResult {
-  std::size_t pairs = 0;
+  bool single = false;            // single-end: reads, not pairs
+  std::size_t pairs = 0;          // read pairs (single-end: reads)
   std::size_t exact_classes = 0;  // distinct pairs (sequence and UMI)
   std::size_t clusters = 0;       // groups of copies after tolerance
   std::size_t no_umi = 0;         // pairs whose name carried no UMI
@@ -92,7 +93,8 @@ struct AwareDupResult {
   }
 };
 
-// Groups the pairs (m1[i], m2[i]); consumes both. When `cluster_out` is
+// Groups the pairs (m1[i], m2[i]), or the reads of m1 when m2 is empty
+// (single-end); consumes both. When `cluster_out` is
 // non-empty, the group of every pair (the smallest pair index in it) is
 // written there as 32-bit integers in pair order.
 AwareDupResult

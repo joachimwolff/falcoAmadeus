@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Error- and UMI-aware paired duplication against an all-pairs oracle
-# (aware_oracle.py) on simulated read pairs.
+# (aware_oracle.py) on simulated read pairs, paired and single-end.
 # Usage: run_aware_tests.sh <falcoAmadeus>
 set -euo pipefail
 FA=$1
@@ -23,6 +23,14 @@ for seed in 1 2; do
       FA_AWARE_CLUSTERS="$T/g.u32" "$FA" -q -t $t -o "$T/out" "$T/r1.fq" \
         --paired-with "$T/r2.fq" "${args[@]}" > /dev/null
       python3 -I "$HERE/aware_oracle.py" check "$T/r1.fq" "$T/r2.fq" \
+        "$T/g.u32" "$D" "$U" "$UMI" || fail=1
+      # single-end: read 1 alone (no UMI in read 2)
+      case $UMI in r1r2:*) continue ;; esac
+      rm -rf "$T/out"
+      FA_AWARE_CLUSTERS="$T/g.u32" "$FA" -q -t $t -o "$T/out" "$T/r1.fq" \
+        "${args[@]}" > /dev/null
+      [ -s "$T/out/aware_duplication.txt" ] || { echo "FAIL no SE report"; fail=1; }
+      python3 -I "$HERE/aware_oracle.py" check "$T/r1.fq" - \
         "$T/g.u32" "$D" "$U" "$UMI" || fail=1
     done
   done <<'CASES'

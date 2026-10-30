@@ -18,7 +18,9 @@
   parse. Against Picard MarkDuplicates on mouse RNA-seq (DRR041223) the
   paired rate with two mismatches finds 97.9% of Picard's duplicates (exact
   matching: 80%), and 99.1% of the copies it counts are Picard duplicates.
-  Tested against an all-pairs oracle (`test/aware`).
+  Single-end input takes the same options (a read is the unit; written to
+  `aware_duplication.txt`). Tested against an all-pairs oracle
+  (`test/aware`, paired and single-end).
 
 ### Changed
 

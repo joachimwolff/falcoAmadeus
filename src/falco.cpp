@@ -1340,6 +1340,38 @@ paired_duplication_report(FpView &k1, FpView &k2,
   return pstats;
 }
 
+// [FalcoAmadeus] Error- and UMI-aware duplication of a single-end FASTQ
+// file (opt-in): reads the file once more and writes its own report.
+void
+write_single_aware_duplication(const std::string &file,
+                               const std::string &out_file,
+                               const AwareDupOptions &opt, const bool quiet,
+                               const std::size_t nthreads) {
+  MateSeqs m1, none;
+  for_each_fastq_record(file, [&](const char *h, const std::size_t hl,
+                                  const char *q, const std::size_t ql) {
+    m1.add(h, hl, q, ql, opt, 1);
+  });
+  if (opt.umi_in_name && m1.size() > 0 && m1.no_umi == m1.size())
+    throw std::runtime_error("--umi-in-name: no read name in " + file +
+                             " ends in a UMI (a last ':' or '_' separated "
+                             "field of bases)");
+  const char *dump = std::getenv("FA_AWARE_CLUSTERS");
+  const AwareDupResult r =
+    aware_duplication(m1, none, opt, nthreads, dump ? dump : "");
+  std::ofstream os(out_file, std::ofstream::binary);
+  os << "##FalcoAmadeus-AwareDuplication\t" << std::string{VERSION} << "\n";
+  os << "File\t" << file << "\n";
+  os << "Total reads\t" << r.pairs << "\n";
+  write_aware_section(os, r, opt);
+  if (!os.good())
+    throw std::runtime_error("Failed to write duplication file: " + out_file);
+  if (!quiet)
+    std::cerr << "[duplication] error/UMI-aware rate " << r.duplicate_rate()
+              << " % (" << r.clusters << " groups of " << r.pairs
+              << " reads), wrote " << out_file << "\n";
+}
+
 // [FalcoAmadeus] --umi-in-name: throws unless the first read name of the
 // file carries a UMI.
 void
@@ -2473,17 +2505,18 @@ main(int argc, char *argv[]) {
 
     opt_parse.add_opt(
       "-dup-mismatches", '\0',
-      "[FalcoAmadeus] With --paired-with, also report a paired duplicate rate "
-      "in which two pairs are copies when their duplication keys differ in at "
-      "most this many bases over both mates (sequencing errors), in either "
-      "mate order. 0 (default) adds no such rate unless a UMI is given. At "
-      "most 8.",
+      "[FalcoAmadeus] Also report a duplicate rate in which two reads are "
+      "copies when their duplication keys differ in at most this many bases "
+      "(sequencing errors); with --paired-with, two pairs whose mates differ "
+      "in at most this many bases in total, in either mate order "
+      "(paired_duplication.txt; single-end: aware_duplication.txt). 0 "
+      "(default) adds no such rate unless a UMI is given. At most 8.",
       false, aware_opt.mismatches);
 
     opt_parse.add_opt(
       "-umi-r1", '\0',
-      "[FalcoAmadeus] With --paired-with, the UMI lies in read 1 at START:LEN "
-      "(1-based, e.g. 1:8). Pairs are copies only when their UMIs agree "
+      "[FalcoAmadeus] The UMI lies in read 1 at START:LEN (1-based, e.g. "
+      "1:8). Reads (pairs) are copies only when their UMIs agree "
       "(see --umi-mismatches); the UMI bases are left out of the sequence "
       "comparison.",
       false, umi_r1_arg);
@@ -2495,7 +2528,7 @@ main(int argc, char *argv[]) {
 
     opt_parse.add_opt(
       "-umi-in-name", '\0',
-      "[FalcoAmadeus] With --paired-with, the UMI is the last ':' or '_' "
+      "[FalcoAmadeus] The UMI is the last ':' or '_' "
       "separated field of the read 1 name (as written by bcl-convert, "
       "umi_tools extract or fastp); '+' and '-' between UMI parts are "
       "ignored.",
@@ -2550,9 +2583,8 @@ main(int argc, char *argv[]) {
       parse_umi_region(umi_r1_arg, aware_opt.umi1_start, aware_opt.umi1_len);
     if (!umi_r2_arg.empty())
       parse_umi_region(umi_r2_arg, aware_opt.umi2_start, aware_opt.umi2_len);
-    if (aware_opt.enabled() && paired_with_file.empty())
-      throw std::runtime_error("--dup-mismatches, --umi-r1, --umi-r2 and "
-                               "--umi-in-name require --paired-with");
+    if (aware_opt.umi2_len > 0 && paired_with_file.empty())
+      throw std::runtime_error("--umi-r2 requires --paired-with");
     if (aware_opt.umi_in_name &&
         (aware_opt.umi1_len > 0 || aware_opt.umi2_len > 0))
       throw std::runtime_error("--umi-in-name cannot be combined with "
@@ -2704,10 +2736,22 @@ main(int argc, char *argv[]) {
         const std::string file_prefix = std::size(all_seq_filenames) == 1
                                            ? std::string{}
                                            : (file_basename + "_");
+        if (aware_opt.umi_in_name)
+          check_umi_in_first_name(filename);
         analyze_and_write(falco_config, filename, forced_file_format,
                           cur_outdir, file_prefix, summary_filename,
                           data_filename, report_filename, skip_text, skip_html,
                           skip_short_summary, do_call, false, std::string{});
+        if (aware_opt.enabled()) {
+          if (!(falco_config.is_fastq || falco_config.is_fastq_gz) ||
+              !falco_config.seekable_input)
+            throw std::runtime_error(
+              "--dup-mismatches and the UMI options need a FASTQ file that "
+              "can be read twice (not SAM/BAM or a pipe): " + filename);
+          write_single_aware_duplication(
+            filename, cur_outdir + "/" + file_prefix + "aware_duplication.txt",
+            aware_opt, falco_config.quiet, falco_config.threads);
+        }
       }
       else {
         // ---- [FalcoAmadeus] paired mode: full standard QC on BOTH mates ----

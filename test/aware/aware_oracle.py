@@ -2,14 +2,15 @@
 """Test oracle for the error- and UMI-aware paired duplication.
 
   aware_oracle.py simulate <seed> <R1.fastq> <R2.fastq>
-  aware_oracle.py check <R1.fastq> <R2.fastq> <groups.u32> <mismatches>
+  aware_oracle.py check <R1.fastq> <R2.fastq|-> <groups.u32> <mismatches>
                   <umi_mismatches> <umi: none|name|r1:S:L|r1r2:S:L>
 
 `simulate` writes read pairs drawn from a few hundred fragments, with
 substitutions, N, swapped mates, several read lengths and UMIs (in the first
 bases of both reads and in the name). `check` groups the pairs by comparing
 every pair with every other one (the definition, without the k-mer blocks)
-and compares the groups with those falcoAmadeus wrote.
+and compares the groups with those falcoAmadeus wrote; R2 "-" checks
+single-end reads.
 """
 import random
 import sys
@@ -89,7 +90,9 @@ def umi_name(name):
 
 def check(r1, r2, groups, D, U, umi):
     D, U = int(D), int(U)
-    m1, m2 = read_fastq(r1), read_fastq(r2)
+    single = r2 == "-"
+    m1 = read_fastq(r1)
+    m2 = [("", "")] * len(m1) if single else read_fastq(r2)
     s = l = 0
     mode = umi.split(":")[0]
     if mode in ("r1", "r1r2"):
@@ -118,7 +121,8 @@ def check(r1, r2, groups, D, U, umi):
 
     # mates with keys shorter than 4 bases per block are grouped only when
     # identical (as in falcoAmadeus)
-    short = [len(r[0]) < 4 * (D + 1) or len(r[1]) < 4 * (D + 1) for r in rec]
+    short = [len(r[0]) < 4 * (D + 1) or
+             (not single and len(r[1]) < 4 * (D + 1)) for r in rec]
     for i in range(n):
         ka, kb, ua, ub, hn = rec[i]
         for j in range(i + 1, n):
@@ -132,7 +136,9 @@ def check(r1, r2, groups, D, U, umi):
                 if hu > 0:
                     continue
             ok = False
-            for (p, q, up, uq) in ((kc, kd, uc, ud), (kd, kc, ud, uc)):
+            orders = ((kc, kd, uc, ud),) if single else \
+                ((kc, kd, uc, ud), (kd, kc, ud, uc))
+            for (p, q, up, uq) in orders:
                 if dist(ka, p) + dist(kb, q) > Dij:
                     continue
                 if hu + udist(ua, up) + udist(ub, uq) > Uij:

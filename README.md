@@ -43,6 +43,8 @@ original apart from the corrected N-content grade.
   apart (`--umi-mismatches` tolerates errors in the UMI). Candidates are found
   through k-mer blocks shared by both mates and confirmed base by base, so the
   rate stays exact for the stated tolerance and independent of read order.
+  The same options work for single-end input, where a read is the unit and
+  the rate is written to `aware_duplication.txt`.
   Sequence duplication reflects PCR duplicates as well as natural redundancy
   (deep coverage, highly expressed or enriched loci). Per-mate
   `fastqc_data.txt` files are kept for MultiQC.
@@ -301,7 +303,7 @@ FalcoAmadeus-specific options:
 | --- | --- |
 | `--paired-with R2` | Analyse the R2 mate together with the R1 positional input; write one combined report and `paired_duplication.txt`. Rejects mates whose read identifiers disagree. |
 | `--allow-unmatched-pairs` | With `--paired-with`, proceed even when R1/R2 read identifiers disagree. |
-| `--dup-mismatches N` | With `--paired-with`, also report a paired duplicate rate in which copies may differ in up to N bases over both mates (at most 8). |
+| `--dup-mismatches N` | Also report a duplicate rate in which copies may differ in up to N bases (at most 8): over both mates with `--paired-with` (`paired_duplication.txt`), per read otherwise (`aware_duplication.txt`). |
 | `--umi-r1 START:LEN`, `--umi-r2 START:LEN` | The UMI lies in read 1 or read 2 at a 1-based position; pairs are copies only when their UMIs agree, and the UMI bases are left out of the sequence comparison. |
 | `--umi-in-name` | The UMI is the last `:` or `_` separated field of the read 1 name (bcl-convert, UMI-tools extract, fastp). |
 | `--umi-mismatches N` | Bases in which the UMIs of two copies may differ (default 0). |

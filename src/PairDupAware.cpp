@@ -504,11 +504,14 @@ aware_duplication(MateSeqs &m1, MateSeqs &m2, const AwareDupOptions &opt,
   lap("start");
   AwareDupResult r;
   const std::size_t n = m1.size();
-  if (m2.size() != n)
+  // single-end: no second mate, a read is the unit
+  const bool single = m2.size() == 0;
+  if (!single && m2.size() != n)
     throw std::runtime_error("aware duplication: mates differ in size");
   if (n >= (std::size_t(1) << 32) - 1)
     throw std::runtime_error("aware duplication: more than 2^32 read pairs");
   r.pairs = n;
+  r.single = single;
   r.no_umi = m1.no_umi;
   const bool name_umi = opt.umi_in_name;
   const bool umi1 = opt.umi1_len > 0, umi2 = opt.umi2_len > 0;
@@ -540,7 +543,8 @@ aware_duplication(MateSeqs &m1, MateSeqs &m2, const AwareDupOptions &opt,
     n, nthreads,
     [&](const std::size_t i, auto sink) {
       std::uint64_t k =
-        unordered_key(mate_hash(e1, umi1, i), mate_hash(e2, umi2, i));
+        single ? mate_hash(e1, umi1, i)
+               : unordered_key(mate_hash(e1, umi1, i), mate_hash(e2, umi2, i));
       if (name_umi)
         k = mix64(k ^ umi_hash(m1, i));
       sink(KI{k, static_cast<std::uint32_t>(i)});
@@ -601,6 +605,13 @@ aware_duplication(MateSeqs &m1, MateSeqs &m2, const AwareDupOptions &opt,
         if (!umi_close(m1, a, m1, b, bu))
           return false;
       }
+      if (single) {
+        unsigned bu = U;
+        return v1.length(a) == v1.length(b) &&
+               (name_umi || !umi1 || umi_close(m1, a, m1, b, bu)) &&
+               mismatches(v1.w(a), v1.n(a), v1.w(b), v1.n(b), MateSeqs::W) <=
+                 D;
+      }
       for (int swap = 0; swap < 2; ++swap) {
         const MateView &p = swap ? v2 : v1, &q = swap ? v1 : v2;
         const MateSeqs &pm = swap ? m2 : m1, &qm = swap ? m1 : m2;
@@ -624,13 +635,14 @@ aware_duplication(MateSeqs &m1, MateSeqs &m2, const AwareDupOptions &opt,
     const bool umi_in_blocks = U == 0;
     // pairs with a mate key too short for the blocks are only grouped exactly
     auto blockable = [&](const std::size_t a) {
-      return v1.length(a) >= MIN_BLOCK * nb && v2.length(a) >= MIN_BLOCK * nb;
+      return v1.length(a) >= MIN_BLOCK * nb &&
+             (single || v2.length(a) >= MIN_BLOCK * nb);
     };
     std::vector<std::uint64_t, NoInit<std::uint64_t>> ent;
     std::atomic<std::size_t> comparisons{0};
     std::size_t largest = 0;
     for (unsigned bi = 0; bi < nb; ++bi)
-      for (unsigned bj = bi; bj < nb; ++bj) {
+      for (unsigned bj = bi; bj < (single ? bi + 1 : nb); ++bj) {
         generate_grouped<std::uint64_t>(
           C, nthreads,
           [&](const std::size_t c, auto sink) {
@@ -643,8 +655,15 @@ aware_duplication(MateSeqs &m1, MateSeqs &m2, const AwareDupOptions &opt,
               umi_in_blocks && umi2 ? umi_hash(m2, a) : 0;
             const std::uint64_t su =
               umi_in_blocks && name_umi ? umi_hash(m1, a) : 0;
-            const unsigned L1 = v1.length(a), L2 = v2.length(a);
+            const unsigned L1 = v1.length(a);
             const std::uint64_t *w1 = v1.w(a), *n1 = v1.n(a);
+            if (single) {  // one block of the read
+              const std::uint64_t k =
+                mix64(block_hash(w1, n1, L1, bi, nb, s1)) ^ su;
+              sink((k & 0xffffffff00000000ULL) | c);
+              return;
+            }
+            const unsigned L2 = v2.length(a);
             const std::uint64_t *w2 = v2.w(a), *n2 = v2.n(a);
             auto put = [&](const unsigned i, const unsigned j) {
               const std::uint64_t k =
@@ -745,21 +764,37 @@ write_aware_section(std::ostream &os, const AwareDupResult &r,
     umi = "read 1 " + region(opt.umi1_start, opt.umi1_len);
   else if (opt.umi2_len > 0)
     umi = "read 2 " + region(opt.umi2_start, opt.umi2_len);
-  os << "#Error- and UMI-aware paired duplicate rate (%): two pairs are "
-        "copies when, in either mate order, both mates have keys of the same "
-        "length that differ in at most the allowed number of bases in total "
-        "(an N matches only an N), and their UMIs differ in at most the "
-        "allowed number of bases. Keys as above, after removing an in-read "
-        "UMI. Copies are grouped transitively; independent of read order.\n";
-  os << "Mismatches allowed per pair\t" << opt.mismatches << "\n";
+  const char *unit = r.single ? "reads" : "pairs";
+  if (r.single)
+    os << "#Error- and UMI-aware duplicate rate (%): two reads are copies "
+          "when their keys have the same length and differ in at most the "
+          "allowed number of bases (an N matches only an N), and their UMIs "
+          "differ in at most the allowed number of bases. Keys are the "
+          "FastQC duplication keys (the first 50 bases of reads longer than "
+          "75), after removing an in-read UMI. Copies are grouped "
+          "transitively; independent of read order.\n";
+  else
+    os << "#Error- and UMI-aware paired duplicate rate (%): two pairs are "
+          "copies when, in either mate order, both mates have keys of the "
+          "same length that differ in at most the allowed number of bases in "
+          "total (an N matches only an N), and their UMIs differ in at most "
+          "the allowed number of bases. Keys as above, after removing an "
+          "in-read UMI. Copies are grouped transitively; independent of read "
+          "order.\n";
+  os << "Mismatches allowed per " << (r.single ? "read" : "pair") << "\t"
+     << opt.mismatches << "\n";
   os << "UMI\t" << umi << "\n";
   os << "UMI mismatches allowed\t" << opt.umi_mismatches << "\n";
   if (opt.umi_in_name)
-    os << "Pairs without a UMI in the read name\t" << r.no_umi << "\n";
-  os << "Distinct pairs (sequence and UMI)\t" << r.exact_classes << "\n";
+    os << (r.single ? "Reads" : "Pairs")
+       << " without a UMI in the read name\t" << r.no_umi << "\n";
+  os << "Distinct " << unit << " (sequence and UMI)\t" << r.exact_classes
+     << "\n";
   os << "Groups of copies\t" << r.clusters << "\n";
-  os << "Paired-end aware\t" << r.duplicate_rate() << "\n";
-  os << "#Paired-end aware duplication levels\n";
+  os << (r.single ? "Aware" : "Paired-end aware") << "\t"
+     << r.duplicate_rate() << "\n";
+  os << (r.single ? "#Aware duplication levels\n"
+                  : "#Paired-end aware duplication levels\n");
   os << "#Duplication Level\tPercentage of deduplicated\t"
      << "Percentage of total\n";
   static const char *labels[16] = {"1",   "2",   "3",    "4",   "5",  "6",
