@@ -538,8 +538,9 @@ StreamReader::postprocess_sequence_line(FastqStats &stats) {
 // scan, N detection, buffer copy, GC count, and per-position base composition
 // accumulated CONTIGUOUSLY into SoA counters (stats.soa_base) -- the SoA layout is
 // what makes the otherwise-scatter base_count vectorisable. The k-mer/adapter
-// sliding window stays scalar (a real loop-carried dependency, and cheap); the loop
-// bails to the scalar path on a separator, any N, or before a GC-truncation point,
+// sliding window stays scalar (a real loop-carried dependency, and cheap). On
+// x86 the loop counts N lanes itself (per position, outside composition and GC);
+// the NEON loop bails to the scalar path on any N. Both stop at the separator,
 // so every edge case keeps exact serial semantics. Only used when do_kmer is off.
 // Both back ends are byte-identical by construction (identical integer math).
 #if defined(__x86_64__) || defined(__i386__)
@@ -560,6 +561,10 @@ StreamReader::seq_simd_chunks(FastqStats &stats, const char *&c, std::size_t &rp
   std::uint8_t *const t8 = stats.base_tile8.data();
   const std::size_t T = FastqStats::SHORT_READ_THRESHOLD;
   const std::size_t rp0 = rp;  // start of the region this call covers
+  bool any_n = false;          // the region holds an N (window pass below)
+  // N lanes of each 64-base block of the region, for the window pass
+  __mmask64 nblk[(FastqStats::SHORT_READ_THRESHOLD + 63) / 64] = {};
+  std::size_t nblocks = 0;
   while (rp + 64 <= bsz) {
     const __m512i v = _mm512_loadu_si512(c);
     const __mmask64 msep = _mm512_cmpeq_epi8_mask(v, vsep);
@@ -574,13 +579,21 @@ StreamReader::seq_simd_chunks(FastqStats &stats, const char *&c, std::size_t &rp
     const __mmask64 valid =
         (mlen == 64) ? ~static_cast<__mmask64>(0)
                      : ((static_cast<__mmask64>(1) << mlen) - 1);
-    if (mN & valid)
-      break;  // 'N' before the separator: scalar path keeps exact semantics
+    // N lanes count per position and are left out of the base composition
+    // and GC (as two-bit code and G/C bit an 'N' would read as T and G/C)
+    const __mmask64 nl = mN & valid;
+    const __mmask64 bases = valid & ~nl;
+    nblk[nblocks++] = nl;
+    if (nl) {
+      any_n = true;
+      for (__mmask64 b = nl; b; b &= b - 1)
+        ++stats.n_base_count[rp + static_cast<std::size_t>(__builtin_ctzll(b))];
+    }
     _mm512_mask_storeu_epi8(buf + rp, valid, v);
     const __m512i t = _mm512_and_si512(_mm512_srli_epi16(v, 1), v3);
     // G/C lanes: the low bit of the two-bit code, i.e. bit 1 of the byte;
     // counted with a popcount instead of a byte sum and vector reduction
-    const __mmask64 mgc = _mm512_test_epi8_mask(v, v2) & valid;
+    const __mmask64 mgc = _mm512_test_epi8_mask(v, v2) & bases;
     // GC truncation point inside this block's lanes (at most one: the step is
     // 100 > 64). The scalar loop captures gc AFTER adding the base at index
     // next_trunc, so the prefix mask is inclusive of that lane.
@@ -596,7 +609,7 @@ StreamReader::seq_simd_chunks(FastqStats &stats, const char *&c, std::size_t &rp
     gc += static_cast<std::size_t>(__builtin_popcountll(mgc));
     for (int code = 0; code < 4; ++code) {
       const __mmask64 m =
-          _mm512_cmpeq_epi8_mask(t, _mm512_set1_epi8(code)) & valid;
+          _mm512_cmpeq_epi8_mask(t, _mm512_set1_epi8(code)) & bases;
       // rp + 64 <= bsz <= T keeps the 64-byte access inside this code's row
       std::uint8_t *const tp = t8 + static_cast<std::size_t>(code) * T + rp;
       const __m512i cur = _mm512_loadu_si512(tp);
@@ -611,8 +624,8 @@ StreamReader::seq_simd_chunks(FastqStats &stats, const char *&c, std::size_t &rp
   // the vector loop above. Interleaving this 64-iteration scalar FSM with each
   // vector iteration serialized the whole pass (measured ~60% of uncompressed
   // -t8 wall time); as a separate tight pass over the L1-hot buffer copy it
-  // pipelines. The covered region contains no 'N' and no separator (the vector
-  // loop bails on both), so replaying the window here produces the exact kmer /
+  // pipelines. The covered region contains no separator, and its Ns are
+  // replayed by the scalar loop's rule (below), so the window here produces the exact kmer /
   // nba / adapters_found trajectory the interleaved version produced, in the
   // same order -- byte-identical by construction. State (kmer, nba) hands off
   // to the scalar tail exactly as before.
@@ -627,109 +640,138 @@ StreamReader::seq_simd_chunks(FastqStats &stats, const char *&c, std::size_t &rp
     const bool adap = do_adapter_optimized;
     const std::size_t asz = adapter_size;
     std::size_t k = kmer, nb = nba;
-    std::size_t i = rp0;
-    // warm-up: until the window fills (nba saturates), at most adapter_size.
-    // Eight bases at a time while at least eight remain to fill: eight steps
-    // of the unmasked k = (k << 2) | code are k << 16 | (the eight codes).
-    for (; i + 8 <= rp && nb + 8 <= asz; i += 8, nb += 8) {
-      std::uint64_t w;
-      std::memcpy(&w, buf + i, 8);
-      k = (k << 16) | _pext_u64(__builtin_bswap64(w), 0x0606060606060606ULL);
-    }
-    for (; i < rp && nb != asz; ++i) {
-      k = (k << Constants::bit_shift_base) |
-          (static_cast<std::size_t>(buf[i] >> 1) & 3);
-      nb += (nb != asz);
-    }
-    if (adap && i < rp) {  // empty region must leave k byte-exact (unmasked)
-      // Steady state, chain-free: the serial recurrence k = ((k<<2)|code)&mask
-      // costs ~3 dependent cycles per base. Instead refill 8 codes at once
-      // (bswap orders the newest base lowest, pext pulls bits 1..2 of each
-      // ASCII byte, i.e. (ch>>1)&3) and form the window ending at lane j
-      // directly from the pre-group k and the fresh codes:
-      //   window_j = ((k << 2*(j+1)) | (g >> 2*(7-j))) & amask
-      // The mask cuts every bit where a masked and an unmasked k history
-      // differ, so each window equals the serial loop's masked value, and the
-      // eight probes are independent immediate-shift expressions out-of-order
-      // hardware can overlap. Probes fire on every steady-state base in
-      // ascending position order: byte-identical trajectory.
-      const auto probe = [&](std::size_t kk, std::size_t pos)
-          __attribute__((always_inline)) {
-        const std::size_t bmb = kk & bmask;
-        if (bm[bmb >> 6] & (static_cast<std::uint64_t>(1) << (bmb & 63))) {
-          for (std::size_t a = 0; a != nad; ++a)
-            if (kk == ad[a] && !adapters_found[a]) {
-              ++stats
-                  .pos_adapter_count[(pos << Constants::bit_shift_adapter) | a];
-              adapters_found[a] = true;
-            }
+    // The window runs over spans without N, eight bases at a time; an N
+    // between spans restarts the run counter and leaves the k-mer as it is
+    // (the scalar loop's rule). A span that follows an N and is shorter than
+    // the adapter probes nothing, and its bases leave the masked window
+    // before the next probe, so it is skipped: the probes and the run counter
+    // are the serial ones (only k-mer bits that every probe masks differ).
+    std::size_t seg = rp0;
+    std::size_t blk = 0;
+    __mmask64 pend_n = any_n ? nblk[0] : 0;
+    for (;;) {
+      std::size_t end = rp;
+      if (any_n) {  // the next N at or after seg
+        while (!pend_n && ++blk < nblocks)
+          pend_n = nblk[blk];
+        if (pend_n) {
+          end = rp0 + 64 * blk +
+                static_cast<std::size_t>(__builtin_ctzll(pend_n));
+          pend_n &= pend_n - 1;
         }
-      };
-      // With a few adapters the eight windows of a group are formed in one
-      // vector and compared with every adapter; only a group holding a match
-      // runs the probes above, in position order, so the counts and
-      // adapters_found evolve exactly as when every base is probed (a probe
-      // changes state only on an exact match).
-      if (nad <= kVecAdapters) {
-        const __m512i shl = _mm512_setr_epi64(2, 4, 6, 8, 10, 12, 14, 16);
-        const __m512i shr = _mm512_setr_epi64(14, 12, 10, 8, 6, 4, 2, 0);
-        const __m512i vam = _mm512_set1_epi64(static_cast<long long>(amask));
-        __m512i vad[kVecAdapters];
-        for (std::size_t a = 0; a != nad; ++a)
-          vad[a] = _mm512_set1_epi64(static_cast<long long>(ad[a]));
-        for (; i + 8 <= rp; i += 8) {
+      }
+      if (seg != rp0 && end != rp && end - seg < asz) {
+        seg = end + 1;  // nb stays 1: the N at end
+        continue;
+      }
+      std::size_t i = seg;
+      // warm-up: until the window fills (nba saturates), at most adapter_size.
+      // Eight bases at a time while at least eight remain to fill: eight steps
+      // of the unmasked k = (k << 2) | code are k << 16 | (the eight codes).
+      for (; i + 8 <= end && nb + 8 <= asz; i += 8, nb += 8) {
+        std::uint64_t w;
+        std::memcpy(&w, buf + i, 8);
+        k = (k << 16) | _pext_u64(__builtin_bswap64(w), 0x0606060606060606ULL);
+      }
+      for (; i < end && nb != asz; ++i) {
+        k = (k << Constants::bit_shift_base) |
+            (static_cast<std::size_t>(buf[i] >> 1) & 3);
+        nb += (nb != asz);
+      }
+      if (adap && i < end) {  // empty region must leave k byte-exact (unmasked)
+        // Steady state, chain-free: the serial recurrence k = ((k<<2)|code)&mask
+        // costs ~3 dependent cycles per base. Instead refill 8 codes at once
+        // (bswap orders the newest base lowest, pext pulls bits 1..2 of each
+        // ASCII byte, i.e. (ch>>1)&3) and form the window ending at lane j
+        // directly from the pre-group k and the fresh codes:
+        //   window_j = ((k << 2*(j+1)) | (g >> 2*(7-j))) & amask
+        // The mask cuts every bit where a masked and an unmasked k history
+        // differ, so each window equals the serial loop's masked value, and the
+        // eight probes are independent immediate-shift expressions out-of-order
+        // hardware can overlap. Probes fire on every steady-state base in
+        // ascending position order: byte-identical trajectory.
+        const auto probe = [&](std::size_t kk, std::size_t pos)
+            __attribute__((always_inline)) {
+          const std::size_t bmb = kk & bmask;
+          if (bm[bmb >> 6] & (static_cast<std::uint64_t>(1) << (bmb & 63))) {
+            for (std::size_t a = 0; a != nad; ++a)
+              if (kk == ad[a] && !adapters_found[a]) {
+                ++stats
+                    .pos_adapter_count[(pos << Constants::bit_shift_adapter) | a];
+                adapters_found[a] = true;
+              }
+          }
+        };
+        // With a few adapters the eight windows of a group are formed in one
+        // vector and compared with every adapter; only a group holding a match
+        // runs the probes above, in position order, so the counts and
+        // adapters_found evolve exactly as when every base is probed (a probe
+        // changes state only on an exact match).
+        if (nad <= kVecAdapters) {
+          const __m512i shl = _mm512_setr_epi64(2, 4, 6, 8, 10, 12, 14, 16);
+          const __m512i shr = _mm512_setr_epi64(14, 12, 10, 8, 6, 4, 2, 0);
+          const __m512i vam = _mm512_set1_epi64(static_cast<long long>(amask));
+          __m512i vad[kVecAdapters];
+          for (std::size_t a = 0; a != nad; ++a)
+            vad[a] = _mm512_set1_epi64(static_cast<long long>(ad[a]));
+          for (; i + 8 <= end; i += 8) {
+            std::uint64_t w;
+            std::memcpy(&w, buf + i, 8);
+            const std::uint64_t g =
+                _pext_u64(__builtin_bswap64(w), 0x0606060606060606ULL);
+            const __m512i win = _mm512_and_si512(
+                _mm512_or_si512(
+                    _mm512_sllv_epi64(_mm512_set1_epi64(static_cast<long long>(k)), shl),
+                    _mm512_srlv_epi64(_mm512_set1_epi64(static_cast<long long>(g)), shr)),
+                vam);
+            __mmask8 hit = 0;
+            for (std::size_t a = 0; a != nad; ++a)
+              hit |= _mm512_cmpeq_epi64_mask(win, vad[a]);
+            if (hit) {
+              probe(((k << 2) | (g >> 14)) & amask, i);
+              probe(((k << 4) | (g >> 12)) & amask, i + 1);
+              probe(((k << 6) | (g >> 10)) & amask, i + 2);
+              probe(((k << 8) | (g >> 8)) & amask, i + 3);
+              probe(((k << 10) | (g >> 6)) & amask, i + 4);
+              probe(((k << 12) | (g >> 4)) & amask, i + 5);
+              probe(((k << 14) | (g >> 2)) & amask, i + 6);
+              probe(((k << 16) | g) & amask, i + 7);
+            }
+            k = (k << 16) | g;
+          }
+        }
+        for (; i + 8 <= end; i += 8) {
           std::uint64_t w;
           std::memcpy(&w, buf + i, 8);
           const std::uint64_t g =
               _pext_u64(__builtin_bswap64(w), 0x0606060606060606ULL);
-          const __m512i win = _mm512_and_si512(
-              _mm512_or_si512(
-                  _mm512_sllv_epi64(_mm512_set1_epi64(static_cast<long long>(k)), shl),
-                  _mm512_srlv_epi64(_mm512_set1_epi64(static_cast<long long>(g)), shr)),
-              vam);
-          __mmask8 hit = 0;
-          for (std::size_t a = 0; a != nad; ++a)
-            hit |= _mm512_cmpeq_epi64_mask(win, vad[a]);
-          if (hit) {
-            probe(((k << 2) | (g >> 14)) & amask, i);
-            probe(((k << 4) | (g >> 12)) & amask, i + 1);
-            probe(((k << 6) | (g >> 10)) & amask, i + 2);
-            probe(((k << 8) | (g >> 8)) & amask, i + 3);
-            probe(((k << 10) | (g >> 6)) & amask, i + 4);
-            probe(((k << 12) | (g >> 4)) & amask, i + 5);
-            probe(((k << 14) | (g >> 2)) & amask, i + 6);
-            probe(((k << 16) | g) & amask, i + 7);
-          }
+          probe(((k << 2) | (g >> 14)) & amask, i);
+          probe(((k << 4) | (g >> 12)) & amask, i + 1);
+          probe(((k << 6) | (g >> 10)) & amask, i + 2);
+          probe(((k << 8) | (g >> 8)) & amask, i + 3);
+          probe(((k << 10) | (g >> 6)) & amask, i + 4);
+          probe(((k << 12) | (g >> 4)) & amask, i + 5);
+          probe(((k << 14) | (g >> 2)) & amask, i + 6);
+          probe(((k << 16) | g) & amask, i + 7);
           k = (k << 16) | g;
         }
+        // remaining < 8 bases: original masked chain
+        for (; i < end; ++i) {
+          k = ((k << Constants::bit_shift_base) |
+               (static_cast<std::size_t>(buf[i] >> 1) & 3)) & amask;
+          probe(k, i);
+        }
+        k &= amask;  // the serial loop leaves k masked after its last probe
       }
-      for (; i + 8 <= rp; i += 8) {
-        std::uint64_t w;
-        std::memcpy(&w, buf + i, 8);
-        const std::uint64_t g =
-            _pext_u64(__builtin_bswap64(w), 0x0606060606060606ULL);
-        probe(((k << 2) | (g >> 14)) & amask, i);
-        probe(((k << 4) | (g >> 12)) & amask, i + 1);
-        probe(((k << 6) | (g >> 10)) & amask, i + 2);
-        probe(((k << 8) | (g >> 8)) & amask, i + 3);
-        probe(((k << 10) | (g >> 6)) & amask, i + 4);
-        probe(((k << 12) | (g >> 4)) & amask, i + 5);
-        probe(((k << 14) | (g >> 2)) & amask, i + 6);
-        probe(((k << 16) | g) & amask, i + 7);
-        k = (k << 16) | g;
+      else {
+        for (; i < end; ++i)
+          k = (k << Constants::bit_shift_base) |
+              (static_cast<std::size_t>(buf[i] >> 1) & 3);
       }
-      // remaining < 8 bases: original masked chain
-      for (; i < rp; ++i) {
-        k = ((k << Constants::bit_shift_base) |
-             (static_cast<std::size_t>(buf[i] >> 1) & 3)) & amask;
-        probe(k, i);
-      }
-      k &= amask;  // the serial loop leaves k masked after its last probe
-    }
-    else {
-      for (; i < rp; ++i)
-        k = (k << Constants::bit_shift_base) |
-            (static_cast<std::size_t>(buf[i] >> 1) & 3);
+      if (end == rp)
+        break;
+      nb = 1;  // the N at end
+      seg = end + 1;
     }
     kmer = k;
     nba = nb;
