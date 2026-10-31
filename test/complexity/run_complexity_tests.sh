@@ -2,7 +2,7 @@
 # Library complexity (--complexity) against preseq 3.2.0 lc_extrap -Q: a
 # generated library (20000 molecules, copy numbers drawn deterministically
 # from a skewed distribution) gives the same yield curve as preseq on the
-# same copy-number histogram. expected_curve.txt holds preseq's output; with
+# same copy-number histogram. expected_curve.tsv holds preseq's output; with
 # preseq on PATH (or PRESEQ=...) it is also run directly.
 # Usage: test/complexity/run_complexity_tests.sh <falcoAmadeus binary>
 set -u
@@ -27,7 +27,7 @@ BEGIN {
 }' > "$W/lib.fastq"
 FA_COPY_HIST="$W/hist.txt" FA_COMPLEXITY_CURVE="$W/curve.txt" \
   "$FA" -q --complexity -o "$W/out" "$W/lib.fastq" > /dev/null 2>&1
-if cmp -s "$W/curve.txt" "$HERE/expected_curve.txt"; then
+if cmp -s "$W/curve.txt" "$HERE/expected_curve.tsv"; then
   echo "ok   curve equals preseq lc_extrap -Q (stored)"
 else
   echo "FAIL curve differs from the stored preseq output"; fail=1
@@ -40,6 +40,6 @@ if [ -n "$PQ" ]; then
 fi
 grep -q "^10x" "$W/out/complexity.txt" && echo "ok   complexity.txt written" ||
   { echo "FAIL complexity.txt"; fail=1; }
-# REGEN_HIST=<path>: keep the histogram (to regenerate expected_curve.txt)
+# REGEN_HIST=<path>: keep the histogram (to regenerate expected_curve.tsv)
 [ -n "${REGEN_HIST:-}" ] && cp "$W/hist.txt" "$REGEN_HIST"
 exit $fail
