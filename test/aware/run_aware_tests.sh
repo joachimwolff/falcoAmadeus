@@ -87,14 +87,17 @@ def gen(seed, out1, out2, ins_len, cuts):
 gen(11, d + '/se.fq', None, (18, 31), [(0, 17), (17, 34)])
 gen(12, d + '/pe1.fq', d + '/pe2.fq', (14, 21), [(0, 10), (10, 20)])
 PY
-rm -rf "$T/out"
-FA_AWARE_CLUSTERS="$T/g.u32" "$FA" -q -t 4 -o "$T/out" "$T/se.fq" \
-  --dup-mismatches 2 > /dev/null
-python3 -I "$HERE/aware_oracle.py" check "$T/se.fq" - "$T/g.u32" 2 0 none || fail=1
-rm -rf "$T/out"
-FA_AWARE_CLUSTERS="$T/g.u32" "$FA" -q -t 4 -o "$T/out" "$T/pe1.fq" \
-  --paired-with "$T/pe2.fq" --dup-mismatches 4 > /dev/null
-python3 -I "$HERE/aware_oracle.py" check "$T/pe1.fq" "$T/pe2.fq" "$T/g.u32" 4 0 none || fail=1
+# FA_REFINE_MIN 2: every group above two classes split, as deep as it goes
+for rmin in 64 2; do
+  rm -rf "$T/out"
+  FA_REFINE_MIN=$rmin FA_AWARE_CLUSTERS="$T/g.u32" "$FA" -q -t 4 -o "$T/out" \
+    "$T/se.fq" --dup-mismatches 2 > /dev/null
+  python3 -I "$HERE/aware_oracle.py" check "$T/se.fq" - "$T/g.u32" 2 0 none || fail=1
+  rm -rf "$T/out"
+  FA_REFINE_MIN=$rmin FA_AWARE_CLUSTERS="$T/g.u32" "$FA" -q -t 4 -o "$T/out" \
+    "$T/pe1.fq" --paired-with "$T/pe2.fq" --dup-mismatches 4 > /dev/null
+  python3 -I "$HERE/aware_oracle.py" check "$T/pe1.fq" "$T/pe2.fq" "$T/g.u32" 4 0 none || fail=1
+done
 # a UMI that ends the name line (no comment after it, a /1 /2 suffix)
 python3 -I - "$T" <<'PY'
 import sys

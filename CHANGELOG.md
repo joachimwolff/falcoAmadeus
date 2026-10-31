@@ -235,13 +235,16 @@
   inserts in short reads), many unrelated pairs share their all-adapter
   blocks, and those block groups were compared pair by pair: on 1 million
   NovaSeq 2x51 pairs (ERR5654681) about 1 billion comparisons at 1
-  mismatch (5.0 s) and 2.6 billion at 2 (17.4 s). Groups of more than 64
-  classes are now split once more by pigeonhole (two copies differ in at
-  most D of the positions outside the shared blocks, so they share one of
-  D + 1 parts of them): 1.4 and 40 million comparisons (0.44 s, 2.2 s), the
-  groups unchanged. test/aware adds copies whose only shared blocks are
-  adapter blocks (single-end and paired, with swapped mates), checked
-  against the all-pairs oracle.
+  mismatch (5.0 s) and 2.6 billion at 2 (17.4 s); 10 million pairs did not
+  finish in minutes. Groups of more than 64 classes are now split by
+  pigeonhole, recursively: two copies differ in at most D of the positions
+  outside the shared blocks, so they share one of D + 1 parts of them, and
+  within a part the same holds for the positions left. On the 1 million
+  pairs 1.3 and 6.1 million comparisons (0.34 s, 0.43 s); on 10 million at
+  2 mismatches 3.1 s; the groups byte-identical at 1, 2 and 3 mismatches.
+  test/aware adds copies whose only shared blocks are adapter blocks
+  (single-end and paired, with swapped mates), also with every group split
+  (FA_REFINE_MIN=2), checked against the all-pairs oracle.
 
 - **Per base N content is graded.** Inherited from falco 1.x, the module
   compared the largest per-position N fraction (0 to 1) with the percent

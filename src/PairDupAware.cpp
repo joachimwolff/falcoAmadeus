@@ -11,8 +11,10 @@
 #include <cstdlib>
 #include <cstdio>
 #include <fstream>
+#include <functional>
 #include <malloc.h>
 #include <memory>
+#include <tuple>
 #include <utility>
 #include <stdexcept>
 
@@ -29,8 +31,17 @@ constexpr std::size_t MAX_UMI = 32;
 // exactly: shorter blocks would put most reads of that length into one group
 constexpr unsigned MIN_BLOCK = 4;
 // groups of more classes than this sharing the blocks of a pass are split
-// further before classes are compared (see refine in aware_duplication)
-constexpr std::size_t REFINE_MIN = 64;
+// further before classes are compared (see refine in aware_duplication);
+// FA_REFINE_MIN overrides it (tests force deep splitting with small values)
+std::size_t
+refine_min() {
+  static const std::size_t v = [] {
+    const char *e = std::getenv("FA_REFINE_MIN");
+    return e ? static_cast<std::size_t>(std::strtoull(e, nullptr, 10))
+             : std::size_t(64);
+  }();
+  return v;
+}
 
 inline std::uint64_t
 mix64(std::uint64_t x) {  // splitmix64 finalizer
@@ -882,62 +893,67 @@ aware_duplication(MateSeqs &m1, MateSeqs &m2, const AwareDupOptions &opt,
           [](const std::uint64_t x) { return x >> (64 - GROUP_BITS); }, ent,
           gstart);
         // A large group of classes sharing the blocks of this pass (e.g. the
-        // adapter blocks of many short inserts) is split once more: two
+        // adapter blocks of many short inserts) is split further: two
         // copies there differ in at most D of the remaining positions (both
         // mates without the shared blocks, the mates ordered by the shared
         // blocks' hashes, which is the same order for copies in either mate
         // order), so they share one of D + 1 parts of those positions
-        // (pigeonhole again). Classes are compared within the parts.
+        // (pigeonhole again), and within a part the same holds for the
+        // positions left. Classes are compared within the final parts.
+        struct Member {
+          std::uint32_t c;   // class
+          std::uint32_t off; // its bases (codes 0-4) in the pool
+          std::uint16_t la, lb;
+          std::uint8_t ba, bb;  // the shared block of each mate
+          bool operator<(const Member &o) const {
+            return std::tie(la, lb, ba, bb, c) <
+                   std::tie(o.la, o.lb, o.ba, o.bb, o.c);
+          }
+          bool same_layout(const Member &o) const {
+            return la == o.la && lb == o.lb && ba == o.ba && bb == o.bb;
+          }
+        };
+        constexpr unsigned MAX_REFINE_DEPTH = 6;
+        const std::size_t REFINE_MIN = refine_min();
+        auto compare_all = [&](const std::vector<std::uint32_t> &cls,
+                               std::size_t &local) {
+          for (std::size_t x = 0; x + 1 < cls.size(); ++x)
+            for (std::size_t y = x + 1; y < cls.size(); ++y) {
+              const std::uint32_t cx = cls[x], cy = cls[y];
+              if (cx == cy || groups.find(cx) == groups.find(cy))
+                continue;
+              ++local;
+              if (close(cx, cy))
+                groups.unite(cx, cy);
+            }
+        };
         auto refine = [&](const std::size_t a, const std::size_t b,
-                          const std::uint64_t key, std::size_t &local,
-                          std::vector<std::uint64_t> &sub) {
-          sub.clear();
+                          const std::uint64_t key, std::size_t &local) {
           const unsigned parts = D + 1;
+          std::vector<Member> mem;
+          std::vector<std::uint8_t> pool;
           auto code_at = [](const std::uint64_t *w, const std::uint64_t *nm,
-                            const unsigned pos) -> unsigned {
+                            const unsigned pos) -> std::uint8_t {
             const unsigned sh = 2 * (pos % 32);
             if ((nm[pos / 32] >> sh) & 1)
               return 4;
-            return static_cast<unsigned>((w[pos / 32] >> sh) & 3);
+            return static_cast<std::uint8_t>((w[pos / 32] >> sh) & 3);
           };
-          // the remaining positions of mate x (without block bx) then of
-          // mate y (without block by): parts of the concatenation
-          auto add_parts = [&](const std::uint32_t c,
-                               const std::uint64_t *wx, const std::uint64_t *nx,
-                               const unsigned Lx, const unsigned bx,
-                               const std::uint64_t *wy, const std::uint64_t *ny,
-                               const unsigned Ly, const unsigned by,
-                               const bool has_y) {
-            const unsigned xlo = bx * Lx / nb, xhi = (bx + 1) * Lx / nb;
-            const unsigned ylo = has_y ? by * Ly / nb : 0,
-                           yhi = has_y ? (by + 1) * Ly / nb : 0;
-            const unsigned rx = Lx - (xhi - xlo);
-            const unsigned R = rx + (has_y ? Ly - (yhi - ylo) : 0);
-            auto at = [&](const unsigned r) {
-              if (r < rx)
-                return code_at(wx, nx, r < xlo ? r : r + (xhi - xlo));
-              const unsigned q = r - rx;
-              return code_at(wy, ny, q < ylo ? q : q + (yhi - ylo));
-            };
-            for (unsigned k = 0; k < parts; ++k) {
-              const unsigned lo = k * R / parts, hi = (k + 1) * R / parts;
-              std::uint64_t h = mix64(
-                (std::uint64_t(Lx) << 48) ^ (std::uint64_t(Ly) << 32) ^
-                (std::uint64_t(bx) << 24) ^ (std::uint64_t(by) << 16) ^
-                (std::uint64_t(k) << 8) ^ parts);
-              std::uint64_t acc = 0;
-              unsigned cnt = 0;
-              for (unsigned r = lo; r < hi; ++r) {
-                acc = acc * 5 + at(r);
-                if (++cnt == 27) {
-                  h = mix64(h ^ acc);
-                  acc = 0;
-                  cnt = 0;
-                }
-              }
-              h = mix64(h ^ acc ^ (std::uint64_t(cnt) << 58));
-              sub.push_back((h & 0xffffffff00000000ULL) | c);
-            }
+          auto add = [&](const std::uint32_t c, const std::uint64_t *wa,
+                         const std::uint64_t *na, const unsigned La,
+                         const unsigned ba, const std::uint64_t *wb,
+                         const std::uint64_t *nb2, const unsigned Lb,
+                         const unsigned bb) {
+            Member m{c, static_cast<std::uint32_t>(pool.size()),
+                     static_cast<std::uint16_t>(La),
+                     static_cast<std::uint16_t>(Lb),
+                     static_cast<std::uint8_t>(ba),
+                     static_cast<std::uint8_t>(bb)};
+            for (unsigned i = 0; i < La; ++i)
+              pool.push_back(code_at(wa, na, i));
+            for (unsigned i = 0; i < Lb; ++i)
+              pool.push_back(code_at(wb, nb2, i));
+            mem.push_back(m);
           };
           std::uint32_t last = ~std::uint32_t(0);
           for (std::size_t x = a; x < b; ++x) {
@@ -955,7 +971,7 @@ aware_duplication(MateSeqs &m1, MateSeqs &m2, const AwareDupOptions &opt,
             const unsigned L1 = v1.length(ra);
             const std::uint64_t *w1 = v1.w(ra), *n1 = v1.n(ra);
             if (single) {
-              add_parts(c, w1, n1, L1, bi, nullptr, nullptr, 0, 0, false);
+              add(c, w1, n1, L1, bi, nullptr, nullptr, 0, 0);
               continue;
             }
             const unsigned L2 = v2.length(ra);
@@ -967,26 +983,85 @@ aware_duplication(MateSeqs &m1, MateSeqs &m2, const AwareDupOptions &opt,
               if (((unordered_key(h1, h2) ^ su) >> 32) != key)
                 continue;  // this order did not give the key
               if (h1 <= h2)
-                add_parts(c, w1, n1, L1, p, w2, n2, L2, q, true);
+                add(c, w1, n1, L1, p, w2, n2, L2, q);
               if (h2 <= h1)
-                add_parts(c, w2, n2, L2, q, w1, n1, L1, p, true);
+                add(c, w2, n2, L2, q, w1, n1, L1, p);
             }
           }
-          std::sort(sub.begin(), sub.end());
-          for (std::size_t u = 0; u < sub.size();) {
-            std::size_t e = u + 1;
-            while (e < sub.size() && (sub[e] >> 32) == (sub[u] >> 32))
-              ++e;
-            for (std::size_t x = u; x + 1 < e; ++x) {
-              const std::uint32_t cx = static_cast<std::uint32_t>(sub[x]);
-              for (std::size_t y = x + 1; y < e; ++y) {
-                const std::uint32_t cy = static_cast<std::uint32_t>(sub[y]);
-                if (cx == cy || groups.find(cx) == groups.find(cy))
-                  continue;
-                ++local;
-                if (close(cx, cy))
-                  groups.unite(cx, cy);
+          std::sort(mem.begin(), mem.end());
+          // one level: members (indices into mem) that share all positions
+          // outside `free`, which holds at most D differences for copies
+          std::function<void(const std::vector<std::uint32_t> &,
+                             const std::vector<std::uint16_t> &, unsigned)>
+            level = [&](const std::vector<std::uint32_t> &ms,
+                        const std::vector<std::uint16_t> &free,
+                        const unsigned depth) {
+              if (ms.size() <= REFINE_MIN || depth > MAX_REFINE_DEPTH ||
+                  free.size() < parts) {
+                std::vector<std::uint32_t> cls(ms.size());
+                for (std::size_t i = 0; i < ms.size(); ++i)
+                  cls[i] = mem[ms[i]].c;
+                compare_all(cls, local);
+                return;
               }
+              std::vector<std::pair<std::uint64_t, std::uint32_t>> hs;
+              for (unsigned k = 0; k < parts; ++k) {
+                const std::size_t lo = k * free.size() / parts,
+                                  hi = (k + 1) * free.size() / parts;
+                hs.clear();
+                for (const std::uint32_t i : ms) {
+                  const std::uint8_t *sq = &pool[mem[i].off];
+                  std::uint64_t h = mix64(k + 1), acc = 0;
+                  unsigned cnt = 0;
+                  for (std::size_t f = lo; f < hi; ++f) {
+                    acc = acc * 5 + sq[free[f]];
+                    if (++cnt == 27) {
+                      h = mix64(h ^ acc);
+                      acc = 0;
+                      cnt = 0;
+                    }
+                  }
+                  hs.emplace_back(mix64(h ^ acc ^ (std::uint64_t(cnt) << 58)),
+                                  i);
+                }
+                std::sort(hs.begin(), hs.end());
+                std::vector<std::uint16_t> rest;
+                rest.insert(rest.end(), free.begin(), free.begin() + lo);
+                rest.insert(rest.end(), free.begin() + hi, free.end());
+                for (std::size_t u = 0; u < hs.size();) {
+                  std::size_t e = u + 1;
+                  while (e < hs.size() && hs[e].first == hs[u].first)
+                    ++e;
+                  if (e - u >= 2) {
+                    std::vector<std::uint32_t> sub;
+                    for (std::size_t x = u; x < e; ++x)
+                      sub.push_back(hs[x].second);
+                    level(sub, rest, depth + 1);
+                  }
+                  u = e;
+                }
+              }
+            };
+          for (std::size_t u = 0; u < mem.size();) {
+            std::size_t e = u + 1;
+            while (e < mem.size() && mem[e].same_layout(mem[u]))
+              ++e;
+            if (e - u >= 2) {
+              const Member &m = mem[u];
+              const unsigned alo = m.ba * m.la / nb, ahi = (m.ba + 1) * m.la / nb;
+              const unsigned blo = single ? 0 : m.bb * m.lb / nb,
+                             bhi = single ? 0 : (m.bb + 1) * m.lb / nb;
+              std::vector<std::uint16_t> free;
+              for (unsigned i = 0; i < m.la; ++i)
+                if (i < alo || i >= ahi)
+                  free.push_back(static_cast<std::uint16_t>(i));
+              for (unsigned i = 0; i < m.lb; ++i)
+                if (i < blo || i >= bhi)
+                  free.push_back(static_cast<std::uint16_t>(m.la + i));
+              std::vector<std::uint32_t> ms;
+              for (std::size_t x = u; x < e; ++x)
+                ms.push_back(static_cast<std::uint32_t>(x));
+              level(ms, free, 1);
             }
             u = e;
           }
@@ -995,7 +1070,6 @@ aware_duplication(MateSeqs &m1, MateSeqs &m2, const AwareDupOptions &opt,
   reduction(max : largest)
         for (std::size_t g = 0; g < GROUPS; ++g) {
           std::size_t local = 0;
-          std::vector<std::uint64_t> sub;
           for (std::size_t a = gstart[g]; a < gstart[g + 1];) {
             const std::uint64_t key = ent[a] >> 32;
             std::size_t b = a + 1;
@@ -1003,7 +1077,7 @@ aware_duplication(MateSeqs &m1, MateSeqs &m2, const AwareDupOptions &opt,
               ++b;
             largest = std::max(largest, b - a);
             if (b - a > REFINE_MIN && D > 0) {
-              refine(a, b, key, local, sub);
+              refine(a, b, key, local);
               a = b;
               continue;
             }
