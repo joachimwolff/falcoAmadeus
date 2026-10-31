@@ -46,6 +46,13 @@ original apart from the corrected N-content grade.
   The same options work for single-end input, where a read is the unit and
   the rate is written to `aware_duplication.txt`.
 
+- **Machine-readable summary.** Every run writes
+  `falcoAmadeus_summary.json` (all metrics per view and of the falcoAmadeus
+  reports, plus the share of bases with Phred quality 20 and 30 or more) and
+  `falcoAmadeus_mqc.json`, which MultiQC shows as general statistics columns
+  (Q30 bases, paired and aware duplication, complexity, insert size, adapter
+  read-through and dimers, screen).
+
 - **Contamination screen.** `--screen DB` estimates which share of the
   reads comes from each genome of a reference panel (human, mouse, rat,
   fly, worm, yeast, Arabidopsis, E. coli, PhiX, lambda, mitochondria, rRNA,

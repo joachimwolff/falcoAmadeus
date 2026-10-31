@@ -4,6 +4,15 @@
 
 ### Added
 
+- **JSON summary and MultiQC columns.** Each run writes
+  `falcoAmadeus_summary.json` with every metric of the reports (Basic
+  Statistics, module grades, FastQC duplication, assay notes per view;
+  paired and aware duplication, complexity curve, insert size and adapter
+  read-through, screen) and the Q20/Q30 base shares (equal to a direct count
+  over the quality strings), and `falcoAmadeus_mqc.json`, MultiQC custom
+  content for the general statistics table (checked with MultiQC 1.35). The
+  text reports are unchanged. Tested in `test/json`.
+
 - **Contamination screen** (`--screen`, `--screen-build`). The share of
   the reads' sequence explained by each genome of a reference panel,
   without alignment: canonical 31-mers selected by hash, each reference at

@@ -52,6 +52,8 @@ falcoAmadeus_SOURCES = \
 	src/Complexity.cpp \
 	src/InsertSize.cpp \
 	src/Screen.cpp \
+	src/JsonReport.cpp \
+	src/JsonReport.hpp \
 	src/Screen.hpp \
 	src/InsertSize.hpp \
 	src/Complexity.hpp \

@@ -29,6 +29,7 @@
 #include "Complexity.hpp"
 #include "InsertSize.hpp"
 #include "Screen.hpp"
+#include "JsonReport.hpp"
 #include "smithlab_utils.hpp"
 
 #include "config.h"
@@ -1984,6 +1985,9 @@ summarize_and_write(FalcoConfig &falco_config, FastqStats &stats,
   write_results(falco_config, stats, skip_text, skip_html, skip_short_summary,
                 do_call, file_prefix, out_dir, summary_filename, data_filename,
                 report_filename);
+  // [FalcoAmadeus] base quality totals for the JSON summary (the encoding is
+  // known once the report is written)
+  record_base_quality(out_dir + "/" + file_prefix, stats);
   if (fa_times) {
     const auto t2 = std::chrono::steady_clock::now();
     std::fprintf(stderr, "[FA_TIMES main] summarize %.3f  write_results %.3f\n",
@@ -3109,6 +3113,23 @@ main(int argc, char *argv[]) {
             falco_config.quiet, falco_config.threads);
         }
         screen_job.join();
+        {
+          const std::string pre = cur_outdir + "/" + file_prefix;
+          JsonView v{"reads",
+                     data_filename.empty() ? pre + "fastqc_data.txt"
+                                           : data_filename,
+                     summary_filename.empty() ? pre + "summary.txt"
+                                              : summary_filename,
+                     pre};
+          write_json_reports(
+            cur_outdir, file_prefix,
+            falco_config.sample_name.empty() ? file_basename
+                                             : falco_config.sample_name,
+            {filename}, {v},
+            {{"aware_duplication", pre + "aware_duplication.txt"},
+             {"complexity", pre + "complexity.txt"},
+             {"screen", pre + "screen.txt"}});
+        }
       }
       else {
         // ---- [FalcoAmadeus] paired mode: full standard QC on BOTH mates ----
@@ -3440,6 +3461,24 @@ main(int argc, char *argv[]) {
                                    falco_config.threads, have ? &a1 : nullptr,
                                    have ? &a2 : nullptr);
           plap("aware duplication");
+        }
+        {
+          std::string sample = fwd_stem;
+          const std::string tag = "_forward";
+          if (sample.size() > tag.size() &&
+              sample.compare(sample.size() - tag.size(), tag.size(), tag) == 0)
+            sample.erase(sample.size() - tag.size());
+          write_json_reports(
+            cur_outdir, std::string{}, sample, {filename, paired_with_file},
+            {{"forward", fwd_dir + "/fastqc_data.txt",
+              fwd_dir + "/summary.txt", fwd_dir + "/"},
+             {"reverse", rev_dir + "/fastqc_data.txt",
+              rev_dir + "/summary.txt", rev_dir + "/"},
+             {"combined", cur_outdir + "/fastqc_data.txt",
+              cur_outdir + "/summary.txt", std::string{}}},
+            {{"paired_duplication", paired_out},
+             {"insert_size", cur_outdir + "/paired_insert_size.txt"},
+             {"screen", cur_outdir + "/screen.txt"}});
         }
       }
 
