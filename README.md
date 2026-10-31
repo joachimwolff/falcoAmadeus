@@ -53,6 +53,14 @@ original apart from the corrected N-content grade.
   (Q30 bases, paired and aware duplication, complexity, insert size, adapter
   read-through and dimers, screen).
 
+- **Acceptance rules.** `--acceptance rules.tsv` grades a sample against
+  lab limits (lines `metric >= warn fail` or `metric <= warn fail`, the
+  metric a path into the JSON summary such as
+  `screen.references.human.found_pct`, or a MultiQC column such as
+  `q30_bases_pct`) and writes `acceptance.txt` with each rule and an overall
+  PASS, WARN or FAIL; a metric the run did not produce counts as FAIL.
+  `--acceptance-exit` makes a failed sample end the run with status 2.
+
 - **Contamination screen.** `--screen DB` estimates which share of the
   reads comes from each genome of a reference panel (human, mouse, rat,
   fly, worm, yeast, Arabidopsis, E. coli, PhiX, lambda, mitochondria, rRNA,
@@ -340,6 +348,8 @@ FalcoAmadeus-specific options:
 | `--umi-r1 START:LEN`, `--umi-r2 START:LEN` | The UMI lies in read 1 or read 2 at a 1-based position; pairs are copies only when their UMIs agree, and the UMI bases are left out of the sequence comparison. |
 | `--umi-in-name` | The UMI is the last `:` or `_` separated field of the read 1 name (bcl-convert, UMI-tools extract, fastp). |
 | `--umi-mismatches N` | Bases in which the UMIs of two copies may differ (default 0). |
+| `--acceptance FILE` | Grade the sample against acceptance rules; writes `acceptance.txt` and an `acceptance` section of the JSON summary. |
+| `--acceptance-exit` | With `--acceptance`, exit with status 2 when a sample fails its rules. |
 | `--screen DB` | Contamination screen against a database from `--screen-build`; writes `screen.txt`. |
 | `--screen-reads N` | Reads per file for `--screen` (default 1000000; 0: all). |
 | `--screen-build DB` with `--screen-refs name=file,...` | Build a screen database from FASTA files (at most 32 references), then exit. |

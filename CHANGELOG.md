@@ -4,6 +4,15 @@
 
 ### Added
 
+- **Acceptance rules** (`--acceptance`, `--acceptance-exit`). A rules file
+  of `metric >= warn fail` / `metric <= warn fail` lines, the metric a path
+  into the JSON summary or a MultiQC column name, gives each sample an
+  overall PASS, WARN or FAIL with each rule's value and result
+  (`acceptance.txt` and the JSON summary); a metric the run did not produce
+  counts as FAIL, a malformed file is rejected before the analysis, and
+  `--acceptance-exit` turns a FAIL into exit status 2. Tested in
+  `test/acceptance`.
+
 - **JSON summary and MultiQC columns.** Each run writes
   `falcoAmadeus_summary.json` with every metric of the reports (Basic
   Statistics, module grades, FastQC duplication, assay notes per view;

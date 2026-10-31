@@ -2499,6 +2499,7 @@ write_combined_paired_report(const std::string &out_file,
 
 int
 main(int argc, char *argv[]) {
+  bool acceptance_failed_exit = false;  // --acceptance-exit and a FAIL
   // [FalcoAmadeus] Idle OpenMP threads should sleep, not spin: worker threads
   // wait at barriers while serial steps (duplication prefix, GC replay
   // hand-off) run, and busy-waiting there costs 10-35% extra CPU time with
@@ -2555,6 +2556,18 @@ main(int argc, char *argv[]) {
     std::size_t insert_size_pairs = 1000000;
     std::string screen_db_path, screen_build_path, screen_refs_arg;
     std::size_t screen_reads = 1000000;
+    std::string acceptance_rules;
+    bool acceptance_exit = false;
+    bool any_acceptance_fail = false;
+    auto note_acceptance = [&](const std::string &result,
+                               const std::string &file) {
+      if (result.empty())
+        return;
+      if (result == "FAIL")
+        any_acceptance_fail = true;
+      if (!falco_config.quiet)
+        std::cerr << "[acceptance] " << file << ": " << result << "\n";
+    };
     std::string umi_r1_arg, umi_r2_arg;
 
     /****************** COMMAND LINE OPTIONS ********************/
@@ -2811,6 +2824,20 @@ main(int argc, char *argv[]) {
       false, aware_opt.umi_in_name);
 
     opt_parse.add_opt(
+      "-acceptance", '\0',
+      "[FalcoAmadeus] Acceptance rules (lines 'metric >= warn fail' or "
+      "'metric <= warn fail'; metric = a path into falcoAmadeus_summary.json "
+      "or a MultiQC column name): writes acceptance.txt with each rule's "
+      "result and an overall PASS, WARN or FAIL.",
+      false, acceptance_rules);
+
+    opt_parse.add_opt(
+      "-acceptance-exit", '\0',
+      "[FalcoAmadeus] With --acceptance, exit with status 2 when a sample "
+      "fails its rules (after all files are written).",
+      false, acceptance_exit);
+
+    opt_parse.add_opt(
       "-screen", '\0',
       "[FalcoAmadeus] Contamination screen: the share of the reads' k-mers "
       "found in each reference of this database (built with "
@@ -2920,6 +2947,8 @@ main(int argc, char *argv[]) {
       std::cerr << opt_parse.help_message() << '\n';
       return EXIT_SUCCESS;
     }
+    if (!acceptance_rules.empty())
+      read_acceptance_rules(acceptance_rules);  // fail before any analysis
     std::unique_ptr<ScreenDb> screen_db;
     if (!screen_db_path.empty())
       screen_db.reset(new ScreenDb(ScreenDb::load(screen_db_path)));
@@ -3121,14 +3150,16 @@ main(int argc, char *argv[]) {
                      summary_filename.empty() ? pre + "summary.txt"
                                               : summary_filename,
                      pre};
-          write_json_reports(
+          const std::string acc = write_json_reports(
             cur_outdir, file_prefix,
             falco_config.sample_name.empty() ? file_basename
                                              : falco_config.sample_name,
             {filename}, {v},
             {{"aware_duplication", pre + "aware_duplication.txt"},
              {"complexity", pre + "complexity.txt"},
-             {"screen", pre + "screen.txt"}});
+             {"screen", pre + "screen.txt"}},
+            acceptance_rules);
+          note_acceptance(acc, filename);
         }
       }
       else {
@@ -3468,7 +3499,7 @@ main(int argc, char *argv[]) {
           if (sample.size() > tag.size() &&
               sample.compare(sample.size() - tag.size(), tag.size(), tag) == 0)
             sample.erase(sample.size() - tag.size());
-          write_json_reports(
+          const std::string acc = write_json_reports(
             cur_outdir, std::string{}, sample, {filename, paired_with_file},
             {{"forward", fwd_dir + "/fastqc_data.txt",
               fwd_dir + "/summary.txt", fwd_dir + "/"},
@@ -3478,7 +3509,9 @@ main(int argc, char *argv[]) {
               cur_outdir + "/summary.txt", std::string{}}},
             {{"paired_duplication", paired_out},
              {"insert_size", cur_outdir + "/paired_insert_size.txt"},
-             {"screen", cur_outdir + "/screen.txt"}});
+             {"screen", cur_outdir + "/screen.txt"}},
+            acceptance_rules);
+          note_acceptance(acc, filename);
         }
       }
 
@@ -3487,10 +3520,11 @@ main(int argc, char *argv[]) {
         std::cerr << "Elapsed time for file " << filename << ": "
                   << get_seconds_since(file_start_time) << "s\n";
     }
+    acceptance_failed_exit = acceptance_exit && any_acceptance_fail;
   }
   catch (const std::exception &e) {
     std::cerr << e.what() << '\n';
     return EXIT_FAILURE;
   }
-  return EXIT_SUCCESS;
+  return acceptance_failed_exit ? 2 : EXIT_SUCCESS;
 }

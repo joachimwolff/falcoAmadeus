@@ -38,12 +38,31 @@ struct JsonView {
 };
 
 // writes <out_dir>/<prefix>falcoAmadeus_summary.json and _mqc.json;
-// extras: (section name, report file) of the falcoAmadeus reports present
-void write_json_reports(const std::string &out_dir, const std::string &prefix,
-                        const std::string &sample,
-                        const std::vector<std::string> &inputs,
-                        const std::vector<JsonView> &views,
-                        const std::vector<std::pair<std::string,
-                                                    std::string>> &extras);
+// extras: (section name, report file) of the falcoAmadeus reports present.
+// With acceptance rules (a file path; see read_acceptance_rules) also
+// <prefix>acceptance.txt and an "acceptance" section; returns the overall
+// result ("PASS", "WARN", "FAIL"), or "" without rules.
+std::string
+write_json_reports(const std::string &out_dir, const std::string &prefix,
+                   const std::string &sample,
+                   const std::vector<std::string> &inputs,
+                   const std::vector<JsonView> &views,
+                   const std::vector<std::pair<std::string, std::string>>
+                     &extras,
+                   const std::string &acceptance_rules = std::string{});
+
+// Acceptance rules: one per line, "metric op warn fail" (whitespace
+// separated; '#' starts a comment), op ">=" (the value must be at least the
+// limits) or "<=" (at most). The metric is a path into the JSON summary
+// (keys joined by '.', e.g. views.forward.q30_bases_pct or
+// screen.references.human.found_pct) or a MultiQC column name (e.g.
+// q30_bases_pct). Below (above) the fail limit: FAIL; below (above) the warn
+// limit: WARN; a metric the run did not produce: MISSING, counted as FAIL.
+// Throws on a malformed rules file.
+struct AcceptanceRule {
+  std::string metric, op;
+  double warn = 0, fail = 0;
+};
+std::vector<AcceptanceRule> read_acceptance_rules(const std::string &path);
 
 #endif

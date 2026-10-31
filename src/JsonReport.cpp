@@ -44,6 +44,19 @@ esc(const std::string &s) {
   return o;
 }
 
+// a limit as written in a rules file would read it (no exponent)
+std::string
+plain(const double v) {
+  char b[64];
+  std::snprintf(b, sizeof b, "%.6f", v);
+  std::string s(b);
+  while (!s.empty() && s.back() == '0')
+    s.pop_back();
+  if (!s.empty() && s.back() == '.')
+    s.pop_back();
+  return s;
+}
+
 // a number as written (JSON number) or a string
 std::string
 value(const std::string &v) {
@@ -293,7 +306,127 @@ extra_json(std::ostringstream &o, const std::string &section,
   ob.end();
 }
 
+// Flattens the JSON this file writes (objects, arrays, strings, numbers)
+// into path -> value text (numbers as written); array elements are skipped.
+struct Flat {
+  const std::string &j;
+  std::size_t i = 0;
+  std::map<std::string, std::string> out;
+  explicit Flat(const std::string &s) : j(s) {}
+  void ws() {
+    while (i < j.size() && std::isspace(static_cast<unsigned char>(j[i])))
+      ++i;
+  }
+  std::string str() {
+    std::string r;
+    ++i;  // opening quote
+    while (i < j.size() && j[i] != '"') {
+      if (j[i] == '\\' && i + 1 < j.size()) {
+        r += j[i + 1];
+        i += 2;
+      }
+      else
+        r += j[i++];
+    }
+    ++i;
+    return r;
+  }
+  void val(const std::string &path) {
+    ws();
+    if (j[i] == '{') {
+      ++i;
+      ws();
+      if (j[i] == '}') {
+        ++i;
+        return;
+      }
+      for (;;) {
+        ws();
+        const std::string k = str();
+        ws();
+        ++i;  // ':'
+        val(path.empty() ? k : path + "." + k);
+        ws();
+        if (j[i] == ',') {
+          ++i;
+          continue;
+        }
+        ++i;  // '}'
+        return;
+      }
+    }
+    if (j[i] == '[') {
+      int depth = 0;
+      bool in_str = false;
+      for (; i < j.size(); ++i) {
+        const char c = j[i];
+        if (in_str) {
+          if (c == '\\')
+            ++i;
+          else if (c == '"')
+            in_str = false;
+        }
+        else if (c == '"')
+          in_str = true;
+        else if (c == '[')
+          ++depth;
+        else if (c == ']' && --depth == 0) {
+          ++i;
+          return;
+        }
+      }
+      return;
+    }
+    if (j[i] == '"') {
+      out[path] = str();
+      return;
+    }
+    const std::size_t a = i;
+    while (i < j.size() && j[i] != ',' && j[i] != '}' && j[i] != ']' &&
+           !std::isspace(static_cast<unsigned char>(j[i])))
+      ++i;
+    out[path] = j.substr(a, i - a);
+  }
+};
+
 }  // namespace
+
+std::vector<AcceptanceRule>
+read_acceptance_rules(const std::string &path) {
+  std::ifstream in(path);
+  if (!in)
+    throw std::runtime_error("cannot open acceptance rules: " + path);
+  std::vector<AcceptanceRule> rules;
+  std::string line;
+  std::size_t ln = 0;
+  while (std::getline(in, line)) {
+    ++ln;
+    const std::size_t h = line.find('#');
+    if (h != std::string::npos)
+      line.erase(h);
+    std::istringstream is(line);
+    AcceptanceRule r;
+    if (!(is >> r.metric))
+      continue;
+    std::string w, f;
+    if (!(is >> r.op >> w >> f) || (r.op != ">=" && r.op != "<="))
+      throw std::runtime_error(
+        "acceptance rules " + path + ", line " + std::to_string(ln) +
+        ": expected 'metric >= warn fail' or 'metric <= warn fail'");
+    char *e1 = nullptr, *e2 = nullptr;
+    r.warn = std::strtod(w.c_str(), &e1);
+    r.fail = std::strtod(f.c_str(), &e2);
+    if (*e1 != '\0' || *e2 != '\0')
+      throw std::runtime_error("acceptance rules " + path + ", line " +
+                               std::to_string(ln) + ": limits must be numbers");
+    if ((r.op == ">=" && r.fail > r.warn) || (r.op == "<=" && r.fail < r.warn))
+      throw std::runtime_error("acceptance rules " + path + ", line " +
+                               std::to_string(ln) +
+                               ": the fail limit must be beyond the warn limit");
+    rules.push_back(r);
+  }
+  return rules;
+}
 
 void
 record_base_quality(const std::string &key, const FastqStats &stats) {
@@ -331,13 +464,14 @@ find_base_quality(const std::string &key) {
   return it == quality_registry().end() ? nullptr : &it->second;
 }
 
-void
+std::string
 write_json_reports(const std::string &out_dir, const std::string &prefix,
                    const std::string &sample,
                    const std::vector<std::string> &inputs,
                    const std::vector<JsonView> &views,
                    const std::vector<std::pair<std::string, std::string>>
-                     &extras) {
+                     &extras,
+                   const std::string &acceptance_rules) {
   std::map<std::string, double> gs;
   std::ostringstream o;
   {
@@ -375,16 +509,78 @@ write_json_reports(const std::string &out_dir, const std::string &prefix,
     top.end();
   }
   const std::string base = out_dir + "/" + prefix;
+  if (gs.count("bases") && gs["bases"] > 0)
+    gs["q30_bases_pct"] = 100.0 * gs["q30"] / gs["bases"];
+  std::string json = o.str();
+  std::string overall;
+  if (!acceptance_rules.empty()) {
+    const auto rules = read_acceptance_rules(acceptance_rules);
+    Flat fl(json);
+    fl.val("");
+    std::ostringstream t, a;
+    int worst = 0;  // 0 PASS, 1 WARN, 2 FAIL
+    static const char *names[] = {"PASS", "WARN", "FAIL"};
+    std::vector<std::string> rows;
+    a << ",\"acceptance\":{\"rules\":\"" << esc(acceptance_rules)
+      << "\",\"results\":[";
+    for (std::size_t k = 0; k < rules.size(); ++k) {
+      const AcceptanceRule &r = rules[k];
+      std::string vtext;
+      bool have = false;
+      double v = 0;
+      auto it = fl.out.find(r.metric);
+      if (it != fl.out.end() && numeric(it->second)) {
+        v = std::atof(it->second.c_str());
+        vtext = it->second;
+        have = true;
+      }
+      else if (gs.count(r.metric)) {
+        v = gs[r.metric];
+        vtext = std::to_string(v);
+        have = true;
+      }
+      std::string res;
+      if (!have) {
+        res = "MISSING";
+        worst = 2;
+      }
+      else {
+        int g = 0;
+        if (r.op == ">=")
+          g = v < r.fail ? 2 : (v < r.warn ? 1 : 0);
+        else
+          g = v > r.fail ? 2 : (v > r.warn ? 1 : 0);
+        res = names[g];
+        worst = std::max(worst, g);
+      }
+      t << r.metric << "\t" << (have ? vtext : "-") << "\t" << r.op << "\t"
+        << plain(r.warn) << "\t" << plain(r.fail) << "\t" << res << "\n";
+      a << (k ? "," : "") << "{\"metric\":\"" << esc(r.metric)
+        << "\",\"value\":" << (have ? value(vtext) : "null")
+        << ",\"op\":\"" << r.op << "\",\"warn\":" << plain(r.warn)
+        << ",\"fail\":" << plain(r.fail) << ",\"result\":\"" << res
+        << "\"}";
+    }
+    overall = names[worst];
+    a << "],\"overall\":\"" << overall << "\"}";
+    json.insert(json.size() - 1, a.str());  // before the closing brace
+    std::ofstream f(base + "acceptance.txt", std::ios::binary);
+    f << "##FalcoAmadeus-Acceptance\t" << VERSION << "\n";
+    f << "Sample\t" << sample << "\n";
+    f << "Rules\t" << acceptance_rules << "\n";
+    f << "Overall\t" << overall << "\n";
+    f << "#Metric\tValue\tRule\tWarn\tFail\tResult\n" << t.str();
+    if (!f.good())
+      throw std::runtime_error("cannot write " + base + "acceptance.txt");
+  }
   {
     std::ofstream f(base + "falcoAmadeus_summary.json", std::ios::binary);
-    f << o.str() << "\n";
+    f << json << "\n";
     if (!f.good())
       throw std::runtime_error("cannot write " + base +
                                "falcoAmadeus_summary.json");
   }
   // MultiQC custom content: general statistics columns
-  if (gs.count("bases") && gs["bases"] > 0)
-    gs["q30_bases_pct"] = 100.0 * gs["q30"] / gs["bases"];
   struct Col {
     const char *id, *title, *desc, *suffix;
     double max;
@@ -445,4 +641,5 @@ write_json_reports(const std::string &out_dir, const std::string &prefix,
   f << m.str() << "\n";
   if (!f.good())
     throw std::runtime_error("cannot write " + base + "falcoAmadeus_mqc.json");
+  return overall;
 }
