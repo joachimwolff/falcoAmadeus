@@ -47,4 +47,21 @@ for seed in 1 2; do
 2 2 r1r2:1:6
 CASES
 done
+# a UMI that ends the name line (no comment after it, a /1 /2 suffix)
+python3 -I - "$T" <<'PY'
+import sys
+d = sys.argv[1]
+with open(d + '/e1.fq', 'w') as a, open(d + '/e2.fq', 'w') as b:
+    for k in range(20):
+        u = 'ACGTACGT' if k % 2 else 'TTGCAAGC'
+        a.write('@r%d:%s/1\n%s\n+\n%s\n' % (k, u, 'ACGT' * 25, 'I' * 100))
+        b.write('@r%d:%s/2\n%s\n+\n%s\n' % (k, u, 'TGCA' * 25, 'I' * 100))
+PY
+rm -rf "$T/out"
+if "$FA" -q -o "$T/out" "$T/e1.fq" --paired-with "$T/e2.fq" --umi-in-name \
+    > /dev/null 2>&1 &&
+  grep -q "^Pairs without a UMI in the read name	0$" "$T/out/paired_duplication.txt" &&
+  grep -q "^Groups of copies	2$" "$T/out/paired_duplication.txt"; then
+  echo "ok   UMI at the end of the name line"
+else echo "FAIL UMI at the end of the name line"; fail=1; fi
 exit $fail

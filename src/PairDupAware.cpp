@@ -101,7 +101,8 @@ mismatches(const std::uint64_t *x, const std::uint64_t *nx,
 bool
 umi_from_name(const char *h, const std::size_t hlen, std::string &out) {
   std::size_t b = (hlen > 0 && h[0] == '@') ? 1 : 0, e = b;
-  while (e < hlen && h[e] != ' ' && h[e] != '\t' && h[e] != '\r')
+  while (e < hlen && h[e] != ' ' && h[e] != '\t' && h[e] != '\r' &&
+         h[e] != '\n')
     ++e;
   if (e - b >= 2 && (h[e - 2] == '/' || h[e - 2] == '.') &&
       (h[e - 1] == '1' || h[e - 1] == '2'))
