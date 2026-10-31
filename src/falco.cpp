@@ -27,6 +27,7 @@
 #include "StreamReader.hpp"
 #include "PairDupAware.hpp"
 #include "Complexity.hpp"
+#include "InsertSize.hpp"
 #include "smithlab_utils.hpp"
 
 #include "config.h"
@@ -639,6 +640,82 @@ for_each_fastq_record(const std::string &file, F f) {
       at_eof = true;
     end += got;
   }
+}
+
+// The sequences of a FASTQ file one record at a time (pull rather than
+// for_each_fastq_record's push, so two files can be read in lockstep).
+class FastqSeqStream {
+ public:
+  explicit FastqSeqStream(const std::string &file)
+    : file_(file), src_(file), buf_(std::size_t(1) << 22) {}
+  // the next record's sequence (valid until the next call); false at EOF
+  bool next(const char *&seq, std::size_t &len) {
+    for (;;) {
+      while (beg_ < end_ && buf_[beg_] == '\n')  // blank lines
+        ++beg_;
+      std::size_t ln[5];
+      ln[0] = beg_;
+      bool full = true;
+      for (int k = 1; k <= 4; ++k) {
+        const char *nl = static_cast<const char *>(
+          std::memchr(buf_.data() + ln[k - 1], '\n', end_ - ln[k - 1]));
+        if (nl == nullptr) {
+          if (eof_ && ln[k - 1] < end_ && k == 4) {
+            ln[4] = end_;  // final line without a newline
+            break;
+          }
+          full = false;
+          break;
+        }
+        ln[k] = static_cast<std::size_t>(nl - buf_.data()) + 1;
+      }
+      if (full) {
+        seq = buf_.data() + ln[1];
+        len = ln[2] - ln[1] - 1;
+        if (len && seq[len - 1] == '\r')
+          --len;
+        beg_ = ln[4];
+        return true;
+      }
+      if (eof_) {
+        if (beg_ < end_)
+          throw std::runtime_error("truncated FASTQ record in file: " + file_);
+        return false;
+      }
+      std::memmove(buf_.data(), buf_.data() + beg_, end_ - beg_);
+      end_ -= beg_;
+      beg_ = 0;
+      if (end_ == buf_.size())
+        buf_.resize(buf_.size() * 2);
+      const std::size_t got = src_.fill(buf_.data() + end_, buf_.size() - end_);
+      if (got == 0)
+        eof_ = true;
+      end_ += got;
+    }
+  }
+
+ private:
+  std::string file_;
+  FastqByteSource src_;
+  std::vector<char> buf_;
+  std::size_t beg_ = 0, end_ = 0;
+  bool eof_ = false;
+};
+
+// [FalcoAmadeus] Insert size, adapter read-through and adapter dimers of the
+// first max_pairs pairs (0: all), from the mate overlap; see InsertSize.hpp.
+static InsertSizeStats
+insert_size_scan(const std::string &r1, const std::string &r2,
+                 const std::size_t max_pairs) {
+  FastqSeqStream a(r1), b(r2);
+  InsertSizeStats st;
+  const char *s1, *s2;
+  std::size_t l1, l2;
+  while ((max_pairs == 0 || st.pairs < max_pairs) && a.next(s1, l1) &&
+         b.next(s2, l2))
+    st.add(s1, static_cast<int>(l1), s2, static_cast<int>(l2));
+  st.finish();
+  return st;
 }
 
 static MateFingerprints
@@ -2380,6 +2457,7 @@ main(int argc, char *argv[]) {
     std::string paired_with_file = "";
     AwareDupOptions aware_opt;
     bool want_complexity = false;
+    std::size_t insert_size_pairs = 1000000;
     std::string umi_r1_arg, umi_r2_arg;
 
     /****************** COMMAND LINE OPTIONS ********************/
@@ -2634,6 +2712,14 @@ main(int argc, char *argv[]) {
       "umi_tools extract or fastp); '+' and '-' between UMI parts are "
       "ignored.",
       false, aware_opt.umi_in_name);
+
+    opt_parse.add_opt(
+      "-insert-size-pairs", '\0',
+      "[FalcoAmadeus] With --paired-with, the number of pairs (from the start "
+      "of the files) whose mate overlap gives the insert size, adapter "
+      "read-through and adapter dimers in paired_insert_size.txt (default "
+      "1000000; 0: all pairs).",
+      false, insert_size_pairs);
 
     opt_parse.add_opt(
       "-complexity", '\0',
@@ -2916,6 +3002,30 @@ main(int argc, char *argv[]) {
         // reads are analysed
         if (aware_opt.umi_in_name)
           check_umi_in_first_name(filename);
+        // insert size from the first pairs, on its own thread beside the
+        // analysis (it reads both files once more, in lockstep)
+        InsertSizeStats isize;
+        std::exception_ptr isize_err;
+        struct IsizeJoin {
+          std::thread t;
+          ~IsizeJoin() {
+            if (t.joinable())
+              t.join();
+          }
+        } isize_job;
+        if (falco_config.is_fastq || falco_config.is_fastq_gz ||
+            ci_ends_with(filename, ".fq") || ci_ends_with(filename, ".fastq") ||
+            ci_ends_with(filename, ".fq.gz") ||
+            ci_ends_with(filename, ".fastq.gz"))
+          isize_job.t = std::thread([&] {
+            try {
+              isize = insert_size_scan(filename, paired_with_file,
+                                       insert_size_pairs);
+            }
+            catch (...) {
+              isize_err = std::current_exception();
+            }
+          });
         PairedFused pf;
         std::size_t fused_matching = 0;
         const bool fused =
@@ -3136,6 +3246,25 @@ main(int argc, char *argv[]) {
         if (report_err)
           std::rethrow_exception(report_err);
         plap("pairing report");
+        if (isize_job.t.joinable()) {
+          isize_job.t.join();
+          if (isize_err)
+            std::rethrow_exception(isize_err);
+          const std::string ifile = cur_outdir + "/paired_insert_size.txt";
+          std::ofstream io(ifile, std::ofstream::binary);
+          io << "##FalcoAmadeus-InsertSize\t" << std::string{VERSION} << "\n";
+          io << "Read1 file\t" << filename << "\n";
+          io << "Read2 file\t" << paired_with_file << "\n";
+          io << "Pairs scanned\t"
+             << (insert_size_pairs == 0 ? std::string("all")
+                                        : "the first " +
+                                            std::to_string(insert_size_pairs))
+             << "\n";
+          isize.write(io, falco_config.adapter_names, falco_config.adapter_seqs);
+          if (!io.good())
+            throw std::runtime_error("Failed to write " + ifile);
+          plap("insert size");
+        }
         if (aware_opt.enabled()) {
           // the mates' records come from the fused read when it collected
           // them, otherwise from a separate scan

@@ -50,6 +50,8 @@ falcoAmadeus_SOURCES = \
 	src/smithlab_utils.cpp \
 	src/PairDupAware.cpp \
 	src/Complexity.cpp \
+	src/InsertSize.cpp \
+	src/InsertSize.hpp \
 	src/Complexity.hpp \
 	src/PairDupAware.hpp \
 	src/Module.hpp \

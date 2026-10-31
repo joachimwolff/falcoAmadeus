@@ -4,6 +4,18 @@
 
 ### Added
 
+- **Insert size, adapter read-through and adapter dimers (paired).** A
+  thread beside the analysis overlaps read 1 with the reverse complement of
+  read 2 for the first million pairs (`--insert-size-pairs`) and writes
+  `paired_insert_size.txt`: the insert-size histogram, peak and median, the
+  pairs whose insert is shorter than a read, the adapter each read continues
+  into (consensus of the bases after the insert, named from the adapter
+  list) and the adapter dimers (read 1 starting with that adapter). The
+  overlap test is a port of fastp 0.24.3's (MIT); its histogram equals
+  fastp's on the same pairs (fastp counts only its first worker thread's
+  pairs, so with one worker). The vectorised test takes about 0.2 s per
+  million pairs. Tested against fastp (`test/insert_size`).
+
 - **Library complexity.** The exact duplicate counts now also give the
   histogram of copy numbers, and from it the expected number of distinct
   pairs (reads) at 2x, 5x, 10x, 20x, 50x and 100x the sequenced ones: a port

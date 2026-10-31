@@ -131,7 +131,8 @@ am_falcoAmadeus_OBJECTS = src/falco.$(OBJEXT) src/FastqStats.$(OBJEXT) \
 	src/HtmlMaker.$(OBJEXT) src/Module.$(OBJEXT) \
 	src/StreamReader.$(OBJEXT) src/FalcoConfig.$(OBJEXT) \
 	src/OptionParser.$(OBJEXT) src/smithlab_utils.$(OBJEXT) \
-	src/PairDupAware.$(OBJEXT) src/Complexity.$(OBJEXT)
+	src/PairDupAware.$(OBJEXT) src/Complexity.$(OBJEXT) \
+	src/InsertSize.$(OBJEXT)
 falcoAmadeus_OBJECTS = $(am_falcoAmadeus_OBJECTS)
 falcoAmadeus_LDADD = $(LDADD)
 AM_V_P = $(am__v_P_$(V))
@@ -151,10 +152,10 @@ depcomp = $(SHELL) $(top_srcdir)/depcomp
 am__maybe_remake_depfiles = depfiles
 am__depfiles_remade = src/$(DEPDIR)/Complexity.Po \
 	src/$(DEPDIR)/FalcoConfig.Po src/$(DEPDIR)/FastqStats.Po \
-	src/$(DEPDIR)/HtmlMaker.Po src/$(DEPDIR)/Module.Po \
-	src/$(DEPDIR)/OptionParser.Po src/$(DEPDIR)/PairDupAware.Po \
-	src/$(DEPDIR)/StreamReader.Po src/$(DEPDIR)/falco.Po \
-	src/$(DEPDIR)/smithlab_utils.Po
+	src/$(DEPDIR)/HtmlMaker.Po src/$(DEPDIR)/InsertSize.Po \
+	src/$(DEPDIR)/Module.Po src/$(DEPDIR)/OptionParser.Po \
+	src/$(DEPDIR)/PairDupAware.Po src/$(DEPDIR)/StreamReader.Po \
+	src/$(DEPDIR)/falco.Po src/$(DEPDIR)/smithlab_utils.Po
 am__mv = mv -f
 CXXCOMPILE = $(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) \
 	$(AM_CPPFLAGS) $(CPPFLAGS) $(AM_CXXFLAGS) $(CXXFLAGS)
@@ -551,6 +552,8 @@ falcoAmadeus_SOURCES = \
 	src/smithlab_utils.cpp \
 	src/PairDupAware.cpp \
 	src/Complexity.cpp \
+	src/InsertSize.cpp \
+	src/InsertSize.hpp \
 	src/Complexity.hpp \
 	src/PairDupAware.hpp \
 	src/Module.hpp \
@@ -687,6 +690,8 @@ src/PairDupAware.$(OBJEXT): src/$(am__dirstamp) \
 	src/$(DEPDIR)/$(am__dirstamp)
 src/Complexity.$(OBJEXT): src/$(am__dirstamp) \
 	src/$(DEPDIR)/$(am__dirstamp)
+src/InsertSize.$(OBJEXT): src/$(am__dirstamp) \
+	src/$(DEPDIR)/$(am__dirstamp)
 
 falcoAmadeus$(EXEEXT): $(falcoAmadeus_OBJECTS) $(falcoAmadeus_DEPENDENCIES) $(EXTRA_falcoAmadeus_DEPENDENCIES) 
 	@rm -f falcoAmadeus$(EXEEXT)
@@ -703,6 +708,7 @@ include src/$(DEPDIR)/Complexity.Po # am--include-marker
 include src/$(DEPDIR)/FalcoConfig.Po # am--include-marker
 include src/$(DEPDIR)/FastqStats.Po # am--include-marker
 include src/$(DEPDIR)/HtmlMaker.Po # am--include-marker
+include src/$(DEPDIR)/InsertSize.Po # am--include-marker
 include src/$(DEPDIR)/Module.Po # am--include-marker
 include src/$(DEPDIR)/OptionParser.Po # am--include-marker
 include src/$(DEPDIR)/PairDupAware.Po # am--include-marker
@@ -1200,6 +1206,7 @@ distclean: distclean-am
 	-rm -f src/$(DEPDIR)/FalcoConfig.Po
 	-rm -f src/$(DEPDIR)/FastqStats.Po
 	-rm -f src/$(DEPDIR)/HtmlMaker.Po
+	-rm -f src/$(DEPDIR)/InsertSize.Po
 	-rm -f src/$(DEPDIR)/Module.Po
 	-rm -f src/$(DEPDIR)/OptionParser.Po
 	-rm -f src/$(DEPDIR)/PairDupAware.Po
@@ -1257,6 +1264,7 @@ maintainer-clean: maintainer-clean-am
 	-rm -f src/$(DEPDIR)/FalcoConfig.Po
 	-rm -f src/$(DEPDIR)/FastqStats.Po
 	-rm -f src/$(DEPDIR)/HtmlMaker.Po
+	-rm -f src/$(DEPDIR)/InsertSize.Po
 	-rm -f src/$(DEPDIR)/Module.Po
 	-rm -f src/$(DEPDIR)/OptionParser.Po
 	-rm -f src/$(DEPDIR)/PairDupAware.Po

@@ -46,6 +46,14 @@ original apart from the corrected N-content grade.
   The same options work for single-end input, where a read is the unit and
   the rate is written to `aware_duplication.txt`.
 
+- **Insert size and adapter read-through (paired).** From the overlap of
+  read 1 with the reverse complement of read 2 in the first million pairs,
+  `paired_insert_size.txt` gives the insert-size histogram (as fastp's
+  overlap analysis; equal histograms on the same pairs), the share of pairs
+  whose insert is shorter than a read, the adapter each read continues into
+  (named when it is a known adapter), and the adapter dimers.
+  `--insert-size-pairs N` sets the number of pairs (0: all).
+
 - **Library complexity.** From how many distinct sequences were seen once,
   twice and so on, `paired_duplication.txt` reports how many distinct pairs
   to expect at 2x to 100x the sequenced pairs, so a library can be judged
@@ -315,6 +323,7 @@ FalcoAmadeus-specific options:
 | `--umi-r1 START:LEN`, `--umi-r2 START:LEN` | The UMI lies in read 1 or read 2 at a 1-based position; pairs are copies only when their UMIs agree, and the UMI bases are left out of the sequence comparison. |
 | `--umi-in-name` | The UMI is the last `:` or `_` separated field of the read 1 name (bcl-convert, UMI-tools extract, fastp). |
 | `--umi-mismatches N` | Bases in which the UMIs of two copies may differ (default 0). |
+| `--insert-size-pairs N` | With `--paired-with`, the number of pairs (from the start) whose mate overlap gives `paired_insert_size.txt` (default 1000000; 0: all). |
 | `--complexity` | Single-end: count every read's duplication key exactly and write `complexity.txt` with the expected distinct reads at 2x to 100x the sequenced reads (paired input reports it in `paired_duplication.txt` always). |
 | `--paired-data mates\|combined\|both` | With `--paired-with`, which `fastqc_data.txt` files to emit for MultiQC: separate mates (default), a single pooled sample, or both. |
 | `--assay TYPE` | Assay-aware pass/warn/fail grading (`rnaseq`, `amplicon`, `wgbs`/`emseq`/`rrbs`, `chipseq`, `atac`, `smallrna`, `wgs`, …; default `generic` is byte-identical to falco). |
