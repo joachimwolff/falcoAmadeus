@@ -6,7 +6,8 @@
 # alignments at 50, 100 and 2500 pixels (expected_picard.tsv; with GATK=gatk
 # and samtools on PATH also run directly), for 1 and 16 threads. Names
 # without coordinates give no optical duplicates, and single-end input is
-# reported per read.
+# reported per read. Pairs that would not align (adapter dimers, inserts
+# under 30 bases, mostly N) are left out, as Picard examines aligned pairs.
 # Usage: test/optical/run_optical_tests.sh <falcoAmadeus binary>
 set -u
 FA=${1:-./falcoAmadeus}
@@ -41,6 +42,43 @@ while IFS=$'\t' read -r D dups opt; do
       fail=1
     fi
   done
+done < "$HERE/expected_picard.tsv"
+# pairs that would not align, placed next to each other on one tile: 60
+# adapter dimers, 60 pairs with a 20-base insert, 60 with mostly N in read 2;
+# they are left out, so the optical count stays Picard's
+python3 -I - "$W" <<'PY'
+import random, sys
+d = sys.argv[1]
+rnd = random.Random(5)
+A1 = 'AGATCGGAAGAGCACACGTCTGAACTCCAGTCACATCACGATCTCGTATGCCGTCTTCTGCTTG'
+A2 = 'AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGTAGATCTCGGTGGTCGCCGTATCATTAAAAAA'
+rc = lambda s: s[::-1].translate(str.maketrans('ACGT', 'TGCA'))
+ins = ''.join(rnd.choice('ACGT') for _ in range(20))
+other = ''.join(rnd.choice('ACGT') for _ in range(100))
+kinds = [('dimer', 'G' + A1, 'G' + A2), ('short', ins + A1, rc(ins) + A2),
+         ('nrich', other, 'N' * 80 + other[:20])]
+with open(d + '/x1.fq', 'w') as f1, open(d + '/x2.fq', 'w') as f2:
+    for kind, s1, s2 in kinds:
+        s1 = (s1 + 'A' * 100)[:100]
+        s2 = (s2 + 'A' * 100)[:100]
+        for k in range(60):
+            name = 'A01234:77:HABCDEFXX:1:1101:%d:%d' % (30000 + 7 * k, 30000 + 5 * k)
+            f1.write('@%s 1:N:0:ACGT\n%s\n+\n%s\n' % (name, s1, 'I' * 100))
+            f2.write('@%s 2:N:0:ACGT\n%s\n+\n%s\n' % (name, s2, 'I' * 100))
+PY
+cat "$W/r1.fq" "$W/x1.fq" > "$W/y1.fq"
+cat "$W/r2.fq" "$W/x2.fq" > "$W/y2.fq"
+while IFS=$'\t' read -r D dups opt; do
+  case $D in \#*) continue ;; esac
+  rm -rf "$W/o"
+  "$FA" -q -t 4 -o "$W/o" "$W/y1.fq" --paired-with "$W/y2.fq" --optical \
+    --optical-distance "$D" > /dev/null 2>&1
+  R="$W/o/paired_duplication.txt"
+  got=$(val "Optical duplicates" "$R")
+  out=$(awk -F'\t' '$1 ~ /^Pairs left out/ {print $2}' "$R")
+  if [ "$got" = "$opt" ] && [ "$out" = 180 ]; then
+    echo "ok   $D pixels: 180 pairs that would not align left out, $got optical as Picard"
+  else echo "FAIL $D pixels with pairs that would not align: $got optical, $out left out"; fail=1; fi
 done < "$HERE/expected_picard.tsv"
 # names without coordinates
 awk 'NR % 4 == 1 {$0 = "@r" NR} 1' "$W/r1.fq" > "$W/n1.fq"

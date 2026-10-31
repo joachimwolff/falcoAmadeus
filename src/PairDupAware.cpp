@@ -27,6 +27,10 @@ namespace {
 constexpr std::uint64_t LOW_BITS = 0x5555555555555555ULL;
 constexpr std::uint8_t NO_UMI = 0xff;
 constexpr std::size_t MAX_UMI = 32;
+// MateSeqs::no_align: an adapter position before base 30, NO_ADAPTER for
+// none, with UNALIGNED set for a read that does not align by itself
+constexpr std::uint8_t NO_ADAPTER = 0x7f;
+constexpr std::uint8_t UNALIGNED = 0x80;
 // mates whose key is shorter than this many bases per block are compared
 // exactly: shorter blocks would put most reads of that length into one group
 constexpr unsigned MIN_BLOCK = 4;
@@ -466,6 +470,43 @@ MateSeqs::add(const char *name, const std::size_t name_len, const char *seq,
     umi_n.push_back(un);
     umi_len.push_back(ulen);
   }
+  if (opt.optical_distance >= 0) {
+    // whether the read would align (bwa mem reports alignments of score 30
+    // or more, so at least 30 matching bases): the position of an adapter
+    // before base 30 (its first 12 bases, at most one mismatch; position 0
+    // also for a read beginning with the adapter's bases 2 to 4 onwards, an
+    // adapter dimer), and whether the read is shorter than 30 bases or its
+    // key mostly N (see no_align)
+    constexpr std::size_t kMinAligned = 30;
+    std::uint8_t code = NO_ADAPTER;
+    for (const std::string &ad : opt.adapters) {
+      for (std::size_t k = 1; k <= 3 && code != 0; ++k) {
+        const std::size_t m = ad.size() - k;
+        if (m < 9 || seq_len < m)
+          continue;
+        unsigned mm = 0;
+        for (std::size_t j = 0; j < m && mm <= 1; ++j)
+          mm += (seq[j] != ad[k + j]);
+        if (mm <= 1)
+          code = 0;
+      }
+      for (std::size_t p = 0; p < std::min<std::size_t>(code, kMinAligned) &&
+                              p + ad.size() <= seq_len;
+           ++p) {
+        unsigned mm = 0;
+        for (std::size_t j = 0; j < ad.size() && mm <= 1; ++j)
+          mm += (seq[p + j] != ad[j]);
+        if (mm <= 1)
+          code = static_cast<std::uint8_t>(p);
+      }
+    }
+    std::size_t nn = 0;
+    for (std::size_t j = 0; j < kl; ++j)
+      nn += (base_code(kp[j]) == 4);
+    if (seq_len < kMinAligned || 2 * nn > kl)
+      code |= UNALIGNED;
+    no_align.push_back(code);
+  }
   if (opt.optical_distance >= 0 && mate == 1) {
     std::int16_t t = -1;
     std::int32_t px = -1, py = -1;
@@ -489,6 +530,7 @@ MateSeqs::clear() {
   tile.clear();
   x.clear();
   y.clear();
+  no_align.clear();
   no_umi = 0;
 }
 
@@ -504,6 +546,7 @@ MateSeqs::shrink() {
   tile.shrink_to_fit();
   x.shrink_to_fit();
   y.shrink_to_fit();
+  no_align.shrink_to_fit();
 }
 
 void
@@ -520,6 +563,7 @@ MateSeqs::append(const MateSeqs &part) {
   tile.insert(tile.end(), part.tile.begin(), part.tile.end());
   x.insert(x.end(), part.x.begin(), part.x.end());
   y.insert(y.end(), part.y.begin(), part.y.end());
+  no_align.insert(no_align.end(), part.no_align.begin(), part.no_align.end());
   no_umi += part.no_umi;
 }
 
@@ -577,6 +621,8 @@ MateSeqs::concat(std::vector<MateSeqs> &parts, std::size_t nthreads) {
                nthreads);
   concat_field(parts, m.y, [](MateSeqs &p) -> auto & { return p.y; },
                nthreads);
+  concat_field(parts, m.no_align,
+               [](MateSeqs &p) -> auto & { return p.no_align; }, nthreads);
   std::vector<MateSeqs>().swap(parts);
   return m;
 }
@@ -635,8 +681,24 @@ optical_duplicates(const MateSeqs &m1, const MateSeqs &m2, const bool single,
                    const std::size_t nthreads, AwareDupResult &r) {
   const std::size_t n = m1.size(), C = rep.size();
   r.optical = true;
-  for (std::size_t i = 0; i < n; ++i)
+  // pairs that would not align are not in Picard's sets: a mate too short
+  // or mostly N, or an insert under 30 bases (an adapter before base 30 in
+  // both mates at about the same position; in the read, single-end)
+  auto aligns = [&](const std::size_t i) {
+    const std::uint8_t a = m1.no_align[i];
+    if (a & UNALIGNED)
+      return false;
+    if (single)
+      return a == NO_ADAPTER;
+    const std::uint8_t b = m2.no_align[i];
+    if (b & UNALIGNED)
+      return false;
+    return a == NO_ADAPTER || b == NO_ADAPTER || (a > b ? a - b : b - a) > 3;
+  };
+  for (std::size_t i = 0; i < n; ++i) {
     r.located += (m1.tile[i] != -1);
+    r.not_aligning += !aligns(i);
+  }
   std::vector<std::uint32_t> start(C + 1, 0);
   for (std::size_t i = 0; i < n; ++i)
     ++start[root[pair_class[i]] + 1];
@@ -659,6 +721,8 @@ optical_duplicates(const MateSeqs &m1, const MateSeqs &m2, const bool single,
     std::size_t size[2] = {0, 0};
     for (std::size_t k = b; k < e; ++k) {
       const std::size_t i = member[k];
+      if (!aligns(i))
+        continue;
       int o = 0;
       if (!single && i != first) {
         const unsigned same =
@@ -787,7 +851,9 @@ aware_duplication(MateSeqs &m1, MateSeqs &m2, const AwareDupOptions &opt,
   const std::size_t C = rep.size();
   r.exact_classes = C;
   std::vector<std::uint32_t> pair_class;
-  const bool optical = opt.optical_distance >= 0 && m1.tile.size() == n;
+  const bool optical = opt.optical_distance >= 0 && m1.tile.size() == n &&
+                       m1.no_align.size() == n &&
+                       (single || m2.no_align.size() == n);
   if (!cluster_out.empty() || optical) {
     pair_class.resize(n);
 #pragma omp parallel for num_threads(nthreads) schedule(dynamic, 16)
@@ -1209,18 +1275,26 @@ write_aware_section(std::ostream &os, const AwareDupResult &r,
                                    ">500", ">1k", ">5k", ">10k+"};
   for (std::size_t i = 0; i < 16; ++i)
     os << labels[i] << "\t" << r.dedup_bins[i] << "\t" << r.total_bins[i]
-       << "\n";  if (r.optical) {
+       << "\n";
+  if (r.optical) {
     const double u = static_cast<double>(std::max<std::size_t>(1, r.pairs));
     const std::size_t dups = r.pairs - r.clusters;
     os << "#Optical duplicates (Picard's rule within the groups of copies "
           "above: same tile, at most the pixel distance apart in x and y; "
           "one per cluster kept). Locations from the read 1 names (tile, x, "
           "y as the last three of 5 or 7 ':' separated fields). Mate orders "
-          "examined apart (Picard's FR and RF).\n";
+          "examined apart (Picard's FR and RF). Pairs with a mate that would "
+          "not align (fewer than 30 bases before an adapter, as bwa mem "
+          "needs a score of 30, or a key that is mostly N) are left out, as "
+          "Picard examines aligned pairs only.\n";
     os << "Optical pixel distance\t" << opt.optical_distance << "\n";
     os << (r.single ? "Reads" : "Pairs") << " with a location in the name\t"
        << r.located << "\t" << 100.0 * static_cast<double>(r.located) / u
        << "\n";
+    os << (r.single ? "Reads" : "Pairs")
+       << " left out (would not align: insert under 30 bases or mostly N)\t"
+       << r.not_aligning << "\t"
+       << 100.0 * static_cast<double>(r.not_aligning) / u << "\n";
     os << "Optical duplicates\t" << r.optical_dups << "\t"
        << 100.0 * static_cast<double>(r.optical_dups) / u << "\n";
     os << "Optical share of the duplicates (%)\t"

@@ -38,6 +38,10 @@ struct AwareDupOptions {
   // optical duplicates (Picard's rule) within the groups of copies: the
   // pixel distance, or -1 for none
   int optical_distance = -1;
+  // adapter starts (the first 12 bases of each adapter of the adapter
+  // list): a read with fewer than 30 bases before one would not align, so
+  // its pair is left out of the optical count (see MateSeqs::no_align)
+  std::vector<std::string> adapters;
   bool enabled() const {
     return mismatches > 0 || umi_mismatches > 0 || umi1_len > 0 ||
            umi2_len > 0 || umi_in_name || optical_distance >= 0;
@@ -76,6 +80,11 @@ struct MateSeqs {
   // read 1 name location for optical duplicates (tile -1: none)
   std::vector<std::int16_t> tile;
   std::vector<std::int32_t> x, y;
+  // per read, with optical duplicates, whether it would align (Picard
+  // examines aligned pairs only): the position of an adapter before base
+  // 30 (0x7f: none), 0x80 added for a read shorter than 30 bases or with a
+  // key mostly N
+  std::vector<std::uint8_t> no_align;
 
   // Adds one record. `mate` is 1 or 2; the name is the header line.
   void add(const char *name, std::size_t name_len, const char *seq,
@@ -104,6 +113,7 @@ struct AwareDupResult {
   std::size_t located = 0;        // pairs whose name gives tile, x, y
   std::size_t optical_dups = 0;   // optical duplicates (Picard's count)
   std::size_t optical_skipped = 0;  // sets above Picard's 300000 limit
+  std::size_t not_aligning = 0;   // pairs left out (short insert, N)
   std::array<double, 16> dedup_bins{};
   std::array<double, 16> total_bins{};
   // groups of copies by size: size -> number of groups

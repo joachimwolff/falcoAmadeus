@@ -3249,6 +3249,12 @@ main(int argc, char *argv[]) {
       if (optical_distance > 1000000)
         throw std::runtime_error("--optical-distance must be at most 1000000");
       aware_opt.optical_distance = static_cast<int>(optical_distance);
+      // the adapter list (the run reads it later, in its setup)
+      FalcoConfig c = falco_config;
+      c.quiet = true;
+      c.read_adapters();
+      for (const std::string &a : c.adapter_seqs)
+        aware_opt.adapters.push_back(a.substr(0, 12));
     }
     if (aware_opt.enabled())
       falco_config.aware_dup = &aware_opt;

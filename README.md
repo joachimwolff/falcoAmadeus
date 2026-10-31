@@ -53,8 +53,10 @@ original apart from the corrected N-content grade.
   location from the tile:x:y of the read 1 name, the two mate orders apart,
   x and y kept in 16 bits as Picard's MarkDuplicates does. The sets are the
   groups of copies of the aware pass (exact, or with `--dup-mismatches` and
-  the UMI options), so no alignment is needed; where these sets equal
-  Picard's, the count equals Picard's.
+  the UMI options), so no alignment is needed; pairs that would not align
+  (an insert under 30 bases, a mate mostly N) are left out, as Picard sees
+  aligned pairs only. Where these sets equal Picard's, the count equals
+  Picard's; on public runs see `paper/data/optical_validation`.
 
 - **UMI quality.** With a UMI option (`--umi-r1`, `--umi-r2`,
   `--umi-in-name`) the run also writes `umi_qc.txt`: UMIs with N,

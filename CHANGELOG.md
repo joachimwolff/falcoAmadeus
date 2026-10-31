@@ -11,11 +11,21 @@
   cluster of close copies, the location from the read 1 name (Picard's
   parser: the last three of 5 or 7 ':' separated fields), the two mate
   orders apart (Picard's FR and RF), x and y in 16 bits as MarkDuplicates
-  keeps them, sets above 300000 not examined. On read pairs whose copies are
+  keeps them, sets above 300000 not examined. Pairs that would not align
+  are left out, as Picard examines aligned pairs only: an insert under 30
+  bases (bwa mem needs a score of 30; the adapter found before base 30 in
+  both mates at about the same position, an adapter dimer included) or a
+  mate shorter than 30 bases or mostly N. On read pairs whose copies are
   sequence-identical at the same coordinates (so the sets equal Picard's),
   the count equals Picard MarkDuplicates (GATK 4.6.2.0) at 0, 50, 100 and
-  2500 pixels on three generated data sets, for 1 and 16 threads. Reported
-  in the aware duplication section; JSON and a MultiQC column. Tested in
+  2500 pixels on three generated data sets, for 1 and 16 threads. On public
+  runs aligned with bwa-mem2: GIAB HG002 HiSeq 2500 2x250 (5 million pairs)
+  2080 and 2088 optical duplicates with 2 mismatches against Picard's 2118
+  and 2126 (100 and 2500 pixels); NovaSeq 2x51 ERR5654681 (10 million
+  pairs), on the pairs Picard examines, 46402 and 347699 with 1 mismatch
+  against 42734 and 327314, the difference mostly repeat reads that bwa
+  placed at different copies (paper/data/optical_validation). Reported in
+  the aware duplication section; JSON and a MultiQC column. Tested in
   `test/optical`.
 
 - **UMI quality** (`umi_qc.txt`, written with any UMI option). Over all
