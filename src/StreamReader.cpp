@@ -2353,6 +2353,24 @@ parse_record(const char *base, std::size_t size, std::size_t p,
   return q ? static_cast<std::size_t>(q - base) + 1 : size;
 }
 
+// [FalcoAmadeus] The parallel drivers keep a read's tile in 32 bits beside its
+// length. A name whose tile field is not a number gives an arbitrary tile
+// number (as in falco), possibly above 32 bits; such a tile goes to a side
+// table and its index is kept, marked by the top bit, so the tile-length
+// reconstruction keys it as the per-thread statistics do.
+constexpr std::uint32_t TILE_BIG = 0x80000000u;
+static inline std::uint32_t
+encode_tile(const std::size_t tile, std::vector<std::size_t> &big) {
+  if (tile < TILE_BIG)
+    return static_cast<std::uint32_t>(tile);
+  big.push_back(tile);
+  return TILE_BIG | static_cast<std::uint32_t>(big.size() - 1);
+}
+static inline std::size_t
+decode_tile(const std::uint32_t code, const std::vector<std::size_t> &big) {
+  return (code & TILE_BIG) ? big[code & ~TILE_BIG] : code;
+}
+
 // [FalcoAmadeus] Combine per-thread worker state into `master`, reproducing the
 // exact single-threaded result. Shared by every parallel driver (FASTQ chunked
 // and BAM chunked) since they all produce the same per-thread structures:
@@ -2477,7 +2495,8 @@ merge_worker_stats(
         tilerecs[t];
       for (std::size_t j = 0; j < recs.size(); ++j) {
         const std::size_t seqlen = recs[j].first;
-        const std::size_t tile_cur = recs[j].second;
+        const std::size_t tile_cur =
+          decode_tile(recs[j].second, wstats[t]->big_tiles);
         const bool do_tile_read =
           (g0 + j) % StreamReader::num_reads_for_tile == 0;
         if (do_tile_read) {
@@ -2878,7 +2897,7 @@ read_bytesplit_core(FalcoConfig &config, FastqStats &master,
       }
       if (!tile_ignore)
         tr.push_back({static_cast<std::uint32_t>(seqlen),
-                      static_cast<std::uint32_t>(tile_cur)});
+                      encode_tile(tile_cur, ws.big_tiles)});
       // release parsed pages; keeps the resident window ~DROP_WINDOW.
       if (can_drop && p - dropped >= DROP_WINDOW) {
         drop_range(dropped, p);
@@ -3215,14 +3234,15 @@ private:
 class TileFold {
  public:
   explicit TileFold(std::size_t max_ranges)
-      : rtile_(max_ranges), rmax_(max_ranges, 0) {}
+      : rtile_(max_ranges), rbig_(max_ranges), rmax_(max_ranges, 0) {}
   struct Range {
     std::vector<std::uint32_t> recs;  // seqlen, tile, before (3 per read)
+    std::vector<std::size_t> big;     // tiles above 32 bits (encode_tile)
     std::size_t lpmax = 0;            // longest read so far in the range
     void record(std::size_t g, std::size_t seqlen, std::size_t tile) {
       if (g % StreamReader::num_reads_for_tile == 0) {
         recs.push_back(static_cast<std::uint32_t>(seqlen));
-        recs.push_back(static_cast<std::uint32_t>(tile));
+        recs.push_back(encode_tile(tile, big));
         recs.push_back(static_cast<std::uint32_t>(lpmax));
       }
       lpmax = std::max(lpmax, seqlen);
@@ -3230,6 +3250,7 @@ class TileFold {
   };
   void end_range(std::size_t r, Range &tr) {
     rtile_[r].swap(tr.recs);
+    rbig_[r].swap(tr.big);
     rmax_[r] = tr.lpmax;
   }
   // continue another reconstruction (the combined view of paired mates)
@@ -3246,7 +3267,8 @@ class TileFold {
     for (std::size_t r = 0; r < nranges; ++r) {
       const std::vector<std::uint32_t> &v = rtile_[r];
       for (std::size_t k = 0; k + 2 < v.size(); k += 3) {
-        const std::size_t seqlen = v[k], tile = v[k + 1];
+        const std::size_t seqlen = v[k],
+                          tile = decode_tile(v[k + 1], rbig_[r]);
         const std::size_t before = std::max<std::size_t>(maxlen_, v[k + 2]);
         if (len_.find(tile) == len_.end())
           len_[tile] = before;  // length at first sight
@@ -3255,6 +3277,7 @@ class TileFold {
       }
       maxlen_ = std::max(maxlen_, rmax_[r]);
       rtile_[r].clear();
+      rbig_[r].clear();
     }
   }
   void finish(FalcoConfig &config, FastqStats &master,
@@ -3284,6 +3307,7 @@ class TileFold {
 
  private:
   std::vector<std::vector<std::uint32_t>> rtile_;
+  std::vector<std::vector<std::size_t>> rbig_;
   std::vector<std::size_t> rmax_;
   std::unordered_map<std::size_t, std::size_t> len_;
   std::size_t maxlen_ = 0;

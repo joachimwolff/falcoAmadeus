@@ -368,6 +368,9 @@ struct FastqStats {
   /*********** PER TILE SEQUENCE QUALITY OVERSERQUENCES ********/
   std::unordered_map <size_t, std::vector<double> > tile_position_quality;
   std::unordered_map <size_t, std::vector<size_t> > tile_position_count;
+  // [FalcoAmadeus] tile numbers too large for the parallel drivers' 32-bit
+  // tile records (see encode_tile in StreamReader.cpp)
+  std::vector<size_t> big_tiles;
 
   /*********** SLOW DATA STRUCTURES FOR LONGER READS ************/
   // Leftover memory using dynamic allocation
