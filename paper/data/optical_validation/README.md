@@ -12,7 +12,7 @@ Two public paired runs whose FASTQ files keep the Illumina read names
 with bwa-mem2 2.2.1 to hg19, marks duplicates with Picard MarkDuplicates
 (GATK 4.6.2.0) at 100 and 2500 pixels, and runs falcoAmadeus `--optical`
 with 0, 1 and 2 mismatches (`summary.tsv`; seconds and peak memory of
-falcoAmadeus at -t 16 on the Threadripper workstation).
+falcoAmadeus at -t 16 on an AMD Ryzen 9 7950X workstation).
 
 Picard examines aligned pairs only (6,270,924 of the NovaSeq pairs, many of
 whose inserts are shorter than the 30 bases bwa mem needs); falcoAmadeus

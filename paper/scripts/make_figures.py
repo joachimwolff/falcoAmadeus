@@ -101,11 +101,11 @@ if os.path.exists(parent_path):
 SE = medians(se, ("file", "shape", "cache", "threads", "tool"))
 THREADS_WIDE = [1, 4, 8, 16, 32]
 SE_FILES = [
-    ("SRR14777166.fastq", "fig1a.pdf", "FASTQ"),
-    ("SRR14777166.fastq.gz", "fig1b.pdf", "gzip FASTQ"),
-    ("SRR14777166.bgzf.fastq.gz", "fig1c.pdf", "BGZF FASTQ"),
-    ("SRR14777166.sam", "fig1d.pdf", "SAM"),
-    ("SRR14777166.bam", "fig1e.pdf", "BAM"),
+    ("SRR14777166.fastq", "fig4a.pdf", "FASTQ"),
+    ("SRR14777166.fastq.gz", "fig4b.pdf", "gzip FASTQ"),
+    ("SRR14777166.bgzf.fastq.gz", "fig4c.pdf", "BGZF FASTQ"),
+    ("SRR14777166.sam", "fig4d.pdf", "SAM"),
+    ("SRR14777166.bam", "fig4e.pdf", "BAM"),
 ]
 
 
@@ -147,8 +147,8 @@ for fkey, pname, title in SE_FILES:
             line.set_marker("o")
             line.set_markerfacecolor("white")
     plain_log_y(ax)
-    if pname == "fig1a.pdf":
-        legend_panel(ax, "fig1legend.pdf", 3)
+    if pname == "fig4a.pdf":
+        legend_panel(ax, "fig4legend.pdf", 3)
     save(fig, pname)
 
 # memory and cold-cache values for the tables
@@ -162,8 +162,8 @@ with open(os.path.join(OUT, "table_se.tsv"), "w") as out:
 pe = (read_tsv("pe_competitors_and_twofile.tsv")
       + read_tsv("pe_falcoamadeus_paired.tsv"))
 PE = medians(pe, ("format", "shape", "threads", "tool"))
-for fmt, pname, title in [("fastq", "fig2a.pdf", "FASTQ"),
-                          ("fastq.gz", "fig2b.pdf", "gzip FASTQ")]:
+for fmt, pname, title in [("fastq", "fig5a.pdf", "FASTQ"),
+                          ("fastq.gz", "fig5b.pdf", "gzip FASTQ")]:
     fig, ax = plt.subplots(figsize=(PANEL_W, PANEL_H))
     series = [("fa_pe", "-", "fa_pe"), ("fa", ":", "fa_two"),
               ("f2", "-", "f2"), ("f2o", "--", "f2o")]
@@ -190,8 +190,8 @@ for fmt, pname, title in [("fastq", "fig2a.pdf", "FASTQ"),
     ax.set_ylabel("Wall time (s)")
     ax.set_title(title)
     plain_log_y(ax)
-    if pname == "fig2a.pdf":
-        legend_panel(ax, "fig2legend.pdf", 3)
+    if pname == "fig5a.pdf":
+        legend_panel(ax, "fig5legend.pdf", 3)
     save(fig, pname)
 
 with open(os.path.join(OUT, "table_pe.tsv"), "w") as out:
@@ -221,8 +221,8 @@ ax.set_xlabel("True duplicate pairs (%)")
 ax.set_ylabel("Reported duplicate pairs (%)")
 ax.set_xlim(-2, 65)
 ax.set_ylim(-2, 70)
-legend_panel(ax, "fig3legend.pdf", 2)
-save(fig, "fig3a.pdf")
+legend_panel(ax, "fig1clegend.pdf", 2)
+save(fig, "fig1c.pdf")
 
 shared = sorted((r for r in sim if r["scenario"] == "shared_r1"),
                 key=lambda r: float(r["true_dup"]))
@@ -237,7 +237,190 @@ ax.set_ylabel("Reported duplicates (%)")
 ax.set_xlim(-2, 65)
 ax.set_ylim(-2, 65)
 ax.legend(frameon=False, loc="upper left")
-save(fig, "fig3b.pdf")
+save(fig, "fig1d.pdf")
+
+# Duplicate rates of alignment-free tools on a simulated library with known
+# PCR duplication (simulate_duplicates.py, run_duplication_competitors.sh)
+comp = read_tsv("duplication_competitors.tsv")
+truth = {r["metric"]: float(r["value"])
+         for r in read_tsv("duplication_competitors_truth.tsv")}
+
+
+def comp_rate(tool, mode, setting):
+    for r in comp:
+        if (r["tool"], r["mode"], r["setting"]) == (tool, mode, setting):
+            return float(r["duplicate_rate_pct"])
+    raise KeyError((tool, mode, setting))
+
+
+FA_DEF = "default (FastQC estimate; PE: exact pairs)"
+FA_UMI = "2 mismatches, UMIs 1:8 (1 mismatch)"
+COMP_GROUPS = [
+    ("Read 1 alone", truth["se_pcr_duplicate_rate_pct"], [
+        ("FastQC 0.12.1", "FastQC", "SE read 1", "default"),
+        ("falco 1.3.2", "falco 1.3.2", "SE read 1", "default"),
+        ("falco 2.0.3", "falco 2", "SE read 1", "default"),
+        ("fastp", "fastp", "SE", "accuracy 3"),
+        ("clumpify, 2 substitutions", "clumpify", "SE", "subs=2"),
+        ("falcoAmadeus, 2 mismatches", "falcoAmadeus", "SE", "2 mismatches"),
+        ("falcoAmadeus, 2 mismatches, UMI", "falcoAmadeus", "SE", FA_UMI),
+    ]),
+    ("Read pairs", truth["pe_pcr_duplicate_rate_pct"], [
+        ("fastp", "fastp", "PE", "accuracy 3"),
+        ("clumpify, 2 substitutions", "clumpify", "PE", "subs=2"),
+        ("Picard EstimateLibraryComplexity", "Picard ELC", "PE",
+         "MAX_DIFF_RATE 0.03"),
+        ("Picard EstimateLibraryComplexity, UMI", "Picard ELC", "PE",
+         "MAX_DIFF_RATE 0.03, UMIs as read barcode tags"),
+        ("falcoAmadeus, exact", "falcoAmadeus", "PE", FA_DEF),
+        ("falcoAmadeus, 2 mismatches", "falcoAmadeus", "PE", "2 mismatches"),
+        ("falcoAmadeus, 2 mismatches, UMI", "falcoAmadeus", "PE", FA_UMI),
+    ]),
+]
+fig, ax = plt.subplots(figsize=(2 * PANEL_W, 2.9))
+y = 0
+ticks, labels = [], []
+for gname, true_rate, items in COMP_GROUPS:
+    top = y
+    for lab, tool, mode, setting in items:
+        v = comp_rate(tool, mode, setting)
+        ax.barh(y, v, 0.7, color=COL["fa"] if tool == "falcoAmadeus"
+                else "#a8a8a8")
+        ax.text(v + 0.4, y, f"{v:.1f}", va="center", fontsize=6.5)
+        ticks.append(y)
+        labels.append(lab)
+        y += 1
+    ax.plot([true_rate, true_rate], [top - 0.5, y - 0.5], "--", color="black",
+            lw=0.9)
+    ax.text(true_rate + 0.3, top - 0.75, f"{gname}: true {true_rate:.1f} %",
+            fontsize=6.5, va="bottom")
+    y += 1.2
+ax.set_yticks(ticks)
+ax.set_yticklabels(labels)
+ax.invert_yaxis()
+ax.set_xlabel("Reported duplicate rate (%)")
+ax.set_xlim(0, 36)
+save(fig, "fig1a.pdf")
+
+# Error-aware groups of copies against Picard MarkDuplicates on the same
+# pairs: Picard duplicates found and counted copies that Picard marks
+DATASETS = [("drr041223", "RNA-seq (DRR041223)"),
+            ("hg002", "WGS (HG002)")]
+fig, ax = plt.subplots(figsize=(PANEL_W, PANEL_H))
+mk = {"drr041223": "o", "hg002": "s"}
+for key, lab in DATASETS:
+    ex = {r["metric"]: float(r["value"])
+          for r in read_tsv(f"picard_comparison_{key}.tsv")}
+    found = [100 * ex["sequence_extra_copies_flagged_by_picard"]
+             / ex["picard_duplicate_pairs"]]
+    prec = [ex["sequence_extra_copies_flagged_by_picard_pct"]]
+    for r in read_tsv(f"picard_groups_{key}.tsv"):
+        found.append(float(r["picard_duplicates_found_pct"]))
+        prec.append(float(r["extra_copies_flagged_by_picard_pct"]))
+    ax.plot(range(3), found, "-", marker=mk[key], ms=3.5, lw=1.2,
+            color=COL["fa"], label=f"{lab}, Picard duplicates found")
+    ax.plot(range(3), prec, "--", marker=mk[key], ms=3.5, lw=1.2,
+            color=COL["f2"], mfc="white",
+            label=f"{lab}, counted copies marked by Picard")
+ax.set_xticks(range(3))
+ax.set_xticklabels(["0", "1", "2"])
+ax.set_xlabel("Mismatches allowed")
+ax.set_ylabel("Pairs (%)")
+ax.set_ylim(0, 105)
+legend_panel(ax, "fig1blegend.pdf", 1)
+save(fig, "fig1b.pdf")
+
+# ---------------------------------------------------------------------------
+# Optical duplicates, library complexity and contamination screen
+opt_sum = read_tsv("optical_validation/summary.tsv")
+picard_opt = {(r["dataset"], r["distance"]): int(r["picard_optical"])
+              for r in opt_sum}
+on_pp = defaultdict(dict)
+with open(os.path.join(DATA, "optical_validation/on_picard_pairs.tsv")) as f:
+    for line in f:
+        ds, m, key, val = line.rstrip("\n").split("\t")
+        on_pp[(ds, m)][key.strip()] = int(val)
+fig, ax = plt.subplots(figsize=(PANEL_W, PANEL_H))
+OPT_SETS = [("hiseq2500_HG002", "HiSeq 2500 (HG002)", "o"),
+            ("novaseq_ERR5654681", "NovaSeq 6000 (ERR5654681)", "s")]
+for ds, lab, m in OPT_SETS:
+    for dist, ls, mfc in (("100", "-", None), ("2500", "--", "white")):
+        ys = [100 * on_pp[(ds, f"M={k}")][f"falco_optical_on_these_{dist}"]
+              / picard_opt[(ds, dist)] for k in range(3)]
+        ax.plot(range(3), ys, ls, marker=m, ms=3.5, lw=1.2, mfc=mfc,
+                color=COL["fa"] if ds.startswith("hiseq") else COL["f2"],
+                label=f"{lab}, {dist} pixels")
+ax.axhline(100, color="#bbbbbb", lw=0.8, zorder=0)
+ax.set_xticks(range(3))
+ax.set_xticklabels(["0", "1", "2"])
+ax.set_xlabel("Mismatches allowed")
+ax.set_ylabel("Optical duplicates (% of Picard)")
+ax.set_ylim(0, 160)
+legend_panel(ax, "fig2alegend.pdf", 1)
+save(fig, "fig2a.pdf")
+
+fig, ax = plt.subplots(figsize=(PANEL_W, PANEL_H))
+CX = [("DRR041223", "RNA-seq (DRR041223)", COL["fa"]),
+      ("SRR12898355_10M", "WGS (HG002)", COL["f2"])]
+for name, lab, c in CX:
+    with open(os.path.join(DATA, "complexity_insert_validation",
+                           f"{name}.yield.tsv")) as f:
+        seq = [int(line.split("\t")[1]) for line in f
+               if line.startswith("1x\t")][0]
+    xs, ys = [], []
+    with open(os.path.join(DATA, "complexity_insert_validation",
+                           f"{name}.curve.tsv")) as f:
+        next(f)
+        for line in f:
+            a, b = (float(v) for v in line.split("\t")[:2])
+            if 0 < a <= 100 * seq:
+                xs.append(a / 1e6)
+                ys.append(b / 1e6)
+    ax.plot([seq / 1e6], [ys[min(range(len(xs)),
+                                 key=lambda i: abs(xs[i] - seq / 1e6))]],
+            "o", color=c, ms=4)
+    ax.plot(xs, ys, "-", color=c, lw=1.2, label=lab)
+    ax.plot([xs[0], xs[-1]], [xs[0], xs[-1]], color="#bbbbbb", lw=0.8,
+            zorder=0)
+ax.set_xscale("log")
+ax.set_yscale("log")
+ax.set_xlabel("Read pairs sequenced (millions)")
+ax.set_ylabel("Distinct pairs (millions)")
+ax.legend(frameon=False, loc="upper left")
+save(fig, "fig2b.pdf")
+
+mix_truth = {r["name"]: float(r["fraction"]) * 100
+             for r in read_tsv("screen_validation/mixture_truth.tsv")}
+mix = {}
+with open(os.path.join(DATA, "screen_validation/mixture_screen.tsv")) as f:
+    rows = [line.rstrip("\n").split("\t") for line in f]
+start = [i for i, r in enumerate(rows) if r[0] == "#Reference"][0]
+for r in rows[start + 1:]:
+    if len(r) >= 3 and r[0] not in ("Several references", "No reference"):
+        mix[r[0]] = float(r[1])
+SCREEN_LABEL = {"human": "Human", "mouse": "Mouse", "rat": "Rat",
+                "fly": "Fly", "worm": "Worm", "yeast": "Yeast",
+                "arabidopsis": "Arabidopsis", "ecoli": "E. coli",
+                "phix": "PhiX", "lambda": "Lambda",
+                "human_mt": "Human mt", "mouse_mt": "Mouse mt",
+                "human_rrna": "Human rRNA", "mycoplasma": "Mycoplasma",
+                "vectors": "UniVec"}
+order = sorted(mix, key=lambda k: (-mix_truth.get(k, 0), -mix[k]))
+fig, ax = plt.subplots(figsize=(2 * PANEL_W, PANEL_H))
+xs = range(len(order))
+floor = 1e-3
+ax.bar([x - 0.2 for x in xs], [max(mix_truth.get(k, 0), floor) for k in order],
+       0.4, color="#a8a8a8", label="Simulated reads")
+ax.bar([x + 0.2 for x in xs], [max(mix[k], floor) for k in order], 0.4,
+       color=COL["fa"], label="Screen: k-mers found")
+ax.set_yscale("log")
+ax.set_ylim(floor, 200)
+ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
+ax.set_xticks(list(xs))
+ax.set_xticklabels([SCREEN_LABEL[k] for k in order], rotation=40, ha="right")
+ax.set_ylabel("Share (%)")
+ax.legend(frameon=False, loc="upper right", ncol=2)
+save(fig, "fig2c.pdf")
 
 # ---------------------------------------------------------------------------
 # Assay-profile validation on 120 public runs
@@ -292,7 +475,7 @@ ax.set_xticklabels([ASSAY_LABEL[a] for a in ASSAY_ORDER], rotation=40,
                    ha="right")
 ax.set_ylabel("Module checks flagged (%)")
 ax.legend(frameon=False, loc="upper left", ncol=2)
-save(fig, "fig4a.pdf")
+save(fig, "fig3a.pdf")
 
 DEFECT_ORDER = ["adapter", "qualtail", "gccontam", "dupspike", "ncontent",
                 "midbias"]
@@ -313,7 +496,7 @@ ax.set_xticklabels([DEFECT_LABEL[d] for d in DEFECT_ORDER], rotation=40,
 ax.set_ylabel("Runs with defect detected (%)")
 ax.set_ylim(0, 115)
 ax.set_yticks([0, 25, 50, 75, 100])
-save(fig, "fig4b.pdf")
+save(fig, "fig3b.pdf")
 
 with open(os.path.join(OUT, "table_assay_modules.tsv"), "w") as out:
     out.write("assay\tmodule\tgeneric_flagged\tprofile_flagged\truns\n")
