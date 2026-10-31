@@ -1,0 +1,9 @@
+name	fraction	reads
+human	0.9	900081
+mouse	0.04	39864
+ecoli	0.02	20137
+phix	0.01	10140
+mycoplasma	0.01	9927
+human_rrna	0.01	9928
+vectors	0.005	4959
+lambda	0.005	4964

@@ -28,6 +28,7 @@
 #include "PairDupAware.hpp"
 #include "Complexity.hpp"
 #include "InsertSize.hpp"
+#include "Screen.hpp"
 #include "smithlab_utils.hpp"
 
 #include "config.h"
@@ -717,6 +718,96 @@ insert_size_scan(const std::string &r1, const std::string &r2,
   st.finish();
   return st;
 }
+
+// [FalcoAmadeus] Contamination screen of the first max_reads reads (0: all)
+// of one or two files (the mates of a pair counted as two reads).
+static void
+screen_scan(const ScreenDb &db, const std::string &f1, const std::string &f2,
+            const std::size_t max_reads, const std::string &out_file,
+            const std::size_t nthreads) {
+  // batches of reads, read on this thread and screened on nthreads
+  const std::size_t T = std::max<std::size_t>(1, nthreads);
+  std::vector<ScreenCounts> part(T, ScreenCounts(db));
+  constexpr std::size_t kBatch = 1u << 15;
+  std::string batch;
+  std::vector<std::pair<std::size_t, std::size_t>> recs;
+  auto flush = [&] {
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(T) schedule(dynamic, 256)
+#endif
+    for (std::size_t i = 0; i < recs.size(); ++i) {
+#ifdef _OPENMP
+      const std::size_t t = static_cast<std::size_t>(omp_get_thread_num());
+#else
+      const std::size_t t = 0;
+#endif
+      part[t].add_read(batch.data() + recs[i].first, recs[i].second);
+    }
+    batch.clear();
+    recs.clear();
+  };
+  const char *s;
+  std::size_t l;
+  for (const std::string *f : {&f1, &f2}) {
+    if (f->empty())
+      continue;
+    FastqSeqStream st(*f);
+    std::size_t n = 0;
+    while ((max_reads == 0 || n < max_reads) && st.next(s, l)) {
+      recs.emplace_back(batch.size(), l);
+      batch.append(s, l);
+      ++n;
+      if (recs.size() == kBatch)
+        flush();
+    }
+    flush();
+  }
+  ScreenCounts sc(db);
+  for (const auto &p : part)
+    sc.merge(p);
+  std::ofstream os(out_file, std::ofstream::binary);
+  os << "##FalcoAmadeus-Screen\t" << std::string{VERSION} << "\n";
+  os << "File\t" << f1 << (f2.empty() ? "" : "\t" + f2) << "\n";
+  os << "Reads per file\t"
+     << (max_reads == 0 ? std::string("all")
+                        : "the first " + std::to_string(max_reads))
+     << "\n";
+  sc.write(os);
+  if (!os.good())
+    throw std::runtime_error("Failed to write " + out_file);
+}
+
+// runs screen_scan on its own thread; join() rethrows its error
+struct ScreenJob {
+  std::thread t;
+  std::exception_ptr err;
+  void start(const ScreenDb *db, std::string f1, std::string f2,
+             std::size_t n, std::string out, std::size_t nthreads) {
+    if (db == nullptr)
+      return;
+    t = std::thread([this, db, f1, f2, n, out, nthreads] {
+      try {
+        screen_scan(*db, f1, f2, n, out, nthreads);
+      }
+      catch (...) {
+        err = std::current_exception();
+      }
+    });
+  }
+  void join() {
+    if (t.joinable())
+      t.join();
+    if (err) {
+      std::exception_ptr e = err;
+      err = nullptr;
+      std::rethrow_exception(e);
+    }
+  }
+  ~ScreenJob() {
+    if (t.joinable())
+      t.join();
+  }
+};
 
 static MateFingerprints
 fingerprint_mate(const std::string &file) {
@@ -2458,6 +2549,8 @@ main(int argc, char *argv[]) {
     AwareDupOptions aware_opt;
     bool want_complexity = false;
     std::size_t insert_size_pairs = 1000000;
+    std::string screen_db_path, screen_build_path, screen_refs_arg;
+    std::size_t screen_reads = 1000000;
     std::string umi_r1_arg, umi_r2_arg;
 
     /****************** COMMAND LINE OPTIONS ********************/
@@ -2714,6 +2807,31 @@ main(int argc, char *argv[]) {
       false, aware_opt.umi_in_name);
 
     opt_parse.add_opt(
+      "-screen", '\0',
+      "[FalcoAmadeus] Contamination screen: the share of the reads' k-mers "
+      "found in each reference of this database (built with "
+      "--screen-build), written to screen.txt.",
+      false, screen_db_path);
+
+    opt_parse.add_opt(
+      "-screen-reads", '\0',
+      "[FalcoAmadeus] Reads per file for --screen, from the start (default "
+      "1000000; 0: all).",
+      false, screen_reads);
+
+    opt_parse.add_opt(
+      "-screen-build", '\0',
+      "[FalcoAmadeus] Build a contamination screen database at this path "
+      "from --screen-refs, then exit.",
+      false, screen_build_path);
+
+    opt_parse.add_opt(
+      "-screen-refs", '\0',
+      "[FalcoAmadeus] References for --screen-build: name=file,name=file "
+      "(FASTA or FASTA.gz; at most 32).",
+      false, screen_refs_arg);
+
+    opt_parse.add_opt(
       "-insert-size-pairs", '\0',
       "[FalcoAmadeus] With --paired-with, the number of pairs (from the start "
       "of the files) whose mate overlap gives the insert size, adapter "
@@ -2769,10 +2887,38 @@ main(int argc, char *argv[]) {
       return EXIT_SUCCESS;
     }
 
+    if (!screen_build_path.empty()) {
+      std::vector<std::pair<std::string, std::string>> refs;
+      std::size_t a = 0;
+      while (a < screen_refs_arg.size()) {
+        std::size_t b = screen_refs_arg.find(',', a);
+        if (b == std::string::npos)
+          b = screen_refs_arg.size();
+        const std::string item = screen_refs_arg.substr(a, b - a);
+        const std::size_t eq = item.find('=');
+        if (eq == std::string::npos || eq == 0 || eq + 1 == item.size())
+          throw std::runtime_error("--screen-refs: expected name=file, got '" +
+                                   item + "'");
+        refs.emplace_back(item.substr(0, eq), item.substr(eq + 1));
+        a = b + 1;
+      }
+      const ScreenDb db = ScreenDb::build(
+        refs, std::max<std::size_t>(1, falco_config.threads));
+      db.save(screen_build_path);
+      if (!falco_config.quiet)
+        for (std::size_t i = 0; i < db.names.size(); ++i)
+          std::cerr << "[screen] " << db.names[i] << ": " << db.ref_bases[i]
+                    << " bases, " << db.ref_kmers[i] << " k-mers kept\n";
+      return EXIT_SUCCESS;
+    }
+
     if (std::size(leftover_args) == 0) {
       std::cerr << opt_parse.help_message() << '\n';
       return EXIT_SUCCESS;
     }
+    std::unique_ptr<ScreenDb> screen_db;
+    if (!screen_db_path.empty())
+      screen_db.reset(new ScreenDb(ScreenDb::load(screen_db_path)));
 
     if (!umi_r1_arg.empty())
       parse_umi_region(umi_r1_arg, aware_opt.umi1_start, aware_opt.umi1_len);
@@ -2933,6 +3079,11 @@ main(int argc, char *argv[]) {
                                            : (file_basename + "_");
         if (aware_opt.umi_in_name)
           check_umi_in_first_name(filename);
+        ScreenJob screen_job;
+        screen_job.start(screen_db.get(), filename, std::string{},
+                         screen_reads,
+                         cur_outdir + "/" + file_prefix + "screen.txt",
+                         falco_config.threads);
         analyze_and_write(falco_config, filename, forced_file_format,
                           cur_outdir, file_prefix, summary_filename,
                           data_filename, report_filename, skip_text, skip_html,
@@ -2957,6 +3108,7 @@ main(int argc, char *argv[]) {
             filename, cur_outdir + "/" + file_prefix + "complexity.txt",
             falco_config.quiet, falco_config.threads);
         }
+        screen_job.join();
       }
       else {
         // ---- [FalcoAmadeus] paired mode: full standard QC on BOTH mates ----
@@ -3026,6 +3178,10 @@ main(int argc, char *argv[]) {
               isize_err = std::current_exception();
             }
           });
+        ScreenJob screen_job;
+        screen_job.start(screen_db.get(), filename, paired_with_file,
+                         screen_reads, cur_outdir + "/screen.txt",
+                         falco_config.threads);
         PairedFused pf;
         std::size_t fused_matching = 0;
         const bool fused =
@@ -3265,6 +3421,7 @@ main(int argc, char *argv[]) {
             throw std::runtime_error("Failed to write " + ifile);
           plap("insert size");
         }
+        screen_job.join();
         if (aware_opt.enabled()) {
           // the mates' records come from the fused read when it collected
           // them, otherwise from a separate scan

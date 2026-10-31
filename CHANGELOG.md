@@ -4,6 +4,20 @@
 
 ### Added
 
+- **Contamination screen** (`--screen`, `--screen-build`). The share of
+  the reads' sequence explained by each genome of a reference panel,
+  without alignment: canonical 31-mers selected by hash, each reference at
+  the scale that keeps about 4000 of its k-mers (all k-mers of PhiX, lambda,
+  mitochondria, rRNA), the reads at the same scales; k-mers with fewer than
+  10 distinct trinucleotides are skipped on both sides. Reports per
+  reference the k-mers found and found only there, and the k-mers in no
+  reference. On 1,000,000 simulated reads (90 % human, 4 % mouse, 2 %
+  E. coli, 1 % PhiX, mycoplasma and rRNA, 0.5 % lambda and vectors) every
+  share was recovered within the expected loss from sequencing errors, with
+  0 to 0.006 % for absent genomes; public human and mouse runs gave their
+  species (paper/data/screen_validation). The first million reads are
+  screened on the run's threads beside the analysis (0.5 s at -t 8).
+
 - **Insert size, adapter read-through and adapter dimers (paired).** A
   thread beside the analysis overlaps read 1 with the reverse complement of
   read 2 for the first million pairs (`--insert-size-pairs`) and writes

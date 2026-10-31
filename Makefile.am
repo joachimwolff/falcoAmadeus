@@ -51,6 +51,8 @@ falcoAmadeus_SOURCES = \
 	src/PairDupAware.cpp \
 	src/Complexity.cpp \
 	src/InsertSize.cpp \
+	src/Screen.cpp \
+	src/Screen.hpp \
 	src/InsertSize.hpp \
 	src/Complexity.hpp \
 	src/PairDupAware.hpp \
