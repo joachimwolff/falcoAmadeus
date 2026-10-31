@@ -49,6 +49,8 @@ falcoAmadeus_SOURCES = \
 	src/OptionParser.cpp \
 	src/smithlab_utils.cpp \
 	src/PairDupAware.cpp \
+	src/Complexity.cpp \
+	src/Complexity.hpp \
 	src/PairDupAware.hpp \
 	src/Module.hpp \
 	src/FastqStats.hpp \

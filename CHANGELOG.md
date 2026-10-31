@@ -4,6 +4,18 @@
 
 ### Added
 
+- **Library complexity.** The exact duplicate counts now also give the
+  histogram of copy numbers, and from it the expected number of distinct
+  pairs (reads) at 2x, 5x, 10x, 20x, 50x and 100x the sequenced ones: a port
+  of the yield curve of preseq 3.2.0 `lc_extrap` in quick mode (rational
+  function extrapolation of the Good-Toulmin series, Daley and Smith 2013).
+  Its values equal preseq's on the same histogram (all 10,001 points of the
+  curve on RNA-seq, WGS and simulated pairs and on single-end runs), and it
+  declines where preseq does (too few duplicates). Paired input reports it
+  in `paired_duplication.txt`; `--complexity` adds `complexity.txt` for
+  single-end input (a second read of the file). Tested against preseq
+  (`test/complexity`).
+
 - **Error- and UMI-aware paired duplication** (opt-in). An exact paired
   count misses PCR copies that carry a sequencing error and merges distinct
   molecules that share a sequence. `--dup-mismatches N` adds a rate to

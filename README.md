@@ -45,6 +45,14 @@ original apart from the corrected N-content grade.
   rate stays exact for the stated tolerance and independent of read order.
   The same options work for single-end input, where a read is the unit and
   the rate is written to `aware_duplication.txt`.
+
+- **Library complexity.** From how many distinct sequences were seen once,
+  twice and so on, `paired_duplication.txt` reports how many distinct pairs
+  to expect at 2x to 100x the sequenced pairs, so a library can be judged
+  for further sequencing before alignment. The estimate is a port of the
+  `preseq lc_extrap` yield curve (quick mode) and gives the same values as
+  preseq on the same counts. `--complexity` adds it for single-end input
+  (`complexity.txt`).
   Sequence duplication reflects PCR duplicates as well as natural redundancy
   (deep coverage, highly expressed or enriched loci). Per-mate
   `fastqc_data.txt` files are kept for MultiQC.
@@ -307,6 +315,7 @@ FalcoAmadeus-specific options:
 | `--umi-r1 START:LEN`, `--umi-r2 START:LEN` | The UMI lies in read 1 or read 2 at a 1-based position; pairs are copies only when their UMIs agree, and the UMI bases are left out of the sequence comparison. |
 | `--umi-in-name` | The UMI is the last `:` or `_` separated field of the read 1 name (bcl-convert, UMI-tools extract, fastp). |
 | `--umi-mismatches N` | Bases in which the UMIs of two copies may differ (default 0). |
+| `--complexity` | Single-end: count every read's duplication key exactly and write `complexity.txt` with the expected distinct reads at 2x to 100x the sequenced reads (paired input reports it in `paired_duplication.txt` always). |
 | `--paired-data mates\|combined\|both` | With `--paired-with`, which `fastqc_data.txt` files to emit for MultiQC: separate mates (default), a single pooled sample, or both. |
 | `--assay TYPE` | Assay-aware pass/warn/fail grading (`rnaseq`, `amplicon`, `wgbs`/`emseq`/`rrbs`, `chipseq`, `atac`, `smallrna`, `wgs`, …; default `generic` is byte-identical to falco). |
 | `--conversion-residual F` | For bisulfite/EM assays, the unconverted fraction outside CpG (0–1; C among C+T followed by a base other than G in C→T reads, G among G+A preceded by a base other than C in G→A reads; each read's strand from its composition) above which a possible incomplete-conversion warning is emitted (default 0.2). |

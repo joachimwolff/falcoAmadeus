@@ -26,6 +26,7 @@
 #include "OptionParser.hpp"
 #include "StreamReader.hpp"
 #include "PairDupAware.hpp"
+#include "Complexity.hpp"
 #include "smithlab_utils.hpp"
 
 #include "config.h"
@@ -38,6 +39,7 @@
 #include <string>
 #include <vector>
 #include <array>
+#include <map>
 #include <unordered_map>
 #include <stdexcept>
 #include <cstdint>
@@ -660,6 +662,9 @@ struct ExactDup {
   std::size_t distinct = 0;
   std::array<double, 16> dedup_bins{};
   std::array<double, 16> total_bins{};
+  // distinct keys seen exactly j times, ascending j (the input of the
+  // library complexity extrapolation)
+  std::vector<std::pair<std::size_t, std::size_t>> copy_hist;
   double duplicate_rate() const {  // % of reads that are extra copies
     return total ? 100.0 * static_cast<double>(total - distinct) /
                      static_cast<double>(total)
@@ -951,6 +956,11 @@ exact_from_groups(const KeyGroups &g, const std::size_t n,
   std::vector<std::array<std::size_t, 33>> part(nthreads);
   for (auto &pt : part)
     pt.fill(0);  // [0..15] distinct, [16..31] reads, [32] distinct total
+  // per thread: distinct keys by copy number (dense below kDenseCopies)
+  constexpr std::size_t kDenseCopies = 4096;
+  std::vector<std::vector<std::size_t>> chist(
+    nthreads, std::vector<std::size_t>(kDenseCopies, 0));
+  std::vector<std::map<std::size_t, std::size_t>> chist_big(nthreads);
   for (std::size_t q = 0; q < passes; ++q) {
     const std::size_t b0 = B * q / passes, b1 = B * (q + 1) / passes;
     std::size_t acc = 0;
@@ -990,6 +1000,8 @@ exact_from_groups(const KeyGroups &g, const std::size_t n,
       const std::size_t t = 0;
 #endif
       std::array<std::size_t, 33> &pt = part[t];
+      std::vector<std::size_t> &ch = chist[t];
+      std::map<std::size_t, std::size_t> &cbig = chist_big[t];
       // copies per distinct key of a bucket, counted in a table that stays in
       // the thread's cache (count 0 marks an empty slot)
       std::vector<std::uint64_t> tk;
@@ -1035,12 +1047,31 @@ exact_from_groups(const KeyGroups &g, const std::size_t n,
           ++pt[sl];
           pt[16 + sl] += copies;
           ++pt[32];
+          if (copies < kDenseCopies)
+            ++ch[copies];
+          else
+            ++cbig[copies];
         }
       }
     }
   }
   ExactDup r;
   r.total = n;
+  {
+    std::map<std::size_t, std::size_t> big;
+    std::vector<std::size_t> dense(kDenseCopies, 0);
+    for (std::size_t t = 0; t < nthreads; ++t) {
+      for (std::size_t j = 1; j < kDenseCopies; ++j)
+        dense[j] += chist[t][j];
+      for (const auto &kv : chist_big[t])
+        big[kv.first] += kv.second;
+    }
+    for (std::size_t j = 1; j < kDenseCopies; ++j)
+      if (dense[j])
+        r.copy_hist.emplace_back(j, dense[j]);
+    for (const auto &kv : big)
+      r.copy_hist.emplace_back(kv.first, kv.second);
+  }
   std::array<std::size_t, 33> sum{};
   for (const auto &pt : part)
     for (std::size_t k = 0; k < 33; ++k)
@@ -1069,6 +1100,46 @@ exact_duplication_parallel(FpView &fps, const std::size_t nthreads,
                            tmp, passes);
 }
 
+
+// [FalcoAmadeus] Library complexity from the exact copy counts (see
+// Complexity.hpp): the expected number of distinct keys at multiples of the
+// sequenced reads. FA_COPY_HIST and FA_COMPLEXITY_CURVE (file paths) write
+// the histogram and preseq's output grid, for comparing with preseq.
+static void
+write_complexity(std::ostream &os, const ExactDup &ex, const char *unit) {
+  if (const char *p = std::getenv("FA_COPY_HIST")) {
+    std::ofstream h(p);
+    for (const auto &jc : ex.copy_hist)
+      h << jc.first << "\t" << jc.second << "\n";
+  }
+  const ComplexityCurve cc(ex.copy_hist);
+  if (const char *p = std::getenv("FA_COMPLEXITY_CURVE")) {
+    std::ofstream c(p);
+    c << "TOTAL_READS\tEXPECTED_DISTINCT\n";
+    c.setf(std::ios_base::fixed, std::ios_base::floatfield);
+    c.precision(1);
+    c << 0 << '\t' << 0 << '\n';
+    for (const auto &pt : cc.curve())
+      c << pt.first << '\t' << pt.second << '\n';
+  }
+  os << "#Library complexity: expected distinct " << unit
+     << " when sequencing more of the same library, from how many distinct "
+        "keys were seen once, twice, ... (preseq lc_extrap, rational-function "
+        "extrapolation, no bootstrap). Distinct keys as counted above, so "
+        "natural duplicates count as copies too.\n";
+  if (!cc.ok()) {
+    os << "Extrapolation\tnot possible: " << cc.error() << "\n";
+    return;
+  }
+  os << "#Sequenced (fold)\t" << unit << "\tExpected distinct\t"
+     << "Fraction distinct\n";
+  for (const double f : {1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0}) {
+    const double n = f * cc.reads();
+    const double d = f == 1.0 ? cc.distinct() : cc.expected_distinct(n);
+    os << f << "x\t" << static_cast<std::size_t>(n) << "\t"
+       << static_cast<std::size_t>(d + 0.5) << "\t" << d / n << "\n";
+  }
+}
 
 // [FalcoAmadeus] paired-end read-pairing summary.
 struct PairStats {
@@ -1325,6 +1396,7 @@ paired_duplication_report(FpView &k1, FpView &k2,
   for (std::size_t i = 0; i < 16; ++i)
     os << labels[i] << "\t" << ex_pair.dedup_bins[i] << "\t"
        << ex_pair.total_bins[i] << "\n";
+  write_complexity(os, ex_pair, "pairs");
 
   if (!quiet)
     std::cerr << "[paired-end duplication] wrote " << out_file << " ("
@@ -1362,6 +1434,37 @@ write_single_aware_duplication(const std::string &file,
     std::cerr << "[duplication] error/UMI-aware rate " << r.duplicate_rate()
               << " % (" << r.clusters << " groups of " << r.pairs
               << " reads), wrote " << out_file << "\n";
+}
+
+// [FalcoAmadeus] --complexity, single-end: the exact copy counts of the
+// duplication keys of all reads (a second read of the file) and the library
+// complexity from them.
+void
+write_single_complexity(const std::string &file, const std::string &out_file,
+                        const bool quiet, const std::size_t nthreads) {
+  std::vector<std::uint64_t> keys;
+  for_each_fastq_record(file, [&](const char *, const std::size_t,
+                                  const char *q, const std::size_t ql) {
+    std::size_t n = ql;
+    if (n && q[n - 1] == '\r')
+      --n;
+    keys.push_back(DupHashMap::fingerprint(q, get_truncate_point(n)));
+  });
+  FpView view = FpView::from_keys(keys);
+  FpVec scratch;
+  const ExactDup ex =
+    exact_duplication_parallel(view, nthreads, scratch, EXACT_PASSES);
+  std::ofstream os(out_file, std::ofstream::binary);
+  os << "##FalcoAmadeus-Complexity\t" << std::string{VERSION} << "\n";
+  os << "File\t" << file << "\n";
+  os << "Total reads\t" << ex.total << "\n";
+  os << "Distinct reads\t" << ex.distinct << "\n";
+  os << "Duplicate rate (%)\t" << ex.duplicate_rate() << "\n";
+  write_complexity(os, ex, "reads");
+  if (!os.good())
+    throw std::runtime_error("Failed to write complexity file: " + out_file);
+  if (!quiet)
+    std::cerr << "[complexity] wrote " << out_file << "\n";
 }
 
 // [FalcoAmadeus] --umi-in-name: throws unless the first read name of the
@@ -2276,6 +2379,7 @@ main(int argc, char *argv[]) {
     // [FalcoAmadeus] optional R2 file for corrected paired-end duplication
     std::string paired_with_file = "";
     AwareDupOptions aware_opt;
+    bool want_complexity = false;
     std::string umi_r1_arg, umi_r2_arg;
 
     /****************** COMMAND LINE OPTIONS ********************/
@@ -2532,6 +2636,14 @@ main(int argc, char *argv[]) {
       false, aware_opt.umi_in_name);
 
     opt_parse.add_opt(
+      "-complexity", '\0',
+      "[FalcoAmadeus] Single-end: also count every read's duplication key "
+      "exactly and write complexity.txt with the expected number of distinct "
+      "reads at 2x to 100x the sequenced reads (preseq lc_extrap). Paired "
+      "input (--paired-with) always reports it in paired_duplication.txt.",
+      false, want_complexity);
+
+    opt_parse.add_opt(
       "-umi-mismatches", '\0',
       "[FalcoAmadeus] Bases in which the UMIs of two copies may differ "
       "(default 0).",
@@ -2748,6 +2860,16 @@ main(int argc, char *argv[]) {
           write_single_aware_duplication(
             filename, cur_outdir + "/" + file_prefix + "aware_duplication.txt",
             aware_opt, falco_config.quiet, falco_config.threads);
+        }
+        if (want_complexity) {
+          if (!(falco_config.is_fastq || falco_config.is_fastq_gz) ||
+              !falco_config.seekable_input)
+            throw std::runtime_error(
+              "--complexity needs a FASTQ file that can be read twice (not "
+              "SAM/BAM or a pipe): " + filename);
+          write_single_complexity(
+            filename, cur_outdir + "/" + file_prefix + "complexity.txt",
+            falco_config.quiet, falco_config.threads);
         }
       }
       else {
