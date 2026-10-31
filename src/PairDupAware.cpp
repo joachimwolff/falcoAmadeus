@@ -722,13 +722,21 @@ aware_duplication(MateSeqs &m1, MateSeqs &m2, const AwareDupOptions &opt,
   for (std::size_t c = 0; c < C; ++c)
     gsize[root[c]] += ccount[c];
   std::array<std::size_t, 16> db{}, tb{};
+  std::vector<std::uint64_t> small(1024, 0);
   for (std::size_t c = 0; c < C; ++c)
     if (gsize[c] > 0) {
+      if (gsize[c] < small.size())
+        ++small[gsize[c]];
+      else
+        ++r.family_sizes[gsize[c]];
       ++r.clusters;
       const std::size_t sl = dup_slot(gsize[c]);
       ++db[sl];
       tb[sl] += gsize[c];
     }
+  for (std::size_t z = 1; z < small.size(); ++z)
+    if (small[z] > 0)
+      r.family_sizes[z] = small[z];
   for (std::size_t s = 0; s < 16; ++s) {
     r.dedup_bins[s] = 100.0 * static_cast<double>(db[s]) /
                       std::max<double>(1.0, static_cast<double>(r.clusters));

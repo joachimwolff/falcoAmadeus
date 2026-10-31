@@ -46,12 +46,23 @@ original apart from the corrected N-content grade.
   The same options work for single-end input, where a read is the unit and
   the rate is written to `aware_duplication.txt`.
 
+- **UMI quality.** With a UMI option (`--umi-r1`, `--umi-r2`,
+  `--umi-in-name`) the run also writes `umi_qc.txt`: UMIs with N,
+  homopolymer UMIs (poly-G from dark cycles), distinct UMIs and the share
+  of the possible sequences in use, the most frequent UMI and the base
+  composition per UMI position; the families (groups of copies with the
+  same UMI and sequence within `--dup-mismatches` and `--umi-mismatches`)
+  with their sizes, the reads in families of 2 and 3 or more, and the
+  families per distinct UMI (high values: molecules share UMIs); and the
+  base quality of in-read UMIs (first million reads).
+
 - **Machine-readable summary.** Every run writes
   `falcoAmadeus_summary.json` (all metrics per view and of the falcoAmadeus
   reports, plus the share of bases with Phred quality 20 and 30 or more) and
   `falcoAmadeus_mqc.json`, which MultiQC shows as general statistics columns
   (Q30 bases, paired and aware duplication, complexity, insert size, adapter
-  read-through and dimers, screen, Q20 trimming).
+  read-through and dimers, screen, UMI family size and UMI space used, Q20
+  trimming).
 
 - **Acceptance rules.** `--acceptance rules.tsv` grades a sample against
   lab limits (lines `metric >= warn fail` or `metric <= warn fail`, the

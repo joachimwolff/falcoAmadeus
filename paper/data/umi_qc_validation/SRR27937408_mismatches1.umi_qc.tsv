@@ -1,0 +1,56 @@
+##FalcoAmadeus-UmiQc	4
+File	SRR27937408.fastq.gz
+#Read 1 UMI
+Read 1 UMI reads	4987876
+Read 1 UMI present	4987876	100
+Read 1 UMI length	6
+Read 1 UMI with N	1203	0.0241185
+Read 1 UMI homopolymer	14663	0.293973
+Read 1 UMI distinct	4096
+Read 1 UMI share of the possible UMIs used (%)	100
+Read 1 UMI most frequent	TGTGTG	0.195621
+#Read 1 UMI base composition (%)
+#Position	A	C	G	T	N
+1	20.2637	19.035	27.5627	33.1369	0.00182442
+2	22.2086	18.8403	29.4198	29.5107	0.0206701
+3	22.0139	18.715	29.6437	29.6274	0
+4	21.6081	18.4033	30.6118	29.3765	0.000200486
+5	20.9863	18.9369	28.7302	31.3452	0.0014034
+6	20.5438	19.3156	28.8936	31.247	2.00486e-05
+#Families (groups of copies: same UMI and sequence within the allowed mismatches)
+Families	4012149
+Mean family size	1.24319
+Median family size	1
+Largest family	4285
+Families of 2 or more	495127	12.3407
+Families of 3 or more	104546	2.60574
+Reads in families of 2 or more	1470854	29.4886
+Reads in families of 3 or more	689692	13.8274
+Distinct molecule tags	4096
+Families per distinct molecule tag	979.529
+#Family size (from)	Families	Percentage of families	Percentage of reads
+1	3517022	87.6593	70.5114
+2	390581	9.73496	15.6612
+3	59267	1.47719	3.56466
+4	16336	0.407163	1.31006
+5	7547	0.188104	0.756534
+6	4632	0.115449	0.557191
+7	3075	0.0766422	0.431546
+8	2216	0.0552322	0.355422
+9	1640	0.0408758	0.295918
+10	1189	0.029635	0.238378
+11	5112	0.127413	1.45212
+21	2424	0.0604165	1.4779
+51	655	0.0163254	0.900403
+101	441	0.0109916	2.01978
+1001	12	0.000299092	0.467453
+#Read 1 UMI base quality (the first reads of the file)
+Read 1 UMI qualities examined	1000000
+Read 1 UMI with a base below Phred 20	0	0
+#Position	Mean quality	Below Phred 20 (%)
+1	30	0
+2	30	0
+3	30	0
+4	30	0
+5	30	0
+6	30	0

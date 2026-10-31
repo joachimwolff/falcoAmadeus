@@ -30,6 +30,7 @@
 #include "InsertSize.hpp"
 #include "Screen.hpp"
 #include "TrimPreview.hpp"
+#include "UmiQc.hpp"
 #include "JsonReport.hpp"
 #include "smithlab_utils.hpp"
 
@@ -1707,13 +1708,106 @@ paired_duplication_report(FpView &k1, FpView &k2,
   return pstats;
 }
 
+// [FalcoAmadeus] umi_qc.txt beside the aware duplication (see UmiQc.hpp):
+// the UMI sequences and families of all reads, and the base quality of the
+// in-read UMIs in the first kUmiQualReads reads of each file, read on their
+// own threads while the records are collected.
+constexpr std::size_t kUmiQualReads = 1000000;
+
+struct UmiQualJob {
+  std::vector<UmiQualStats> out;
+  std::vector<std::thread> t;
+  std::vector<std::exception_ptr> err;
+  void start(const std::string &r1, const std::string &r2,
+             const AwareDupOptions &opt) {
+    if (opt.umi1_len > 0)
+      out.emplace_back("Read 1 UMI", opt.umi1_start, opt.umi1_len);
+    if (opt.umi2_len > 0 && !r2.empty())
+      out.emplace_back("Read 2 UMI", opt.umi2_start, opt.umi2_len);
+    err.resize(out.size());
+    for (std::size_t k = 0; k < out.size(); ++k) {
+      const std::string file = out[k].source == "Read 1 UMI" ? r1 : r2;
+      t.emplace_back([this, k, file] {
+        try {
+          FastqSeqStream st(file);
+          const char *s, *q;
+          std::size_t l, ql, n = 0;
+          while (n < kUmiQualReads && st.next(s, l, q, ql)) {
+            out[k].add(q, ql);
+            ++n;
+          }
+        }
+        catch (...) {
+          err[k] = std::current_exception();
+        }
+      });
+    }
+  }
+  void join() {
+    for (std::thread &x : t)
+      if (x.joinable())
+        x.join();
+    for (std::exception_ptr &e : err)
+      if (e) {
+        std::exception_ptr x = e;
+        e = nullptr;
+        std::rethrow_exception(x);
+      }
+  }
+  ~UmiQualJob() {
+    for (std::thread &x : t)
+      if (x.joinable())
+        x.join();
+  }
+};
+
+// the UMI sequences of the configured sources and the distinct molecule tags
+static std::vector<UmiSeqStats>
+umi_sequences(const MateSeqs &m1, const MateSeqs &m2,
+              const AwareDupOptions &opt, const std::size_t nthreads,
+              std::size_t &tags) {
+  std::vector<UmiSeqStats> v;
+  if (opt.umi_in_name)
+    v.push_back(umi_seq_stats(m1, "Read name UMI", nthreads));
+  if (opt.umi1_len > 0)
+    v.push_back(umi_seq_stats(m1, "Read 1 UMI", nthreads));
+  if (opt.umi2_len > 0 && m2.size() > 0)
+    v.push_back(umi_seq_stats(m2, "Read 2 UMI", nthreads));
+  tags = v.empty() ? 0 : v[0].distinct;
+  if (opt.umi1_len > 0 && opt.umi2_len > 0 && m2.size() > 0 &&
+      !opt.umi_in_name)
+    tags = distinct_umi_pairs(m1, m2, nthreads);
+  return v;
+}
+
+static void
+write_umi_qc_file(const std::string &out_file, const std::string &file,
+                  const std::vector<UmiSeqStats> &seqs, const std::size_t tags,
+                  const AwareDupResult &r, UmiQualJob &qual,
+                  const std::string &quality_key) {
+  qual.join();
+  const BaseQuality *bq = find_base_quality(quality_key);
+  std::ofstream os(out_file, std::ofstream::binary);
+  os << "##FalcoAmadeus-UmiQc\t" << std::string{VERSION} << "\n";
+  os << "File\t" << file << "\n";
+  write_umi_qc(os, seqs, tags, r.family_sizes, r.single, qual.out,
+               bq != nullptr ? bq->phred_base : 33);
+  if (!os.good())
+    throw std::runtime_error("Failed to write " + out_file);
+}
+
 // [FalcoAmadeus] Error- and UMI-aware duplication of a single-end FASTQ
 // file (opt-in): reads the file once more and writes its own report.
 void
 write_single_aware_duplication(const std::string &file,
                                const std::string &out_file,
                                const AwareDupOptions &opt, const bool quiet,
-                               const std::size_t nthreads) {
+                               const std::size_t nthreads,
+                               const std::string &umi_out,
+                               const std::string &quality_key) {
+  UmiQualJob qual;
+  if (opt.has_umi())
+    qual.start(file, std::string{}, opt);
   MateSeqs m1, none;
   for_each_fastq_record(file, [&](const char *h, const std::size_t hl,
                                   const char *q, const std::size_t ql) {
@@ -1723,9 +1817,15 @@ write_single_aware_duplication(const std::string &file,
     throw std::runtime_error("--umi-in-name: no read name in " + file +
                              " ends in a UMI (a last ':' or '_' separated "
                              "field of bases)");
+  std::size_t tags = 0;
+  const std::vector<UmiSeqStats> useq =
+    opt.has_umi() ? umi_sequences(m1, none, opt, nthreads, tags)
+                  : std::vector<UmiSeqStats>{};
   const char *dump = std::getenv("FA_AWARE_CLUSTERS");
   const AwareDupResult r =
     aware_duplication(m1, none, opt, nthreads, dump ? dump : "");
+  if (opt.has_umi())
+    write_umi_qc_file(umi_out, file, useq, tags, r, qual, quality_key);
   std::ofstream os(out_file, std::ofstream::binary);
   os << "##FalcoAmadeus-AwareDuplication\t" << std::string{VERSION} << "\n";
   os << "File\t" << file << "\n";
@@ -1802,7 +1902,12 @@ append_aware_duplication(const std::string &r1_file,
                          const std::string &out_file,
                          const AwareDupOptions &opt, const bool quiet,
                          const std::size_t nthreads,
+                         const std::string &umi_out,
+                         const std::string &quality_key,
                          MateSeqs *pre1 = nullptr, MateSeqs *pre2 = nullptr) {
+  UmiQualJob qual;
+  if (opt.has_umi())
+    qual.start(r1_file, r2_file, opt);
   MateSeqs own1, own2;
   MateSeqs &m1 = pre1 ? *pre1 : own1, &m2 = pre2 ? *pre2 : own2;
   if (!pre1 || !pre2) {
@@ -1843,9 +1948,15 @@ append_aware_duplication(const std::string &r1_file,
     throw std::runtime_error("--umi-in-name: no read name in " + r1_file +
                              " ends in a UMI (a last ':' or '_' separated "
                              "field of bases)");
+  std::size_t tags = 0;
+  const std::vector<UmiSeqStats> useq =
+    opt.has_umi() ? umi_sequences(m1, m2, opt, nthreads, tags)
+                  : std::vector<UmiSeqStats>{};
   const char *dump = std::getenv("FA_AWARE_CLUSTERS");
   const AwareDupResult r =
     aware_duplication(m1, m2, opt, nthreads, dump ? dump : "");
+  if (opt.has_umi())
+    write_umi_qc_file(umi_out, r1_file, useq, tags, r, qual, quality_key);
   std::ofstream os(out_file, std::ofstream::binary | std::ofstream::app);
   write_aware_section(os, r, opt);
   if (!os.good())
@@ -3284,7 +3395,9 @@ main(int argc, char *argv[]) {
               "can be read twice (not SAM/BAM or a pipe): " + filename);
           write_single_aware_duplication(
             filename, cur_outdir + "/" + file_prefix + "aware_duplication.txt",
-            aware_opt, falco_config.quiet, falco_config.threads);
+            aware_opt, falco_config.quiet, falco_config.threads,
+            cur_outdir + "/" + file_prefix + "umi_qc.txt",
+            cur_outdir + "/" + file_prefix);
         }
         if (want_complexity) {
           if (!(falco_config.is_fastq || falco_config.is_fastq_gz) ||
@@ -3319,7 +3432,8 @@ main(int argc, char *argv[]) {
             {{"aware_duplication", pre + "aware_duplication.txt"},
              {"complexity", pre + "complexity.txt"},
              {"screen", pre + "screen.txt"},
-             {"trimming_preview", pre + "trimming_preview.txt"}},
+             {"trimming_preview", pre + "trimming_preview.txt"},
+             {"umi_qc", pre + "umi_qc.txt"}},
             acceptance_rules);
           note_acceptance(acc, filename);
         }
@@ -3669,7 +3783,9 @@ main(int argc, char *argv[]) {
           std::vector<MateSeqs>().swap(pf.h2.aware_parts);
           append_aware_duplication(filename, paired_with_file, paired_out,
                                    aware_opt, falco_config.quiet,
-                                   falco_config.threads, have ? &a1 : nullptr,
+                                   falco_config.threads,
+                                   cur_outdir + "/umi_qc.txt", fwd_dir + "/",
+                                   have ? &a1 : nullptr,
                                    have ? &a2 : nullptr);
           plap("aware duplication");
         }
@@ -3690,7 +3806,8 @@ main(int argc, char *argv[]) {
             {{"paired_duplication", paired_out},
              {"insert_size", cur_outdir + "/paired_insert_size.txt"},
              {"screen", cur_outdir + "/screen.txt"},
-             {"trimming_preview", cur_outdir + "/trimming_preview.txt"}},
+             {"trimming_preview", cur_outdir + "/trimming_preview.txt"},
+             {"umi_qc", cur_outdir + "/umi_qc.txt"}},
             acceptance_rules);
           note_acceptance(acc, filename);
         }

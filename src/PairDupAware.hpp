@@ -23,6 +23,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <ostream>
 #include <string>
 #include <vector>
@@ -86,6 +87,8 @@ struct AwareDupResult {
   std::size_t comparisons = 0;    // base-by-base pair comparisons
   std::array<double, 16> dedup_bins{};
   std::array<double, 16> total_bins{};
+  // groups of copies by size: size -> number of groups
+  std::map<std::uint64_t, std::uint64_t> family_sizes;
   double duplicate_rate() const {
     return pairs ? 100.0 * static_cast<double>(pairs - clusters) /
                      static_cast<double>(pairs)

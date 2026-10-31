@@ -4,6 +4,23 @@
 
 ### Added
 
+- **UMI quality** (`umi_qc.txt`, written with any UMI option). Over all
+  reads: UMIs present, with N and homopolymer, distinct UMIs and the share
+  of the 4^L possible ones in use, the most frequent UMI, the composition per
+  UMI position; the families of the aware duplication pass (same UMI and
+  sequence within the allowed mismatches): number, mean, median and largest
+  size, families and reads in families of 2 and 3 or more, a size
+  histogram, and families per distinct molecule tag (UMI, or UMI pair for
+  dual UMIs); for in-read UMIs, the quality per position and the UMIs with a
+  base below Phred 20 in the first million reads. Every line equals an
+  independent computation (test/umi_qc/umi_oracle.py) on generated reads
+  (paired dual UMIs, single-end reads shorter than the UMI, name UMIs of
+  varying length, Phred+64, gzip) and on the public QuantSeq UMI run
+  SRR27937408 (5.0 million reads, 6-nt UMI: all 4096 UMIs in use, about
+  1000 families per UMI) at 0, 1 and 2 mismatches
+  (paper/data/umi_qc_validation). JSON section and MultiQC columns (UMI
+  family, UMI space).
+
 - **Trimming preview** (`--trim-preview`, `--trim-preview-reads`). For
   the first million reads of each file (each mate), the bases and reads
   that 3' quality trimming at cutoffs 10, 20 and 30 would remove and the

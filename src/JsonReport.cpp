@@ -254,6 +254,12 @@ extra_json(std::ostringstream &o, const std::string &section,
         gs["adapter_read_through_pct"] = std::atof(f[2].c_str());
       if (k == "adapter_dimers" && f.size() >= 3)
         gs["adapter_dimer_pct"] = std::atof(f[2].c_str());
+      if (section == "umi_qc" && k == "mean_family_size")
+        gs["umi_mean_family_size"] = std::atof(f[1].c_str());
+      if (section == "umi_qc" &&
+          k.find("share_of_the_possible_umis_used") != std::string::npos)
+        gs["umi_space_used_pct"] = std::max(gs["umi_space_used_pct"],
+                                            std::atof(f[1].c_str()));
       if (section == "screen" && k == "no_reference")
         gs["screen_no_reference_pct"] = std::atof(f[1].c_str());
     }
@@ -691,6 +697,11 @@ write_json_reports(const std::string &out_dir, const std::string &prefix,
      "k-mer share of the most frequent screened reference", "%", 100},
     {"screen_no_reference_pct", "Screen none",
      "k-mer share found in no screened reference", "%", 100},
+    {"umi_mean_family_size", "UMI family",
+     "Mean reads per UMI family (same UMI and sequence)", "", 0},
+    {"umi_space_used_pct", "UMI space",
+     "Share of the possible UMI sequences in use (the fuller source)", "%",
+     100},
     {"trim_q20_bases_removed_pct", "Q20 trim",
      "Bases cutadapt -q 20 would remove (the larger mate)", "%", 100},
   };
