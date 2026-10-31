@@ -4,10 +4,12 @@
 #include "FastqStats.hpp"
 #include "config.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cctype>
 #include <cstdlib>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -306,6 +308,89 @@ extra_json(std::ostringstream &o, const std::string &section,
   ob.end();
 }
 
+// The trimming preview: per section (reads; or forward and reverse), the
+// quality cuts by cutoff and the adapter estimate
+void
+trim_json(std::ostringstream &o, const std::string &file,
+          std::map<std::string, double> &gs) {
+  std::ifstream in(file);
+  Obj ob(o);
+  ob.kv("file", "\"" + esc(file) + "\"");
+  std::string line;
+  bool open = false, in_q = false;
+  Obj *sec = nullptr;
+  std::unique_ptr<Obj> sec_obj, q_obj;
+  auto close_q = [&] {
+    if (q_obj) {
+      q_obj->end();
+      q_obj.reset();
+    }
+    in_q = false;
+  };
+  while (std::getline(in, line)) {
+    if (line.empty() || line.rfind("##", 0) == 0)
+      continue;
+    if (line == "#Reads" || line == "#Forward" || line == "#Reverse") {
+      close_q();
+      if (open)
+        sec_obj->end();
+      ob.k(key(line.substr(1)));
+      sec_obj = std::make_unique<Obj>(o);
+      sec = sec_obj.get();
+      open = true;
+      continue;
+    }
+    if (line.rfind("#Cutoff", 0) == 0 && sec != nullptr) {
+      sec->k("quality");
+      q_obj = std::make_unique<Obj>(o);
+      in_q = true;
+      continue;
+    }
+    if (line[0] == '#')
+      continue;
+    const auto f = split(line);
+    if (sec == nullptr) {
+      if (f.size() >= 2)
+        ob.kv(key(f[0]), value(f[1]));
+      continue;
+    }
+    if (in_q && f.size() == 6 && numeric(f[0])) {
+      q_obj->k(f[0]);
+      Obj r(o);
+      r.kv("bases_removed_pct", value(f[1]));
+      r.kv("reads_trimmed_pct", value(f[2]));
+      r.kv("shorter_than_20_pct", value(f[3]));
+      r.kv("shorter_than_36_pct", value(f[4]));
+      r.kv("shorter_than_50_pct", value(f[5]));
+      r.end();
+      if (f[0] == "20") {
+        double &g = gs["trim_q20_bases_removed_pct"];
+        g = std::max(g, std::atof(f[1].c_str()));
+      }
+      continue;
+    }
+    close_q();
+    if (f.size() >= 2 && f[0] == "Adapter") {
+      sec->kv("adapter", value(f[1]));
+      if (f.size() >= 3)
+        sec->kv("adapter_sequence", value(f[2]));
+      continue;
+    }
+    if (f.size() >= 2) {
+      std::string k = key(f[0]);
+      if (f[0].find("(%)") != std::string::npos)
+        k += "_pct";
+      sec->kv(k, value(f[1]));
+      if (f.size() >= 3 && numeric(f[2]))
+        sec->kv(k + "_pct", value(f[2]));
+    }
+  }
+  close_q();
+  if (open)
+    sec_obj->end();
+  ob.end();
+}
+
 // Flattens the JSON this file writes (objects, arrays, strings, numbers)
 // into path -> value text (numbers as written); array elements are skipped.
 struct Flat {
@@ -432,6 +517,7 @@ void
 record_base_quality(const std::string &key, const FastqStats &stats) {
   BaseQuality q;
   const std::size_t off = static_cast<std::size_t>(stats.encoding_offset);
+  q.phred_base = 33 + static_cast<int>(stats.encoding_offset);
   const std::size_t npos = stats.max_read_length;
   for (std::size_t i = 0; i < npos; ++i)
     for (std::size_t j = 0; j < FastqStats::kNumQualityValues; ++j) {
@@ -504,7 +590,10 @@ write_json_reports(const std::string &out_dir, const std::string &prefix,
       if (!probe)
         continue;
       top.k(ex.first);
-      extra_json(o, ex.first, ex.second, gs);
+      if (ex.first == "trimming_preview")
+        trim_json(o, ex.second, gs);
+      else
+        extra_json(o, ex.first, ex.second, gs);
     }
     top.end();
   }
@@ -602,6 +691,8 @@ write_json_reports(const std::string &out_dir, const std::string &prefix,
      "k-mer share of the most frequent screened reference", "%", 100},
     {"screen_no_reference_pct", "Screen none",
      "k-mer share found in no screened reference", "%", 100},
+    {"trim_q20_bases_removed_pct", "Q20 trim",
+     "Bases cutadapt -q 20 would remove (the larger mate)", "%", 100},
   };
   std::ostringstream m;
   {

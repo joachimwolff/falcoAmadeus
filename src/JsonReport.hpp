@@ -22,6 +22,7 @@ struct FastqStats;
 // Phred >= 20 / >= 30 bases of one view, kept when its report is written
 struct BaseQuality {
   double bases = 0, q20 = 0, q30 = 0;
+  int phred_base = 33;  // the encoding's quality zero (33 or 64)
 };
 
 // counts the bases of `stats` by quality (after its report is written, when

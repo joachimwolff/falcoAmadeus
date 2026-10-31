@@ -4,6 +4,21 @@
 
 ### Added
 
+- **Trimming preview** (`--trim-preview`, `--trim-preview-reads`). For
+  the first million reads of each file (each mate), the bases and reads
+  that 3' quality trimming at cutoffs 10, 20 and 30 would remove and the
+  reads it would leave shorter than 20, 36 and 50 bases; the quality cut is
+  cutadapt's algorithm (quality_trim_index, ported), and on 200,000 reads
+  of 11 public runs (RNA-seq, small RNA, ATAC, ChIP, WGBS, EM-seq, RRBS,
+  16S, exome, WGS, paired R1) all 165 values equal those counted from
+  cutadapt 5.2 `-q`. Adapter trimming is an estimate (the first 12 bases of
+  the adapter with at most one mismatch, or a read end of 3 or more bases
+  equal to its start, for the adapter of the list found most, homopolymers
+  aside), within 0.4 percentage points of cutadapt `-a` on the same runs
+  (paper/data/trim_preview_validation). The encoding (Phred+33 or +64) is
+  the report's. A JSON section and a MultiQC column (Q20 trim) are added.
+  Tested in `test/trim_preview`.
+
 - **Acceptance rules** (`--acceptance`, `--acceptance-exit`). A rules file
   of `metric >= warn fail` / `metric <= warn fail` lines, the metric a path
   into the JSON summary or a MultiQC column name, gives each sample an

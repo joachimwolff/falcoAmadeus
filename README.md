@@ -51,7 +51,7 @@ original apart from the corrected N-content grade.
   reports, plus the share of bases with Phred quality 20 and 30 or more) and
   `falcoAmadeus_mqc.json`, which MultiQC shows as general statistics columns
   (Q30 bases, paired and aware duplication, complexity, insert size, adapter
-  read-through and dimers, screen).
+  read-through and dimers, screen, Q20 trimming).
 
 - **Acceptance rules.** `--acceptance rules.tsv` grades a sample against
   lab limits (lines `metric >= warn fail` or `metric <= warn fail`, the
@@ -70,6 +70,13 @@ original apart from the corrected N-content grade.
   `--screen-build DB --screen-refs name=fasta,...` builds the database from
   any FASTA files (about 40 MB and 15 s for the panel above);
   `paper/scripts/screen_validation` lists the public references used.
+
+- **Trimming preview.** `--trim-preview` writes `trimming_preview.txt`:
+  what cutadapt's 3' quality trimming (`-q` at 10, 20 and 30) would remove
+  and how many reads would end up shorter than 20, 36 and 50 bases (the
+  same lengths as cutadapt; one section per mate for paired input), and an
+  estimate of adapter trimming with the adapter of the list found most
+  (`paper/data/trim_preview_validation`).
 
 - **Insert size and adapter read-through (paired).** From the overlap of
   read 1 with the reverse complement of read 2 in the first million pairs,
@@ -353,6 +360,8 @@ FalcoAmadeus-specific options:
 | `--screen DB` | Contamination screen against a database from `--screen-build`; writes `screen.txt`. |
 | `--screen-reads N` | Reads per file for `--screen` (default 1000000; 0: all). |
 | `--screen-build DB` with `--screen-refs name=file,...` | Build a screen database from FASTA files (at most 32 references), then exit. |
+| `--trim-preview` | Write `trimming_preview.txt`: bases and reads removed by 3' quality trimming at 10, 20 and 30 (as cutadapt `-q`), reads left shorter than 20, 36 and 50 bases, and an adapter-trimming estimate. FASTQ files only. |
+| `--trim-preview-reads N` | Reads per file for `--trim-preview` (default 1000000; 0: all). |
 | `--insert-size-pairs N` | With `--paired-with`, the number of pairs (from the start) whose mate overlap gives `paired_insert_size.txt` (default 1000000; 0: all). |
 | `--complexity` | Single-end: count every read's duplication key exactly and write `complexity.txt` with the expected distinct reads at 2x to 100x the sequenced reads (paired input reports it in `paired_duplication.txt` always). |
 | `--paired-data mates\|combined\|both` | With `--paired-with`, which `fastqc_data.txt` files to emit for MultiQC: separate mates (default), a single pooled sample, or both. |

@@ -133,7 +133,7 @@ am_falcoAmadeus_OBJECTS = src/falco.$(OBJEXT) src/FastqStats.$(OBJEXT) \
 	src/OptionParser.$(OBJEXT) src/smithlab_utils.$(OBJEXT) \
 	src/PairDupAware.$(OBJEXT) src/Complexity.$(OBJEXT) \
 	src/InsertSize.$(OBJEXT) src/Screen.$(OBJEXT) \
-	src/JsonReport.$(OBJEXT)
+	src/TrimPreview.$(OBJEXT) src/JsonReport.$(OBJEXT)
 falcoAmadeus_OBJECTS = $(am_falcoAmadeus_OBJECTS)
 falcoAmadeus_LDADD = $(LDADD)
 AM_V_P = $(am__v_P_$(V))
@@ -157,7 +157,8 @@ am__depfiles_remade = src/$(DEPDIR)/Complexity.Po \
 	src/$(DEPDIR)/JsonReport.Po src/$(DEPDIR)/Module.Po \
 	src/$(DEPDIR)/OptionParser.Po src/$(DEPDIR)/PairDupAware.Po \
 	src/$(DEPDIR)/Screen.Po src/$(DEPDIR)/StreamReader.Po \
-	src/$(DEPDIR)/falco.Po src/$(DEPDIR)/smithlab_utils.Po
+	src/$(DEPDIR)/TrimPreview.Po src/$(DEPDIR)/falco.Po \
+	src/$(DEPDIR)/smithlab_utils.Po
 am__mv = mv -f
 CXXCOMPILE = $(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) \
 	$(AM_CPPFLAGS) $(CPPFLAGS) $(AM_CXXFLAGS) $(CXXFLAGS)
@@ -556,9 +557,11 @@ falcoAmadeus_SOURCES = \
 	src/Complexity.cpp \
 	src/InsertSize.cpp \
 	src/Screen.cpp \
+	src/TrimPreview.cpp \
 	src/JsonReport.cpp \
 	src/JsonReport.hpp \
 	src/Screen.hpp \
+	src/TrimPreview.hpp \
 	src/InsertSize.hpp \
 	src/Complexity.hpp \
 	src/PairDupAware.hpp \
@@ -700,6 +703,8 @@ src/InsertSize.$(OBJEXT): src/$(am__dirstamp) \
 	src/$(DEPDIR)/$(am__dirstamp)
 src/Screen.$(OBJEXT): src/$(am__dirstamp) \
 	src/$(DEPDIR)/$(am__dirstamp)
+src/TrimPreview.$(OBJEXT): src/$(am__dirstamp) \
+	src/$(DEPDIR)/$(am__dirstamp)
 src/JsonReport.$(OBJEXT): src/$(am__dirstamp) \
 	src/$(DEPDIR)/$(am__dirstamp)
 
@@ -725,6 +730,7 @@ include src/$(DEPDIR)/OptionParser.Po # am--include-marker
 include src/$(DEPDIR)/PairDupAware.Po # am--include-marker
 include src/$(DEPDIR)/Screen.Po # am--include-marker
 include src/$(DEPDIR)/StreamReader.Po # am--include-marker
+include src/$(DEPDIR)/TrimPreview.Po # am--include-marker
 include src/$(DEPDIR)/falco.Po # am--include-marker
 include src/$(DEPDIR)/smithlab_utils.Po # am--include-marker
 
@@ -1225,6 +1231,7 @@ distclean: distclean-am
 	-rm -f src/$(DEPDIR)/PairDupAware.Po
 	-rm -f src/$(DEPDIR)/Screen.Po
 	-rm -f src/$(DEPDIR)/StreamReader.Po
+	-rm -f src/$(DEPDIR)/TrimPreview.Po
 	-rm -f src/$(DEPDIR)/falco.Po
 	-rm -f src/$(DEPDIR)/smithlab_utils.Po
 	-rm -f Makefile
@@ -1285,6 +1292,7 @@ maintainer-clean: maintainer-clean-am
 	-rm -f src/$(DEPDIR)/PairDupAware.Po
 	-rm -f src/$(DEPDIR)/Screen.Po
 	-rm -f src/$(DEPDIR)/StreamReader.Po
+	-rm -f src/$(DEPDIR)/TrimPreview.Po
 	-rm -f src/$(DEPDIR)/falco.Po
 	-rm -f src/$(DEPDIR)/smithlab_utils.Po
 	-rm -f Makefile

@@ -29,6 +29,7 @@
 #include "Complexity.hpp"
 #include "InsertSize.hpp"
 #include "Screen.hpp"
+#include "TrimPreview.hpp"
 #include "JsonReport.hpp"
 #include "smithlab_utils.hpp"
 
@@ -652,6 +653,13 @@ class FastqSeqStream {
     : file_(file), src_(file), buf_(std::size_t(1) << 22) {}
   // the next record's sequence (valid until the next call); false at EOF
   bool next(const char *&seq, std::size_t &len) {
+    const char *q;
+    std::size_t ql;
+    return next(seq, len, q, ql);
+  }
+  // with its quality line
+  bool next(const char *&seq, std::size_t &len, const char *&qual,
+            std::size_t &qlen) {
     for (;;) {
       while (beg_ < end_ && buf_[beg_] == '\n')  // blank lines
         ++beg_;
@@ -676,6 +684,11 @@ class FastqSeqStream {
         len = ln[2] - ln[1] - 1;
         if (len && seq[len - 1] == '\r')
           --len;
+        qual = buf_.data() + ln[3];
+        qlen = ln[4] - ln[3] - (ln[4] <= end_ && ln[4] > ln[3] &&
+                                    buf_[ln[4] - 1] == '\n' ? 1 : 0);
+        if (qlen && qual[qlen - 1] == '\r')
+          --qlen;
         beg_ = ln[4];
         return true;
       }
@@ -809,6 +822,127 @@ struct ScreenJob {
       t.join();
   }
 };
+
+// [FalcoAmadeus] Trimming preview of the first max_reads reads (0: all) of
+// one file, at Phred bases 33 and 64 (the file's encoding is known only once
+// its report is written); see TrimPreview.hpp.
+struct TrimJob {
+  std::thread t;
+  std::exception_ptr err;
+  std::unique_ptr<TrimPreview> p33, p64;
+  void start(const std::string &file, const std::size_t max_reads,
+             const FalcoConfig &cfg, const std::size_t nthreads) {
+    // the adapter list (the run reads it later, in its setup)
+    FalcoConfig c = cfg;
+    c.quiet = true;
+    c.read_adapters();
+    p33 = std::make_unique<TrimPreview>(c.adapter_names, c.adapter_seqs, 33);
+    p64 = std::make_unique<TrimPreview>(c.adapter_names, c.adapter_seqs, 64);
+    t = std::thread([this, file, max_reads, nthreads] {
+      try {
+        scan(file, max_reads, nthreads);
+      }
+      catch (...) {
+        err = std::current_exception();
+      }
+    });
+  }
+  void join() {
+    if (t.joinable())
+      t.join();
+    if (err) {
+      std::exception_ptr e = err;
+      err = nullptr;
+      std::rethrow_exception(e);
+    }
+  }
+  // the preview at the encoding of the report written under key
+  const TrimPreview &result(const std::string &key) const {
+    const BaseQuality *q = find_base_quality(key);
+    return (q != nullptr && q->phred_base == 64) ? *p64 : *p33;
+  }
+  ~TrimJob() {
+    if (t.joinable())
+      t.join();
+  }
+
+ private:
+  void scan(const std::string &file, const std::size_t max_reads,
+            const std::size_t nthreads) {
+    const std::size_t T = std::max<std::size_t>(1, nthreads);
+    std::vector<TrimPreview> a(T, *p33), b(T, *p64);
+    constexpr std::size_t kBatch = 1u << 15;
+    std::string batch;
+    // (offset, sequence length, quality length)
+    std::vector<std::array<std::size_t, 3>> recs;
+    auto flush = [&] {
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(T) schedule(dynamic, 256)
+#endif
+      for (std::size_t i = 0; i < recs.size(); ++i) {
+#ifdef _OPENMP
+        const std::size_t k = static_cast<std::size_t>(omp_get_thread_num());
+#else
+        const std::size_t k = 0;
+#endif
+        const char *s = batch.data() + recs[i][0];
+        a[k].add(s, recs[i][1], s + recs[i][1], recs[i][2]);
+        b[k].add(s, recs[i][1], s + recs[i][1], recs[i][2]);
+      }
+      batch.clear();
+      recs.clear();
+    };
+    FastqSeqStream st(file);
+    const char *s, *q;
+    std::size_t l, ql, n = 0;
+    while ((max_reads == 0 || n < max_reads) && st.next(s, l, q, ql)) {
+      recs.push_back({batch.size(), l, ql});
+      batch.append(s, l);
+      batch.append(q, ql);
+      ++n;
+      if (recs.size() == kBatch)
+        flush();
+    }
+    flush();
+    for (std::size_t k = 0; k < T; ++k) {
+      p33->merge(a[k]);
+      p64->merge(b[k]);
+    }
+  }
+};
+
+// --trim-preview reads the file a second time: a FASTQ file (plain or gzip),
+// not SAM/BAM or a pipe
+static void
+check_trim_preview_input(const std::string &file, const std::string &format) {
+  struct stat st;
+  const bool regular = stat(file.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+  std::string ext = file.size() >= 4 ? file.substr(file.size() - 4) : "";
+  for (char &ch : ext)
+    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  const bool sam = format.find("sam") != std::string::npos ||
+                   format.find("bam") != std::string::npos ||
+                   (format.empty() && (ext == ".sam" || ext == ".bam"));
+  if (!regular || sam)
+    throw std::runtime_error("--trim-preview needs a FASTQ file that can be "
+                             "read twice (not SAM/BAM or a pipe): " + file);
+}
+
+static void
+write_trim_preview(const std::string &out_file, const std::size_t max_reads,
+                   const std::vector<std::pair<std::string,
+                                               const TrimPreview *>> &parts) {
+  std::ofstream os(out_file, std::ofstream::binary);
+  os << "##FalcoAmadeus-TrimmingPreview\t" << std::string{VERSION} << "\n";
+  os << "Reads per file\t"
+     << (max_reads == 0 ? std::string("all")
+                        : "the first " + std::to_string(max_reads))
+     << "\n";
+  for (const auto &p : parts)
+    p.second->write(os, p.first);
+  if (!os.good())
+    throw std::runtime_error("Failed to write " + out_file);
+}
 
 static MateFingerprints
 fingerprint_mate(const std::string &file) {
@@ -2556,6 +2690,8 @@ main(int argc, char *argv[]) {
     std::size_t insert_size_pairs = 1000000;
     std::string screen_db_path, screen_build_path, screen_refs_arg;
     std::size_t screen_reads = 1000000;
+    bool want_trim_preview = false;
+    std::size_t trim_preview_reads = 1000000;
     std::string acceptance_rules;
     bool acceptance_exit = false;
     bool any_acceptance_fail = false;
@@ -2838,6 +2974,19 @@ main(int argc, char *argv[]) {
       false, acceptance_exit);
 
     opt_parse.add_opt(
+      "-trim-preview", '\0',
+      "[FalcoAmadeus] Trimming preview: what 3' quality trimming (cutadapt "
+      "-q at 10, 20 and 30) and adapter trimming would remove, and how many "
+      "reads would become too short, written to trimming_preview.txt.",
+      false, want_trim_preview);
+
+    opt_parse.add_opt(
+      "-trim-preview-reads", '\0',
+      "[FalcoAmadeus] Reads per file for --trim-preview, from the start "
+      "(default 1000000; 0: all).",
+      false, trim_preview_reads);
+
+    opt_parse.add_opt(
       "-screen", '\0',
       "[FalcoAmadeus] Contamination screen: the share of the reads' k-mers "
       "found in each reference of this database (built with "
@@ -3117,6 +3266,12 @@ main(int argc, char *argv[]) {
                          screen_reads,
                          cur_outdir + "/" + file_prefix + "screen.txt",
                          falco_config.threads);
+        TrimJob trim_job;
+        if (want_trim_preview) {
+          check_trim_preview_input(filename, forced_file_format);
+          trim_job.start(filename, trim_preview_reads, falco_config,
+                         falco_config.threads);
+        }
         analyze_and_write(falco_config, filename, forced_file_format,
                           cur_outdir, file_prefix, summary_filename,
                           data_filename, report_filename, skip_text, skip_html,
@@ -3142,6 +3297,12 @@ main(int argc, char *argv[]) {
             falco_config.quiet, falco_config.threads);
         }
         screen_job.join();
+        if (want_trim_preview) {
+          trim_job.join();
+          const std::string pre = cur_outdir + "/" + file_prefix;
+          write_trim_preview(pre + "trimming_preview.txt", trim_preview_reads,
+                             {{"Reads", &trim_job.result(pre)}});
+        }
         {
           const std::string pre = cur_outdir + "/" + file_prefix;
           JsonView v{"reads",
@@ -3157,7 +3318,8 @@ main(int argc, char *argv[]) {
             {filename}, {v},
             {{"aware_duplication", pre + "aware_duplication.txt"},
              {"complexity", pre + "complexity.txt"},
-             {"screen", pre + "screen.txt"}},
+             {"screen", pre + "screen.txt"},
+             {"trimming_preview", pre + "trimming_preview.txt"}},
             acceptance_rules);
           note_acceptance(acc, filename);
         }
@@ -3234,6 +3396,15 @@ main(int argc, char *argv[]) {
         screen_job.start(screen_db.get(), filename, paired_with_file,
                          screen_reads, cur_outdir + "/screen.txt",
                          falco_config.threads);
+        TrimJob trim_job1, trim_job2;
+        if (want_trim_preview) {
+          check_trim_preview_input(filename, forced_file_format);
+          check_trim_preview_input(paired_with_file, forced_file_format);
+          trim_job1.start(filename, trim_preview_reads, falco_config,
+                          falco_config.threads);
+          trim_job2.start(paired_with_file, trim_preview_reads, falco_config,
+                          falco_config.threads);
+        }
         PairedFused pf;
         std::size_t fused_matching = 0;
         const bool fused =
@@ -3474,6 +3645,15 @@ main(int argc, char *argv[]) {
           plap("insert size");
         }
         screen_job.join();
+        if (want_trim_preview) {
+          trim_job1.join();
+          trim_job2.join();
+          write_trim_preview(cur_outdir + "/trimming_preview.txt",
+                             trim_preview_reads,
+                             {{"Forward", &trim_job1.result(fwd_dir + "/")},
+                              {"Reverse", &trim_job2.result(rev_dir + "/")}});
+          plap("trimming preview");
+        }
         if (aware_opt.enabled()) {
           // the mates' records come from the fused read when it collected
           // them, otherwise from a separate scan
@@ -3509,7 +3689,8 @@ main(int argc, char *argv[]) {
               cur_outdir + "/summary.txt", std::string{}}},
             {{"paired_duplication", paired_out},
              {"insert_size", cur_outdir + "/paired_insert_size.txt"},
-             {"screen", cur_outdir + "/screen.txt"}},
+             {"screen", cur_outdir + "/screen.txt"},
+             {"trimming_preview", cur_outdir + "/trimming_preview.txt"}},
             acceptance_rules);
           note_acceptance(acc, filename);
         }

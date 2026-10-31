@@ -52,9 +52,11 @@ falcoAmadeus_SOURCES = \
 	src/Complexity.cpp \
 	src/InsertSize.cpp \
 	src/Screen.cpp \
+	src/TrimPreview.cpp \
 	src/JsonReport.cpp \
 	src/JsonReport.hpp \
 	src/Screen.hpp \
+	src/TrimPreview.hpp \
 	src/InsertSize.hpp \
 	src/Complexity.hpp \
 	src/PairDupAware.hpp \
