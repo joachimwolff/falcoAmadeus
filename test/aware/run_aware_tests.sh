@@ -47,6 +47,54 @@ for seed in 1 2; do
 2 2 r1r2:1:6
 CASES
 done
+# short inserts followed by a shared adapter: unrelated pairs share their
+# adapter blocks (block groups above the refinement size), and copies carry
+# an error in every block of the insert, so the adapter blocks are the only
+# blocks they share (single-end with 2 mismatches: blocks of 17 bases;
+# paired with 4: blocks of 10). Found only by the refinement of large block
+# groups.
+python3 -I - "$T" <<'PY'
+import random, sys
+d = sys.argv[1]
+A1 = 'AGATCGGAAGAGCACACGTCTGAACTCCAGTCACATCACGATC'
+A2 = 'AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGTAGATCTCGGT'
+def gen(seed, out1, out2, ins_len, cuts):
+    rnd = random.Random(seed)
+    def hit(s, lo, hi):
+        s = list(s)
+        i = rnd.randrange(lo, hi)
+        s[i] = rnd.choice('ACGT'.replace(s[i], ''))
+        return ''.join(s)
+    f1, f2 = open(out1, 'w'), (open(out2, 'w') if out2 else None)
+    k = 0
+    for m in range(600):
+        ins = ''.join(rnd.choice('ACGT') for _ in range(rnd.randrange(*ins_len)))
+        rc = ins[::-1].translate(str.maketrans('ACGT', 'TGCA'))
+        a0, b0 = (ins + A1)[:51], (rc + A2)[:51]
+        for c in range(1 + (m % 3)):
+            a, b = a0, b0
+            if c:
+                for lo, hi in cuts:
+                    a = hit(a, lo, hi)
+                    if out2:
+                        b = hit(b, lo, hi)
+            if c == 2 and out2:
+                a, b = b, a
+            f1.write('@p%d\n%s\n+\n%s\n' % (k, a, 'I' * 51))
+            if out2:
+                f2.write('@p%d\n%s\n+\n%s\n' % (k, b, 'I' * 51))
+            k += 1
+gen(11, d + '/se.fq', None, (18, 31), [(0, 17), (17, 34)])
+gen(12, d + '/pe1.fq', d + '/pe2.fq', (14, 21), [(0, 10), (10, 20)])
+PY
+rm -rf "$T/out"
+FA_AWARE_CLUSTERS="$T/g.u32" "$FA" -q -t 4 -o "$T/out" "$T/se.fq" \
+  --dup-mismatches 2 > /dev/null
+python3 -I "$HERE/aware_oracle.py" check "$T/se.fq" - "$T/g.u32" 2 0 none || fail=1
+rm -rf "$T/out"
+FA_AWARE_CLUSTERS="$T/g.u32" "$FA" -q -t 4 -o "$T/out" "$T/pe1.fq" \
+  --paired-with "$T/pe2.fq" --dup-mismatches 4 > /dev/null
+python3 -I "$HERE/aware_oracle.py" check "$T/pe1.fq" "$T/pe2.fq" "$T/g.u32" 4 0 none || fail=1
 # a UMI that ends the name line (no comment after it, a /1 /2 suffix)
 python3 -I - "$T" <<'PY'
 import sys

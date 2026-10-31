@@ -231,6 +231,18 @@
 
 ### Fixed
 
+- **Aware duplication on short inserts.** With adapter read-through (short
+  inserts in short reads), many unrelated pairs share their all-adapter
+  blocks, and those block groups were compared pair by pair: on 1 million
+  NovaSeq 2x51 pairs (ERR5654681) about 1 billion comparisons at 1
+  mismatch (5.0 s) and 2.6 billion at 2 (17.4 s). Groups of more than 64
+  classes are now split once more by pigeonhole (two copies differ in at
+  most D of the positions outside the shared blocks, so they share one of
+  D + 1 parts of them): 1.4 and 40 million comparisons (0.44 s, 2.2 s), the
+  groups unchanged. test/aware adds copies whose only shared blocks are
+  adapter blocks (single-end and paired, with swapped mates), checked
+  against the all-pairs oracle.
+
 - **Per base N content is graded.** Inherited from falco 1.x, the module
   compared the largest per-position N fraction (0 to 1) with the percent
   limits (warn 5, error 20), so it never warned or failed: reads with 50 % N

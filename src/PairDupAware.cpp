@@ -28,6 +28,9 @@ constexpr std::size_t MAX_UMI = 32;
 // mates whose key is shorter than this many bases per block are compared
 // exactly: shorter blocks would put most reads of that length into one group
 constexpr unsigned MIN_BLOCK = 4;
+// groups of more classes than this sharing the blocks of a pass are split
+// further before classes are compared (see refine in aware_duplication)
+constexpr std::size_t REFINE_MIN = 64;
 
 inline std::uint64_t
 mix64(std::uint64_t x) {  // splitmix64 finalizer
@@ -878,16 +881,132 @@ aware_duplication(MateSeqs &m1, MateSeqs &m2, const AwareDupOptions &opt,
           },
           [](const std::uint64_t x) { return x >> (64 - GROUP_BITS); }, ent,
           gstart);
+        // A large group of classes sharing the blocks of this pass (e.g. the
+        // adapter blocks of many short inserts) is split once more: two
+        // copies there differ in at most D of the remaining positions (both
+        // mates without the shared blocks, the mates ordered by the shared
+        // blocks' hashes, which is the same order for copies in either mate
+        // order), so they share one of D + 1 parts of those positions
+        // (pigeonhole again). Classes are compared within the parts.
+        auto refine = [&](const std::size_t a, const std::size_t b,
+                          const std::uint64_t key, std::size_t &local,
+                          std::vector<std::uint64_t> &sub) {
+          sub.clear();
+          const unsigned parts = D + 1;
+          auto code_at = [](const std::uint64_t *w, const std::uint64_t *nm,
+                            const unsigned pos) -> unsigned {
+            const unsigned sh = 2 * (pos % 32);
+            if ((nm[pos / 32] >> sh) & 1)
+              return 4;
+            return static_cast<unsigned>((w[pos / 32] >> sh) & 3);
+          };
+          // the remaining positions of mate x (without block bx) then of
+          // mate y (without block by): parts of the concatenation
+          auto add_parts = [&](const std::uint32_t c,
+                               const std::uint64_t *wx, const std::uint64_t *nx,
+                               const unsigned Lx, const unsigned bx,
+                               const std::uint64_t *wy, const std::uint64_t *ny,
+                               const unsigned Ly, const unsigned by,
+                               const bool has_y) {
+            const unsigned xlo = bx * Lx / nb, xhi = (bx + 1) * Lx / nb;
+            const unsigned ylo = has_y ? by * Ly / nb : 0,
+                           yhi = has_y ? (by + 1) * Ly / nb : 0;
+            const unsigned rx = Lx - (xhi - xlo);
+            const unsigned R = rx + (has_y ? Ly - (yhi - ylo) : 0);
+            auto at = [&](const unsigned r) {
+              if (r < rx)
+                return code_at(wx, nx, r < xlo ? r : r + (xhi - xlo));
+              const unsigned q = r - rx;
+              return code_at(wy, ny, q < ylo ? q : q + (yhi - ylo));
+            };
+            for (unsigned k = 0; k < parts; ++k) {
+              const unsigned lo = k * R / parts, hi = (k + 1) * R / parts;
+              std::uint64_t h = mix64(
+                (std::uint64_t(Lx) << 48) ^ (std::uint64_t(Ly) << 32) ^
+                (std::uint64_t(bx) << 24) ^ (std::uint64_t(by) << 16) ^
+                (std::uint64_t(k) << 8) ^ parts);
+              std::uint64_t acc = 0;
+              unsigned cnt = 0;
+              for (unsigned r = lo; r < hi; ++r) {
+                acc = acc * 5 + at(r);
+                if (++cnt == 27) {
+                  h = mix64(h ^ acc);
+                  acc = 0;
+                  cnt = 0;
+                }
+              }
+              h = mix64(h ^ acc ^ (std::uint64_t(cnt) << 58));
+              sub.push_back((h & 0xffffffff00000000ULL) | c);
+            }
+          };
+          std::uint32_t last = ~std::uint32_t(0);
+          for (std::size_t x = a; x < b; ++x) {
+            const std::uint32_t c = static_cast<std::uint32_t>(ent[x]);
+            if (c == last)  // one class can carry the key twice
+              continue;
+            last = c;
+            const std::size_t ra = rep[c];
+            const std::uint64_t s1 =
+              umi_in_blocks && umi1 ? umi_hash(m1, ra) : 0;
+            const std::uint64_t s2 =
+              umi_in_blocks && umi2 ? umi_hash(m2, ra) : 0;
+            const std::uint64_t su =
+              umi_in_blocks && name_umi ? umi_hash(m1, ra) : 0;
+            const unsigned L1 = v1.length(ra);
+            const std::uint64_t *w1 = v1.w(ra), *n1 = v1.n(ra);
+            if (single) {
+              add_parts(c, w1, n1, L1, bi, nullptr, nullptr, 0, 0, false);
+              continue;
+            }
+            const unsigned L2 = v2.length(ra);
+            const std::uint64_t *w2 = v2.w(ra), *n2 = v2.n(ra);
+            for (int t = 0; t < (bi != bj ? 2 : 1); ++t) {
+              const unsigned p = t ? bj : bi, q = t ? bi : bj;
+              const std::uint64_t h1 = block_hash(w1, n1, L1, p, nb, s1),
+                                  h2 = block_hash(w2, n2, L2, q, nb, s2);
+              if (((unordered_key(h1, h2) ^ su) >> 32) != key)
+                continue;  // this order did not give the key
+              if (h1 <= h2)
+                add_parts(c, w1, n1, L1, p, w2, n2, L2, q, true);
+              if (h2 <= h1)
+                add_parts(c, w2, n2, L2, q, w1, n1, L1, p, true);
+            }
+          }
+          std::sort(sub.begin(), sub.end());
+          for (std::size_t u = 0; u < sub.size();) {
+            std::size_t e = u + 1;
+            while (e < sub.size() && (sub[e] >> 32) == (sub[u] >> 32))
+              ++e;
+            for (std::size_t x = u; x + 1 < e; ++x) {
+              const std::uint32_t cx = static_cast<std::uint32_t>(sub[x]);
+              for (std::size_t y = x + 1; y < e; ++y) {
+                const std::uint32_t cy = static_cast<std::uint32_t>(sub[y]);
+                if (cx == cy || groups.find(cx) == groups.find(cy))
+                  continue;
+                ++local;
+                if (close(cx, cy))
+                  groups.unite(cx, cy);
+              }
+            }
+            u = e;
+          }
+        };
 #pragma omp parallel for num_threads(nthreads) schedule(dynamic, 1) \
   reduction(max : largest)
         for (std::size_t g = 0; g < GROUPS; ++g) {
           std::size_t local = 0;
+          std::vector<std::uint64_t> sub;
           for (std::size_t a = gstart[g]; a < gstart[g + 1];) {
             const std::uint64_t key = ent[a] >> 32;
             std::size_t b = a + 1;
             while (b < gstart[g + 1] && (ent[b] >> 32) == key)
               ++b;
             largest = std::max(largest, b - a);
+            if (b - a > REFINE_MIN && D > 0) {
+              refine(a, b, key, local, sub);
+              a = b;
+              continue;
+            }
             for (std::size_t x = a; x + 1 < b; ++x) {
               const std::uint32_t cx = static_cast<std::uint32_t>(ent[x]);
               for (std::size_t y = x + 1; y < b; ++y) {
