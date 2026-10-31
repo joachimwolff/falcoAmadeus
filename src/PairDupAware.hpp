@@ -35,12 +35,23 @@ struct AwareDupOptions {
   std::size_t umi1_start = 0, umi1_len = 0;
   std::size_t umi2_start = 0, umi2_len = 0;
   bool umi_in_name = false;  // UMI as the last ':' or '_' field of the name
+  // optical duplicates (Picard's rule) within the groups of copies: the
+  // pixel distance, or -1 for none
+  int optical_distance = -1;
   bool enabled() const {
     return mismatches > 0 || umi_mismatches > 0 || umi1_len > 0 ||
-           umi2_len > 0 || umi_in_name;
+           umi2_len > 0 || umi_in_name || optical_distance >= 0;
   }
   bool has_umi() const { return umi1_len > 0 || umi2_len > 0 || umi_in_name; }
 };
+
+// Picard's default read name parsing (ReadNameParser, the optimized capture
+// of the last three ':' separated fields): a name of 5 or 7 fields gives
+// tile, x and y (each field's leading integer); false otherwise. The name
+// ends at the first whitespace.
+bool
+parse_read_location(const char *name, std::size_t len, std::int16_t &tile,
+                    std::int32_t &x, std::int32_t &y);
 
 // Parses "START:LEN" (1-based start) into a 0-based start and a length.
 // Throws on malformed input.
@@ -62,6 +73,9 @@ struct MateSeqs {
   std::vector<std::uint64_t> umi_n;     // N positions (same layout)
   std::vector<std::uint8_t> umi_len;    // 0xff: no UMI found in the name
   std::size_t no_umi = 0;
+  // read 1 name location for optical duplicates (tile -1: none)
+  std::vector<std::int16_t> tile;
+  std::vector<std::int32_t> x, y;
 
   // Adds one record. `mate` is 1 or 2; the name is the header line.
   void add(const char *name, std::size_t name_len, const char *seq,
@@ -85,6 +99,11 @@ struct AwareDupResult {
   std::size_t clusters = 0;       // groups of copies after tolerance
   std::size_t no_umi = 0;         // pairs whose name carried no UMI
   std::size_t comparisons = 0;    // base-by-base pair comparisons
+  // optical duplicates (with AwareDupOptions::optical_distance)
+  bool optical = false;
+  std::size_t located = 0;        // pairs whose name gives tile, x, y
+  std::size_t optical_dups = 0;   // optical duplicates (Picard's count)
+  std::size_t optical_skipped = 0;  // sets above Picard's 300000 limit
   std::array<double, 16> dedup_bins{};
   std::array<double, 16> total_bins{};
   // groups of copies by size: size -> number of groups

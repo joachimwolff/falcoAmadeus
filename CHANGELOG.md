@@ -4,6 +4,20 @@
 
 ### Added
 
+- **Optical duplicates** (`--optical`, `--optical-distance`). Within the
+  groups of copies of the aware duplication pass (exact, with
+  `--dup-mismatches`, or UMI-aware), Picard's OpticalDuplicateFinder rule:
+  copies on the same tile within the pixel distance in x and y, one kept per
+  cluster of close copies, the location from the read 1 name (Picard's
+  parser: the last three of 5 or 7 ':' separated fields), the two mate
+  orders apart (Picard's FR and RF), x and y in 16 bits as MarkDuplicates
+  keeps them, sets above 300000 not examined. On read pairs whose copies are
+  sequence-identical at the same coordinates (so the sets equal Picard's),
+  the count equals Picard MarkDuplicates (GATK 4.6.2.0) at 0, 50, 100 and
+  2500 pixels on three generated data sets, for 1 and 16 threads. Reported
+  in the aware duplication section; JSON and a MultiQC column. Tested in
+  `test/optical`.
+
 - **UMI quality** (`umi_qc.txt`, written with any UMI option). Over all
   reads: UMIs present, with N and homopolymer, distinct UMIs and the share
   of the 4^L possible ones in use, the most frequent UMI, the composition per

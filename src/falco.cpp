@@ -2802,6 +2802,8 @@ main(int argc, char *argv[]) {
     std::string screen_db_path, screen_build_path, screen_refs_arg;
     std::size_t screen_reads = 1000000;
     bool want_trim_preview = false;
+    bool want_optical = false;
+    std::size_t optical_distance = 100;
     std::size_t trim_preview_reads = 1000000;
     std::string acceptance_rules;
     bool acceptance_exit = false;
@@ -3139,6 +3141,21 @@ main(int argc, char *argv[]) {
       false, want_complexity);
 
     opt_parse.add_opt(
+      "-optical", '\0',
+      "[FalcoAmadeus] Optical duplicates (Picard's rule: copies on the same "
+      "tile within --optical-distance pixels in x and y, from the tile:x:y "
+      "of Illumina read names) within the groups of copies of the aware "
+      "duplication pass (exact, or with --dup-mismatches and the UMI "
+      "options); reported with it.",
+      false, want_optical);
+
+    opt_parse.add_opt(
+      "-optical-distance", '\0',
+      "[FalcoAmadeus] Pixel distance for --optical (default 100 as Picard; "
+      "Picard advises 2500 for patterned flow cells such as NovaSeq).",
+      false, optical_distance);
+
+    opt_parse.add_opt(
       "-umi-mismatches", '\0',
       "[FalcoAmadeus] Bases in which the UMIs of two copies may differ "
       "(default 0).",
@@ -3228,6 +3245,11 @@ main(int argc, char *argv[]) {
                                "--umi-r2 or --umi-in-name)");
     if (aware_opt.mismatches > 8)
       throw std::runtime_error("--dup-mismatches must be at most 8");
+    if (want_optical) {
+      if (optical_distance > 1000000)
+        throw std::runtime_error("--optical-distance must be at most 1000000");
+      aware_opt.optical_distance = static_cast<int>(optical_distance);
+    }
     if (aware_opt.enabled())
       falco_config.aware_dup = &aware_opt;
 

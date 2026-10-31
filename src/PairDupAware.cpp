@@ -298,6 +298,71 @@ umi_close(const MateSeqs &x, const std::size_t i, const MateSeqs &y,
 
 }  // namespace
 
+namespace {
+
+// Picard (htsjdk) rapidParseInt: an optional '-', then digits up to the
+// first non-digit; at least one digit. Overflow wraps as Java's int does.
+bool
+rapid_parse_int(const char *s, const int from, const int to, std::int32_t &out) {
+  int i = from;
+  bool neg = false;
+  if (i < to && s[i] == '-') {
+    ++i;
+    neg = true;
+  }
+  std::uint32_t v = 0;
+  bool has = false;
+  for (; i < to; ++i) {
+    const char c = s[i];
+    if (c < '0' || c > '9')
+      break;
+    v = v * 10u + static_cast<std::uint32_t>(c - '0');
+    has = true;
+  }
+  if (!has)
+    return false;
+  out = static_cast<std::int32_t>(neg ? 0u - v : v);
+  return true;
+}
+
+}  // namespace
+
+bool
+parse_read_location(const char *name, std::size_t len, std::int16_t &tile,
+                    std::int32_t &x, std::int32_t &y) {
+  if (len > 0 && name[0] == '@') {
+    ++name;
+    --len;
+  }
+  std::size_t e = 0;
+  while (e < len && name[e] != ' ' && name[e] != '\t' && name[e] != '\r' &&
+         name[e] != '\n')
+    ++e;
+  // ReadNameParser.getLastThreeFields(name, ':', tokens)
+  const int n = static_cast<int>(e);
+  std::int32_t tok[3];
+  int idx = 2, fields = 0, end = n, i;
+  for (i = n - 1; 0 <= i && 0 <= idx; --i) {
+    if (name[i] == ':' || i == 0) {
+      ++fields;
+      const int from = (i == 0) ? 0 : i + 1;
+      if (!rapid_parse_int(name, from, end, tok[idx]))
+        return false;
+      --idx;
+      end = i;
+    }
+  }
+  for (; 0 <= i; --i)
+    if (name[i] == ':' || i == 0)
+      ++fields;
+  if (fields != 5 && fields != 7)
+    return false;
+  tile = static_cast<std::int16_t>(tok[0]);
+  x = tok[1];
+  y = tok[2];
+  return true;
+}
+
 void
 parse_umi_region(const std::string &arg, std::size_t &start,
                  std::size_t &len) {
@@ -387,6 +452,15 @@ MateSeqs::add(const char *name, const std::size_t name_len, const char *seq,
     umi_n.push_back(un);
     umi_len.push_back(ulen);
   }
+  if (opt.optical_distance >= 0 && mate == 1) {
+    std::int16_t t = -1;
+    std::int32_t px = -1, py = -1;
+    if (!parse_read_location(name, name_len, t, px, py))
+      t = -1;
+    tile.push_back(t);
+    x.push_back(px);
+    y.push_back(py);
+  }
 }
 
 void
@@ -398,6 +472,9 @@ MateSeqs::clear() {
   umi.clear();
   umi_n.clear();
   umi_len.clear();
+  tile.clear();
+  x.clear();
+  y.clear();
   no_umi = 0;
 }
 
@@ -410,6 +487,9 @@ MateSeqs::shrink() {
   umi.shrink_to_fit();
   umi_n.shrink_to_fit();
   umi_len.shrink_to_fit();
+  tile.shrink_to_fit();
+  x.shrink_to_fit();
+  y.shrink_to_fit();
 }
 
 void
@@ -423,6 +503,9 @@ MateSeqs::append(const MateSeqs &part) {
   umi.insert(umi.end(), part.umi.begin(), part.umi.end());
   umi_n.insert(umi_n.end(), part.umi_n.begin(), part.umi_n.end());
   umi_len.insert(umi_len.end(), part.umi_len.begin(), part.umi_len.end());
+  tile.insert(tile.end(), part.tile.begin(), part.tile.end());
+  x.insert(x.end(), part.x.begin(), part.x.end());
+  y.insert(y.end(), part.y.begin(), part.y.end());
   no_umi += part.no_umi;
 }
 
@@ -474,9 +557,125 @@ MateSeqs::concat(std::vector<MateSeqs> &parts, std::size_t nthreads) {
                nthreads);
   concat_field(parts, m.umi_len,
                [](MateSeqs &p) -> auto & { return p.umi_len; }, nthreads);
+  concat_field(parts, m.tile, [](MateSeqs &p) -> auto & { return p.tile; },
+               nthreads);
+  concat_field(parts, m.x, [](MateSeqs &p) -> auto & { return p.x; },
+               nthreads);
+  concat_field(parts, m.y, [](MateSeqs &p) -> auto & { return p.y; },
+               nthreads);
   std::vector<MateSeqs>().swap(parts);
   return m;
 }
+
+namespace {
+
+// Picard's OpticalDuplicateFinder.findOpticalDuplicates applies to sets of
+// at most this many pairs
+constexpr std::size_t MAX_OPTICAL_SET = 300000;
+
+// Optical duplicates in one set (Picard's count): two members are close when
+// they share a tile and differ by at most d pixels in x and in y (x and y as
+// Picard keeps them, see below); each
+// cluster of close members (single linkage) keeps one, the others are
+// optical duplicates. Picard's keeper and its fast path for two or three
+// members flag different members but count the same.
+std::size_t
+optical_in_set(std::vector<std::array<std::int32_t, 3>> &loc, const int d) {
+  std::sort(loc.begin(), loc.end());
+  const std::size_t L = loc.size();
+  std::vector<std::uint32_t> parent(L);
+  for (std::size_t i = 0; i < L; ++i)
+    parent[i] = static_cast<std::uint32_t>(i);
+  auto find = [&](std::uint32_t a) {
+    while (parent[a] != a)
+      a = parent[a] = parent[parent[a]];
+    return a;
+  };
+  std::size_t clusters = L;
+  for (std::size_t i = 0; i < L; ++i)
+    for (std::size_t j = i + 1; j < L && loc[j][0] == loc[i][0] &&
+                                static_cast<std::int64_t>(loc[j][1]) - loc[i][1] <= d;
+         ++j) {
+      const std::int64_t dy = static_cast<std::int64_t>(loc[j][2]) - loc[i][2];
+      if (dy <= d && -dy <= d) {
+        const std::uint32_t a = find(static_cast<std::uint32_t>(i)),
+                            b = find(static_cast<std::uint32_t>(j));
+        if (a != b) {
+          parent[a] = b;
+          --clusters;
+        }
+      }
+    }
+  return L - clusters;
+}
+
+// Optical duplicates within the groups of copies. The mates of a pair are
+// in the order of the group's first pair or swapped (Picard's FR and RF
+// orientations, examined apart); a pair is swapped when its mates are
+// closer to the first pair's in the other order.
+void
+optical_duplicates(const MateSeqs &m1, const MateSeqs &m2, const bool single,
+                   const std::vector<std::uint32_t> &rep,
+                   const std::vector<std::uint32_t> &root,
+                   const std::vector<std::uint32_t> &pair_class, const int d,
+                   const std::size_t nthreads, AwareDupResult &r) {
+  const std::size_t n = m1.size(), C = rep.size();
+  r.optical = true;
+  for (std::size_t i = 0; i < n; ++i)
+    r.located += (m1.tile[i] != -1);
+  std::vector<std::uint32_t> start(C + 1, 0);
+  for (std::size_t i = 0; i < n; ++i)
+    ++start[root[pair_class[i]] + 1];
+  for (std::size_t c = 0; c < C; ++c)
+    start[c + 1] += start[c];
+  std::vector<std::uint32_t> member(n), fill(start.begin(), start.end() - 1);
+  for (std::size_t i = 0; i < n; ++i)
+    member[fill[root[pair_class[i]]]++] = static_cast<std::uint32_t>(i);
+  { std::vector<std::uint32_t>().swap(fill); }
+  const MateView v1{m1}, v2{m2};
+  std::size_t opt_total = 0, skipped = 0;
+#pragma omp parallel for num_threads(nthreads) schedule(dynamic, 256) \
+  reduction(+ : opt_total, skipped)
+  for (std::size_t g = 0; g < C; ++g) {
+    const std::size_t b = start[g], e = start[g + 1];
+    if (e - b < 2)
+      continue;
+    const std::size_t first = rep[g];
+    std::vector<std::array<std::int32_t, 3>> loc[2];
+    std::size_t size[2] = {0, 0};
+    for (std::size_t k = b; k < e; ++k) {
+      const std::size_t i = member[k];
+      int o = 0;
+      if (!single && i != first) {
+        const unsigned same =
+          mismatches(v1.w(i), v1.n(i), v1.w(first), v1.n(first), MateSeqs::W) +
+          mismatches(v2.w(i), v2.n(i), v2.w(first), v2.n(first), MateSeqs::W);
+        const unsigned swapped =
+          mismatches(v1.w(i), v1.n(i), v2.w(first), v2.n(first), MateSeqs::W) +
+          mismatches(v2.w(i), v2.n(i), v1.w(first), v1.n(first), MateSeqs::W);
+        o = swapped < same;
+      }
+      ++size[o];
+      // x and y as Picard's MarkDuplicates keeps them (ReadEnds extends
+      // PhysicalLocationShort: 16 bits, values above 32767 wrap)
+      if (m1.tile[i] != -1)
+        loc[o].push_back({m1.tile[i], static_cast<std::int16_t>(m1.x[i]),
+                          static_cast<std::int16_t>(m1.y[i])});
+    }
+    for (int o = 0; o < 2; ++o) {
+      if (size[o] > MAX_OPTICAL_SET) {
+        ++skipped;
+        continue;
+      }
+      if (loc[o].size() >= 2)
+        opt_total += optical_in_set(loc[o], d);
+    }
+  }
+  r.optical_dups = opt_total;
+  r.optical_skipped = skipped;
+}
+
+}  // namespace
 
 AwareDupResult
 aware_duplication(MateSeqs &m1, MateSeqs &m2, const AwareDupOptions &opt,
@@ -574,7 +773,8 @@ aware_duplication(MateSeqs &m1, MateSeqs &m2, const AwareDupOptions &opt,
   const std::size_t C = rep.size();
   r.exact_classes = C;
   std::vector<std::uint32_t> pair_class;
-  if (!cluster_out.empty()) {
+  const bool optical = opt.optical_distance >= 0 && m1.tile.size() == n;
+  if (!cluster_out.empty() || optical) {
     pair_class.resize(n);
 #pragma omp parallel for num_threads(nthreads) schedule(dynamic, 16)
     for (std::size_t g = 0; g < GROUPS; ++g)
@@ -745,6 +945,11 @@ aware_duplication(MateSeqs &m1, MateSeqs &m2, const AwareDupOptions &opt,
   }
 
   lap("groups");
+  if (optical) {
+    optical_duplicates(m1, m2, single, rep, root, pair_class,
+                       opt.optical_distance, nthreads, r);
+    lap("optical");
+  }
   if (!cluster_out.empty()) {
     std::ofstream o(cluster_out, std::ofstream::binary);
     for (std::size_t i = 0; i < n; ++i) {
@@ -811,5 +1016,29 @@ write_aware_section(std::ostream &os, const AwareDupResult &r,
                                    ">500", ">1k", ">5k", ">10k+"};
   for (std::size_t i = 0; i < 16; ++i)
     os << labels[i] << "\t" << r.dedup_bins[i] << "\t" << r.total_bins[i]
+       << "\n";  if (r.optical) {
+    const double u = static_cast<double>(std::max<std::size_t>(1, r.pairs));
+    const std::size_t dups = r.pairs - r.clusters;
+    os << "#Optical duplicates (Picard's rule within the groups of copies "
+          "above: same tile, at most the pixel distance apart in x and y; "
+          "one per cluster kept). Locations from the read 1 names (tile, x, "
+          "y as the last three of 5 or 7 ':' separated fields). Mate orders "
+          "examined apart (Picard's FR and RF).\n";
+    os << "Optical pixel distance\t" << opt.optical_distance << "\n";
+    os << (r.single ? "Reads" : "Pairs") << " with a location in the name\t"
+       << r.located << "\t" << 100.0 * static_cast<double>(r.located) / u
        << "\n";
+    os << "Optical duplicates\t" << r.optical_dups << "\t"
+       << 100.0 * static_cast<double>(r.optical_dups) / u << "\n";
+    os << "Optical share of the duplicates (%)\t"
+       << (dups ? 100.0 * static_cast<double>(r.optical_dups) /
+                    static_cast<double>(dups)
+                : 0.0)
+       << "\n";
+    os << "Duplicates without the optical ones\t" << dups - r.optical_dups
+       << "\t" << 100.0 * static_cast<double>(dups - r.optical_dups) / u
+       << "\n";
+    os << "Sets above 300000 (not examined, as Picard)\t"
+       << r.optical_skipped << "\n";
+  }
 }

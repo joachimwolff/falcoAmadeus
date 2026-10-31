@@ -46,6 +46,16 @@ original apart from the corrected N-content grade.
   The same options work for single-end input, where a read is the unit and
   the rate is written to `aware_duplication.txt`.
 
+- **Optical duplicates.** `--optical` counts the duplicates that are
+  copies of one cluster read twice by the camera, with Picard's rule: copies
+  on the same tile at most `--optical-distance` pixels apart (100 as Picard;
+  2500 for patterned flow cells), one per cluster of close copies kept, the
+  location from the tile:x:y of the read 1 name, the two mate orders apart,
+  x and y kept in 16 bits as Picard's MarkDuplicates does. The sets are the
+  groups of copies of the aware pass (exact, or with `--dup-mismatches` and
+  the UMI options), so no alignment is needed; where these sets equal
+  Picard's, the count equals Picard's.
+
 - **UMI quality.** With a UMI option (`--umi-r1`, `--umi-r2`,
   `--umi-in-name`) the run also writes `umi_qc.txt`: UMIs with N,
   homopolymer UMIs (poly-G from dark cycles), distinct UMIs and the share
@@ -61,8 +71,8 @@ original apart from the corrected N-content grade.
   reports, plus the share of bases with Phred quality 20 and 30 or more) and
   `falcoAmadeus_mqc.json`, which MultiQC shows as general statistics columns
   (Q30 bases, paired and aware duplication, complexity, insert size, adapter
-  read-through and dimers, screen, UMI family size and UMI space used, Q20
-  trimming).
+  read-through and dimers, screen, optical duplicates, UMI family size and
+  UMI space used, Q20 trimming).
 
 - **Acceptance rules.** `--acceptance rules.tsv` grades a sample against
   lab limits (lines `metric >= warn fail` or `metric <= warn fail`, the
@@ -365,6 +375,8 @@ FalcoAmadeus-specific options:
 | `--dup-mismatches N` | Also report a duplicate rate in which copies may differ in up to N bases (at most 8): over both mates with `--paired-with` (`paired_duplication.txt`), per read otherwise (`aware_duplication.txt`). |
 | `--umi-r1 START:LEN`, `--umi-r2 START:LEN` | The UMI lies in read 1 or read 2 at a 1-based position; pairs are copies only when their UMIs agree, and the UMI bases are left out of the sequence comparison. |
 | `--umi-in-name` | The UMI is the last `:` or `_` separated field of the read 1 name (bcl-convert, UMI-tools extract, fastp). |
+| `--optical` | Count optical duplicates (Picard's rule) within the groups of copies; reported in the aware duplication section. Needs Illumina read names (tile:x:y). |
+| `--optical-distance N` | Pixel distance for `--optical` (default 100; Picard advises 2500 for patterned flow cells). |
 | `--umi-mismatches N` | Bases in which the UMIs of two copies may differ (default 0). |
 | `--acceptance FILE` | Grade the sample against acceptance rules; writes `acceptance.txt` and an `acceptance` section of the JSON summary. |
 | `--acceptance-exit` | With `--acceptance`, exit with status 2 when a sample fails its rules. |

@@ -254,6 +254,8 @@ extra_json(std::ostringstream &o, const std::string &section,
         gs["adapter_read_through_pct"] = std::atof(f[2].c_str());
       if (k == "adapter_dimers" && f.size() >= 3)
         gs["adapter_dimer_pct"] = std::atof(f[2].c_str());
+      if (k == "optical_duplicates" && f.size() >= 3)
+        gs["optical_dup_pct"] = std::atof(f[2].c_str());
       if (section == "umi_qc" && k == "mean_family_size")
         gs["umi_mean_family_size"] = std::atof(f[1].c_str());
       if (section == "umi_qc" &&
@@ -697,6 +699,8 @@ write_json_reports(const std::string &out_dir, const std::string &prefix,
      "k-mer share of the most frequent screened reference", "%", 100},
     {"screen_no_reference_pct", "Screen none",
      "k-mer share found in no screened reference", "%", 100},
+    {"optical_dup_pct", "Optical dups",
+     "Optical duplicates (Picard's rule) of all pairs", "%", 100},
     {"umi_mean_family_size", "UMI family",
      "Mean reads per UMI family (same UMI and sequence)", "", 0},
     {"umi_space_used_pct", "UMI space",
