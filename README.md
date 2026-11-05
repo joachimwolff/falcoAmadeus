@@ -212,8 +212,9 @@ Peak resident memory for the same runs:
 | SAM      | 90&nbsp;MB | n/a*        | 224&nbsp;MB     | n/a*        | 239&nbsp;MB     |
 | BAM      | 90&nbsp;MB | 211&nbsp;MB | **169&nbsp;MB** | 216&nbsp;MB | **185&nbsp;MB** |
 
-\* falco2 reads 0 of the 163.3M records from this samtools-generated SAM
-file, so its SAM cells are not comparable. FalcoAmadeus and falco 1.3.1 both
+\* falco2 here is the development build of August 2026, which read 0 of the
+163.3M records from this samtools-generated SAM file, so its SAM cells are
+not comparable. FalcoAmadeus and falco 1.3.1 both
 process all reads.
 
 FalcoAmadeus is faster than falco2 in every valid cell while using less
@@ -242,14 +243,9 @@ $ conda install -c bioconda falcoamadeus
 The `falcoAmadeus` binary can be found inside the `bin` directory of your
 anaconda installer.
 
-> **Note:** the bioconda package is being submitted. Until it lands, build from
-> source (below). The bioconda recipe lives in [`recipe/`](recipe/); publishing
-> version 2 requires pushing a `v2` release tag to this repository, filling in
-> the tarball `sha256` in [`recipe/meta.yaml`](recipe/meta.yaml), and opening a
-> pull request against
-> [bioconda-recipes](https://github.com/bioconda/bioconda-recipes). The conda
-> build links htslib, libdeflate and ISA-L, so it ships with full performance
-> on all input formats.
+The conda build links htslib, libdeflate and ISA-L, so it ships with full
+performance on all input formats. The recipe is kept in
+[`recipe/`](recipe/).
 
 ## Installing from a source release
 

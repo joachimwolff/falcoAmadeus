@@ -1,46 +1,268 @@
+<!-- Generated from README.md by documentation/sync_from_readme.py; do not edit. -->
+
 # FalcoAmadeus: a faster, sequencing-aware falco
 
-[![GitHub Downloads](https://img.shields.io/github/downloads/joachimwolff/falcoAmadeus/total.svg?style=social&logo=github&label=Download)](https://github.com/joachimwolff/falcoAmadeus/releases/latest)
-[![DOI](https://zenodo.org/badge/214499063.svg)](https://zenodo.org/badge/latestdoi/214499063)
-[![Install on conda](https://anaconda.org/bioconda/falco/badges/platforms.svg)](https://anaconda.org/bioconda/falco)
-[![Install on conda](https://anaconda.org/bioconda/falco/badges/license.svg)](https://anaconda.org/bioconda/falco)
-[![Install on conda](https://img.shields.io/conda/dn/bioconda/falco?color=red&label=conda%20downloads&style=flat-square)](https://anaconda.org/bioconda/falco)
+**FalcoAmadeus** is a performance-focused fork of
+[falco](https://github.com/smithlabcode/falco) (itself an emulation of the
+popular [FastQC](https://www.bioinformatics.babraham.ac.uk/projects/fastqc)
+software) that checks large sequencing reads for common problems.
 
-This program is an emulation of the popular
-[FastQC](https://www.bioinformatics.babraham.ac.uk/projects/fastqc)
-software to check large sequencing reads for common problems.
+By default it produces the same output as upstream falco 1.3.2 with one
+corrected grade: Per base N content is graded as in FastQC (warn above 5 %,
+fail above 20 % N at a position), where falco 1.x never warns or fails because
+it compares a fraction with the percent limits. With
+`--legacy-n-content-grade`, a plain single-end run's `fastqc_data.txt` and
+`summary.txt` are byte-identical to those of falco 1.3.2 (checked in CI). The
+speed work never changes results. Everything else new below is **opt-in**
+behind a flag or a new mode.
+
+## Why this fork exists
+
+These optimizations were offered to upstream falco as a patch, but the
+maintainers declined to merge it. FalcoAmadeus exists to make the faster
+implementation available to users who want it, and to add the sequencing-aware
+and reporting features below, while keeping the output identical to the
+original apart from the corrected N-content grade.
+
+## What FalcoAmadeus does differently
+
+- **Paired-end analysis** (`--paired-with R2`). FastQC and falco process one
+  file at a time, so sequence duplication is assessed per mate: two fragments
+  that share only one end count as duplicates. FalcoAmadeus analyses the pair
+  together and writes **one combined HTML report** with **Combined / Forward /
+  Reverse** tabs, where *Combined* pools R1+R2 as a single dataset (GC,
+  adapters, content, quality measured over all reads at once). It first checks
+  that the mates are in matching order (identical read identifiers) and
+  rejects inputs where they are not (`--allow-unmatched-pairs` overrides).
+  `paired_duplication.txt` reports the **paired sequence duplicate rate**,
+  where a pair is a copy only when *both* mates match, counted exactly over
+  all reads and therefore independent of read order, next to the per-mate
+  rates and the FastQC-style estimates for comparison with FastQC/falco.
+  On request the report adds an **error- and UMI-aware rate**:
+  `--dup-mismatches N` lets the mates of two copies differ in up to N bases in
+  total (copies with sequencing errors), and `--umi-r1`/`--umi-r2 START:LEN`
+  or `--umi-in-name` keep pairs with different unique molecular identifiers
+  apart (`--umi-mismatches` tolerates errors in the UMI). Candidates are found
+  through k-mer blocks shared by both mates and confirmed base by base, so the
+  rate stays exact for the stated tolerance and independent of read order.
+  The same options work for single-end input, where a read is the unit and
+  the rate is written to `aware_duplication.txt`.
+
+- **Optical duplicates.** `--optical` counts the duplicates that are
+  copies of one cluster read twice by the camera, with Picard's rule: copies
+  on the same tile at most `--optical-distance` pixels apart (100 as Picard;
+  2500 for patterned flow cells), one per cluster of close copies kept, the
+  location from the tile:x:y of the read 1 name, the two mate orders apart,
+  x and y kept in 16 bits as Picard's MarkDuplicates does. The sets are the
+  groups of copies of the aware pass (exact, or with `--dup-mismatches` and
+  the UMI options), so no alignment is needed; pairs that would not align
+  (an insert under 30 bases, a mate mostly N) are left out, as Picard sees
+  aligned pairs only. Where these sets equal Picard's, the count equals
+  Picard's; on public runs see `paper/data/optical_validation`.
+
+- **UMI quality.** With a UMI option (`--umi-r1`, `--umi-r2`,
+  `--umi-in-name`) the run also writes `umi_qc.txt`: UMIs with N,
+  homopolymer UMIs (poly-G from dark cycles), distinct UMIs and the share
+  of the possible sequences in use, the most frequent UMI and the base
+  composition per UMI position; the families (groups of copies with the
+  same UMI and sequence within `--dup-mismatches` and `--umi-mismatches`)
+  with their sizes, the reads in families of 2 and 3 or more, and the
+  families per distinct UMI (high values: molecules share UMIs); and the
+  base quality of in-read UMIs (first million reads).
+
+- **Machine-readable summary.** Every run writes
+  `falcoAmadeus_summary.json` (all metrics per view and of the falcoAmadeus
+  reports, plus the share of bases with Phred quality 20 and 30 or more) and
+  `falcoAmadeus_mqc.json`, which MultiQC shows as general statistics columns
+  (Q30 bases, paired and aware duplication, complexity, insert size, adapter
+  read-through and dimers, screen, optical duplicates, UMI family size and
+  UMI space used, Q20 trimming).
+
+- **Acceptance rules.** `--acceptance rules.tsv` grades a sample against
+  lab limits (lines `metric >= warn fail` or `metric <= warn fail`, the
+  metric a path into the JSON summary such as
+  `screen.references.human.found_pct`, or a MultiQC column such as
+  `q30_bases_pct`) and writes `acceptance.txt` with each rule and an overall
+  PASS, WARN or FAIL; a metric the run did not produce counts as FAIL.
+  `--acceptance-exit` makes a failed sample end the run with status 2.
+
+- **Contamination screen.** `--screen DB` estimates which share of the
+  reads comes from each genome of a reference panel (human, mouse, rat,
+  fly, worm, yeast, Arabidopsis, E. coli, PhiX, lambda, mitochondria, rRNA,
+  mycoplasma, vectors) without alignment: canonical 31-mers selected by
+  hash (FracMinHash), low-complexity k-mers skipped on both sides, in
+  `screen.txt` (found per reference, found only there, no reference).
+  `--screen-build DB --screen-refs name=fasta,...` builds the database from
+  any FASTA files (about 40 MB and 15 s for the panel above);
+  `paper/scripts/screen_validation` lists the public references used.
+
+- **Trimming preview.** `--trim-preview` writes `trimming_preview.txt`:
+  what cutadapt's 3' quality trimming (`-q` at 10, 20 and 30) would remove
+  and how many reads would end up shorter than 20, 36 and 50 bases (the
+  same lengths as cutadapt; one section per mate for paired input), and an
+  estimate of adapter trimming with the adapter of the list found most
+  (`paper/data/trim_preview_validation`).
+
+- **Insert size and adapter read-through (paired).** From the overlap of
+  read 1 with the reverse complement of read 2 in the first million pairs,
+  `paired_insert_size.txt` gives the insert-size histogram (as fastp's
+  overlap analysis; equal histograms on the same pairs), the share of pairs
+  whose insert is shorter than a read, the adapter each read continues into
+  (named when it is a known adapter), and the adapter dimers.
+  `--insert-size-pairs N` sets the number of pairs (0: all).
+
+- **Library complexity.** From how many distinct sequences were seen once,
+  twice and so on, `paired_duplication.txt` reports how many distinct pairs
+  to expect at 2x to 100x the sequenced pairs, so a library can be judged
+  for further sequencing before alignment. The estimate is a port of the
+  `preseq lc_extrap` yield curve (quick mode) and gives the same values as
+  preseq on the same counts. `--complexity` adds it for single-end input
+  (`complexity.txt`).
+  Sequence duplication reflects PCR duplicates as well as natural redundancy
+  (deep coverage, highly expressed or enriched loci). Per-mate
+  `fastqc_data.txt` files are kept for MultiQC.
+
+- **Assay-aware QC** (`--assay <type>`). Tunes each module's pass/warn/fail
+  expectations to the library type (`rnaseq`, `amplicon`, `wgbs` bisulfite/EM,
+  `chipseq`, `atac`, `smallrna`, `wgs`, …), so genuinely expected base-content
+  patterns (e.g. the C→T depletion of bisulfite libraries) are annotated and
+  not flagged as failures.
+
+- **A beautified, interactive HTML report.** The report (now named
+  `falcoAmadeus_report.html`) has a modern, responsive design: collapsible
+  modules with plain-language explanations and FastQC documentation links, a
+  **light/dark theme toggle**, **selectable colourblind-safe colour palettes**
+  that also recolour the box plot and per-tile heatmap, readable unified
+  hover tooltips, and cleaner plots (a proper box-and-whisker per-base-quality
+  plot over pass/warn/fail zones, a padded length-distribution histogram, …).
+
+- **MultiQC-friendly.** The `fastqc_data.txt` output is ingested by MultiQC as a
+  FastQC report. `--name NAME` sets an explicit sample name (so inputs passed
+  with unhelpful names — e.g. Galaxy paired-collection elements all called
+  *forward*/*reverse* — stay distinct instead of collapsing), and
+  `--paired-data mates|combined|both` chooses whether MultiQC gets the two mates
+  separately or a single pooled sample per pair.
+
+- **Multi-threaded parsing of every input format** (`-t N`). FASTQ, gzipped
+  FASTQ, SAM and BAM all parse in parallel, and the same fast drivers serve
+  single-threaded runs too. Output is byte-identical to upstream falco at
+  every thread count.
+
+A Galaxy tool wrapper exposing these features is maintained separately as
+`tools-iuc/tools/falcoAmadeus`.
+
+## Screenshots
+
+The redesigned report, in light and dark themes:
+
+| Light | Dark |
+| :---: | :---: |
+| [![Light theme](img/report_light.png)](img/report_light.png) | [![Dark theme](img/report_dark.png)](img/report_dark.png) |
+
+Paired-end combined report (Combined / Forward / Reverse tabs, with the
+read-pair summary at the top):
+
+[![Paired-end combined report](img/report_paired.png)](img/report_paired.png)
+
+## Speed improvements
+
+FalcoAmadeus replaces falco's serial input path with parallel, format-aware
+drivers, while keeping the output byte-identical (verified against the
+upstream checksum suite and against single-threaded output at every thread
+count, for every change):
+
+- **Parallel parsing for every input format.** Uncompressed FASTQ and SAM are
+  memory-mapped and parsed in place across record-aligned byte ranges. BAM is
+  decompressed and parsed in overlapped, double-buffered chunks (BGZF blocks
+  inflate in parallel with libdeflate). Plain gzip inflates with ISA-L into
+  bounded chunks that are parsed in parallel while the next chunk
+  decompresses. Single-core runs use the same drivers, so `-t 1` is fast too.
+- **SIMD statistics kernels** (AVX-512 on x86, NEON on ARM, scalar fallback):
+  the sequence pass (separator scan, N detection, GC, per-position base
+  composition into small cache-resident accumulator tiles), the quality pass,
+  chain-free adapter window probes, and BAM's packed-base decode including
+  reverse-complement.
+- **Order-exact parallel bookkeeping.** Everything order-dependent (the
+  duplication tracker's first-100k-unique semantics, the floating-point GC
+  model, read subsampling) reproduces the serial trajectory exactly; that is
+  what keeps the output byte-identical rather than approximately equal.
+- **Bounded memory.** Inputs stream through reused chunk buffers with
+  drop-behind page management, so peak memory stays flat (roughly 35 to
+  250&nbsp;MB depending on format and thread count) no matter how large the
+  input is.
+
+### Benchmark: 163 million reads, three tools, four formats
+
+Wall time on 163,264,569 reads (SRR10315318), AMD Ryzen 9 7950X (16
+cores/32 threads), 125&nbsp;GB RAM, NVMe storage, warm page cache; medians of
+two interleaved runs (falco 1.3.1 is single-threaded and was run once per
+format):
+
+| Input | falco 1.3.1 | falco2 `-t 8` | FalcoAmadeus `-t 8` | falco2 `-t 16` | FalcoAmadeus `-t 16` |
+| ----- | ----------: | ------------: | ------------------: | -------------: | -------------------: |
+| FASTQ (38.8&nbsp;GB)    | 192.5&nbsp;s | 6.5&nbsp;s  | **5.4&nbsp;s**  | 4.2&nbsp;s  | **3.6&nbsp;s**  |
+| FASTQ.gz (4.4&nbsp;GB)  | 231.6&nbsp;s | 47.3&nbsp;s | **18.6&nbsp;s** | 45.0&nbsp;s | **17.3&nbsp;s** |
+| SAM (39.1&nbsp;GB)      | 203.7&nbsp;s | n/a*        | **5.6&nbsp;s**  | n/a*        | **5.7&nbsp;s**  |
+| BAM (4.0&nbsp;GB)       | 191.5&nbsp;s | 8.7&nbsp;s  | **7.8&nbsp;s**  | 6.8&nbsp;s  | **6.1&nbsp;s**  |
+
+Peak resident memory for the same runs:
+
+| Input | falco 1.3.1 | falco2 `-t 8` | FalcoAmadeus `-t 8` | falco2 `-t 16` | FalcoAmadeus `-t 16` |
+| ----- | ----------: | ------------: | ------------------: | -------------: | -------------------: |
+| FASTQ    | 90&nbsp;MB | 276&nbsp;MB | **205&nbsp;MB** | 290&nbsp;MB | **223&nbsp;MB** |
+| FASTQ.gz | 89&nbsp;MB | 284&nbsp;MB | **133&nbsp;MB** | 308&nbsp;MB | **147&nbsp;MB** |
+| SAM      | 90&nbsp;MB | n/a*        | 224&nbsp;MB     | n/a*        | 239&nbsp;MB     |
+| BAM      | 90&nbsp;MB | 211&nbsp;MB | **169&nbsp;MB** | 216&nbsp;MB | **185&nbsp;MB** |
+
+\* falco2 here is the development build of August 2026, which read 0 of the
+163.3M records from this samtools-generated SAM file, so its SAM cells are
+not comparable. FalcoAmadeus and falco 1.3.1 both
+process all reads.
+
+FalcoAmadeus is faster than falco2 in every valid cell while using less
+memory, and 12x (gzip) to 53x (FASTQ) faster than single-threaded falco
+1.3.1. At `-t 1` it also beats falco2's single-core runs on every format
+(measured on a 30M-read set: FASTQ 4.1&nbsp;s vs 5.7&nbsp;s, gzip 5.2&nbsp;s
+vs 9.7&nbsp;s, BAM 5.9&nbsp;s vs 7.9&nbsp;s, at 4 to 8 times less memory).
+
+[![Three-tool benchmark, 163M reads](img/benchmark_3tool_163M.png)](img/benchmark_3tool_163M.png)
+
+The binary is installed and invoked as `falcoAmadeus`. Apart from the program
+name and the added options above, all usage is identical to upstream falco.
 
 Installing FalcoAmadeus
-================
+=======================
 
 ## Installing through conda
-If you use [anaconda](https://anaconda.org) to manage your packages,
-and the `conda` binary is in your path, you can install the most
-recent release of `falcoAmadeus` by running
+
+If you use [anaconda](https://anaconda.org) to manage your packages, and the
+`conda` binary is in your path, you can install `falcoAmadeus` with
+
 ```
 $ conda install -c bioconda falcoamadeus
 ```
 
-`falcoAmadeus` can be found inside the `bin` directory of your anaconda
-installer.
+The `falcoAmadeus` binary can be found inside the `bin` directory of your
+anaconda installer.
 
-## Installing from source (code release)
+The conda build links htslib, libdeflate and ISA-L, so it ships with full
+performance on all input formats. The recipe is kept in
+[`recipe/`](https://github.com/joachimwolff/falcoAmadeus/tree/master/recipe/).
 
-Compilation from source can be done by downloading a `falcoAmadeus` release
-from the [releases](https://github.com/joachimwolff/falcoAmadeus/releases)
-section above. Upon downloading the release (in `.tar.gz` or `.zip`
-format), and inflating the downloaded file to a directory
-(e.g. `falcoAmadeus`), move to the target directory the file was inflated
-(e.g. `cd falcoAmadeus`). You should see a `configure` file in it. In this
-directory, run
+## Installing from a source release
+
+Download a release from the
+[releases](https://github.com/joachimwolff/falcoAmadeus/releases) section of
+this repository. Extract the `.tar.gz` or `.zip`, `cd` into the extracted
+directory (which contains a `configure` script), and run
 
 ```
 $ ./configure CXXFLAGS="-O3 -Wall"
 $ make all
 $ make install
 ```
-if you wish to install the falcoAmadeus binaries on a specific directory, you can use
-the `--prefix` argument when running `./configure`, for instance:
+
+To install to a specific location, pass `--prefix` to `./configure`:
 
 ```
 $ ./configure CXXFLAGS="-O3 -Wall" --prefix=/path/to/installation/directory
@@ -51,243 +273,135 @@ specified prefix.
 
 ## Installing from a cloned repository
 
-We strongly recommend using `falcoAmadeus` through stable releases as
-described above, as the latest commits might contain undocumented
-bugs. For the more advanced users who wish to test the most recent
-code, `falcoAmadeus` can be installed by first cloning the repository
+For the most recent code (which may contain undocumented bugs), clone the
+repository and generate the build system with `autoreconf`:
 
 ```
 $ git clone https://github.com/joachimwolff/falcoAmadeus.git
 $ cd falcoAmadeus
-```
-
-Once inside the generated repsotory directory, run
-```
+$ ./autogen.sh
+$ ./configure CXXFLAGS="-O3 -Wall"
 $ make all
 $ make install
 ```
 
-This should create a `bin` directory inside the cloned repository
-containing `falcoAmadeus`.
-
 ### Required C++ dependencies
 
-[zlib](https://zlib.net) is required to read gzip compressed FASTQ
-files. It is usually installed by default in most UNIX computers and
-is part of the htslib setup, but it can also be installed with
-standard package managers like apt, brew or conda.
+[zlib](https://zlib.net) is required to read gzip-compressed FASTQ files. It is
+usually installed by default on UNIX systems and is part of the htslib setup,
+but can also be installed with apt, brew or conda.
 
-On Ubuntu, zlib C++ libraries can be installed with `apt`:
+On Ubuntu:
+
 ```
 $ sudo apt install zlib1g zlib1g-dev
 ```
 
 ### Optional C++ dependencies
 
-[htslib](https://github.com/samtools/htslib) is required to process
-bam files. If not provided, bam files will be treated as unrecognized
-file formats.
+All of these are optional, detected at configure time, and fall back
+gracefully when absent -- but the first two are strongly recommended, since
+the fast parallel BAM and gzip paths depend on them:
 
-If htslib is installed, falcoAmadeus can be compiled with it by simply replacing the
-configure command above with the `--enable-hts` flag:
+- [htslib](https://github.com/samtools/htslib) is required to process BAM
+  files (without it BAM is treated as an unrecognized format). Enable with
+  `--enable-hts`.
+- [libdeflate](https://github.com/ebiggers/libdeflate) powers parallel BGZF
+  block decompression (BAM and bgzip-compressed FASTQ). Detected
+  automatically when the header and library are installed.
+- [ISA-L](https://github.com/intel/isa-l) roughly doubles plain-gzip
+  decompression speed. Detected automatically.
+- [rapidgzip](https://github.com/mxmlnkn/rapidgzip) (header-only) can
+  decompress even a single plain-gzip stream in parallel. Build with
+  `--with-rapidgzip=<checkout>/librapidarchive/src` and enable per run with
+  `FA_RAPIDGZIP=1`; worthwhile for very large plain-gzip files on machines
+  with spare cores and memory.
+
+A typical full-performance build:
 
 ```
 $ ./configure CXXFLAGS="-O3 -Wall" --enable-hts
 ```
 
-If `falcoAmadeus` was cloned from the repository, run the following commands
-to allow BAM file reading:
-
-```
-$ make HAVE_HTSLIB=1 all
-$ make HAVE_HTSLIB=1 install
-```
-
-If successfully compiled, `falcoAmadeus` can be used in BAM files the same way as it is
-used with fastq and sam files.
+with htslib, libdeflate and ISA-L installed where the compiler can find them
+(add their locations to `CPPFLAGS`/`LDFLAGS` if they live in a non-default
+prefix, e.g. a conda environment).
 
 Running FalcoAmadeus
-=============
+====================
 
-Run falcoAmadeus in with the following command, where the `example.fq` file
-provided can be replaced with the path to any FASTQ file you want to run
-`falcoAmadeus`
+Run FalcoAmadeus with the following command, where `example.fq` can be replaced
+with any FASTQ/FASTQ.gz/SAM/BAM file:
+
 ```
 $ falcoAmadeus example.fq
 ```
 
-This will generate three files in the same directory as the input fastq file:
+This generates three files in the output directory:
 
-* `fastqc_data.txt` is a text file with a summary of the QC metrics
+* `fastqc_data.txt` — a text summary of the QC metrics (ingestible by MultiQC).
+* `falcoAmadeus_report.html` — the interactive HTML report.
+* `summary.txt` — a tab-separated pass/warn/fail result for each module.
 
-* `falcoAmadeus_report.html` is the visual HTML report showing plots of the
-   QC metrics summarized in the text summary.
-
-* `summary.txt`: A tab-separated file describing whether the
-  pass/warn/fail result for each module. If multiple files are
-  provided, only one summary file is generated, with one of the
-  columns being the file name associated to each module result.
-
-The full list of arguments and options can be seen by running `falcoAmadeus`
-without any arguments, as well as `falcoAmadeus -?` or `falcoAmadeus --help`. This
-will print the following list:
+**Paired-end** (one combined report + per-mate data for MultiQC +
+`paired_duplication.txt`):
 
 ```
-Usage: falcoAmadeus [OPTIONS] <seqfile1> <seqfile2> ...
-
-Options:
-  -h, --help                Print this help file and exit  
-  -v, --version             Print the version of the program and exit  
-  -o, --outdir              Create all output files in the specified 
-                            output directory. FALCO-SPECIFIC: If the 
-                            directory does not exists, the program will 
-                            create it. If this option is not set then 
-                            the output file for each sequence file is 
-                            created in the same directory as the 
-                            sequence file which was processed.  
-      --nogroup             Disable grouping of bases for reads >50bp. 
-                            All reports will show data for every base 
-                            in the read. WARNING: When using this 
-                            option, your plots may end up a ridiculous 
-                            size. You have been warned!  
-  -f, --format              Bypasses the normal sequence file format 
-                            detection and forces the program to use the 
-                            specified format. Validformats are bam, 
-                            sam, bam_mapped, sam_mapped, fastq, fq, 
-                            fastq.gz or fq.gz.  
-  -t, --threads             [FalcoAmadeus] Number of threads. With 2 or 
-                            more, gzipped input is decompressed on a 
-                            background thread while the reads are 
-                            parsed, overlapping the two. Output is 
-                            byte-identical to single-threaded (-t 1, 
-                            the default). [1] 
-      --name                [FalcoAmadeus] Sample name to use as the 
-                            report 'Filename' (and MultiQC sample name) 
-                            instead of the input file's basename. 
-                            Useful when the input is passed with an 
-                            unhelpful name -- e.g. Galaxy paired 
-                            collections whose elements are all 
-                            literally 'forward'/'reverse' -- so each 
-                            sample stays distinct. In paired mode it 
-                            also names the per-mate output subdirs.  
-      --paired-data         [FalcoAmadeus] With --paired-with, which 
-                            fastqc_data.txt files to write for MultiQC: 
-                            'mates' (default) = separate forward + 
-                            reverse; 'combined' = a single pooled R1+R2 
-                            file only (one MultiQC sample per pair, no 
-                            separate mates); 'both' = all three. The 
-                            combined HTML report is written either way. 
-                            mates 
-  -c, --contaminants        Specifies a non-default file which contains 
-                            the list of contaminants to screen 
-                            overrepresented sequences against. The file 
-                            must contain sets of named contaminants in 
-                            the form name[tab]sequence. Lines prefixed 
-                            with a hash will be ignored. Default: 
-                            Configuration/contaminant_list.txt 
-  -a, --adapters            Specifies a non-default file which contains 
-                            the list of adapter sequences which will be 
-                            explicity searched against the library. The 
-                            file must contain sets of named adapters in 
-                            the form name[tab]sequence. Lines prefixed 
-                            with a hash will be ignored. Default: 
-                            Configuration/adapter_list.txt 
-  -l, --limits              Specifies a non-default file which contains 
-                            a set of criteria which will be used to 
-                            determine the warn/error limits for the 
-                            various modules. This file can also be used 
-                            to selectively remove some modules from the 
-                            output all together. The format needs to 
-                            mirror the default limits.txt file found in 
-                            the Configuration folder. Default: 
-                            Configuration/limits.txt 
-  -q, --quiet               Supress all progress messages on stdout and 
-                            only report errors.  
-  -s, -subsample            [Falco only] makes falco faster (but 
-                            possibly less accurate) by only processing 
-                            reads that are multiple of this value 
-                            (using 0-based indexing to number reads). 
-                            [1] 
-  -b, -bisulfite            [Falco only] reads are whole genome 
-                            bisulfite sequencing, and more Ts and fewer 
-                            Cs are therefore expected and will be 
-                            accounted for in base content.  
-      -conversion-residual  [FalcoAmadeus] For methylation assays 
-                            (--assay wgbs/emseq/rrbs): residual 
-                            unmethylated-base fraction (0-1) above 
-                            which a possible incomplete-conversion 
-                            warning is emitted. Heuristic only; the 
-                            authoritative check is the post-alignment 
-                            non-CpG conversion rate. [0.050000] 
-  -r, -reverse-complement   [Falco only] The input is a 
-                            reverse-complement. All modules will be 
-                            tested by swapping A/T and C/G  
-      --assay               [FalcoAmadeus] Assay/library-type-aware 
-                            grading. FastQC/falco grade against a 
-                            whole-genome-shotgun null and mis-flag 
-                            expected assay biology as failures; this 
-                            relaxes ONLY the affected modules per 
-                            library type (reported data are unchanged; 
-                            only pass/warn/fail plus explanatory #Assay 
-                            comments). Valid: generic, wgs, exome, 
-                            amplicon, 16s, rnaseq, smallrna, atac, 
-                            chipseq, wgbs, emseq, rrbs. Default 
-                            'generic' is byte-identical to stock falco. 
-                            wgbs/emseq/rrbs imply bisulfite handling. 
-                            generic 
-      -skip-data            [Falco only] Do not create FastQC data text 
-                            file.  
-      -skip-report          [Falco only] Do not create FastQC report 
-                            HTML file.  
-      -skip-summary         [Falco only] Do not create FastQC summary 
-                            file  
-  -D, -data-filename        [Falco only] Specify filename for FastQC 
-                            data output (TXT). If not specified, it 
-                            will be called fastq_data.txt in either the 
-                            input file's directory or the one specified 
-                            in the --output flag. Only available when 
-                            running falco with a single input.  
-  -R, -report-filename      [Falco only] Specify filename for FastQC 
-                            report output (HTML). If not specified, it 
-                            will be called falcoAmadeus_report.html in 
-                            either the input file's directory or the 
-                            one specified in the --output flag. Only 
-                            available when running falco with a single 
-                            input.  
-  -S, -summary-filename     [Falco only] Specify filename for the short 
-                            summary output (TXT). If not specified, it 
-                            will be called fastq_report.html in either 
-                            the input file's directory or the one 
-                            specified in the --output flag. Only 
-                            available when running falco with a single 
-                            input.  
-  -K, -add-call             [Falco only] add the command call call to 
-                            FastQC data output and FastQC report HTML 
-                            (this may break the parse of 
-                            fastqc_data.txt in programs that are very 
-                            strict about the FastQC output format).  
-      -allow-empty-input    [Falco only] allow empty input files and 
-                            generate empty output files without en 
-                            error state. WARNING: using this option can 
-                            mask problems in other parts of a workflow. 
-                             
-      -progress             [Falco only] Report a progress bar while 
-                            running.  
-      --paired-with         [FalcoAmadeus] Path to the mate (R2) 
-                            FASTQ/FASTQ.gz file. The primary positional 
-                            input is treated as R1 and analysed 
-                            single-end exactly as usual; ADDITIONALLY a 
-                            lockstep pass over R1+R2 writes a corrected 
-                            paired-end PCR-duplication report to 
-                            <outdir>/<prefix>paired_duplication.txt. A 
-                            pair is a duplicate only if BOTH mates 
-                            match, avoiding the overcounting of naive 
-                            single-end dedup. SAM/BAM not supported.  
-
-Help options:
-  -?, -help                 print this help message  
-      -about                print about message  
+$ falcoAmadeus R1.fastq.gz --paired-with R2.fastq.gz -o out/
 ```
+
+with copies allowed to differ in two bases, and an 8 nt UMI at the start of
+read 2 that may carry one error:
+
+```
+$ falcoAmadeus R1.fastq.gz --paired-with R2.fastq.gz --dup-mismatches 2 \
+    --umi-r2 1:8 --umi-mismatches 1 -o out/
+```
+
+**Assay-aware grading** (here for a bisulfite / EM-seq library):
+
+```
+$ falcoAmadeus reads.fastq.gz --assay wgbs -o out/
+```
+
+### Options
+
+FalcoAmadeus-specific options:
+
+| Option | Description |
+| --- | --- |
+| `--paired-with R2` | Analyse the R2 mate together with the R1 positional input; write one combined report and `paired_duplication.txt`. Rejects mates whose read identifiers disagree. |
+| `--allow-unmatched-pairs` | With `--paired-with`, proceed even when R1/R2 read identifiers disagree. |
+| `--dup-mismatches N` | Also report a duplicate rate in which copies may differ in up to N bases (at most 8): over both mates with `--paired-with` (`paired_duplication.txt`), per read otherwise (`aware_duplication.txt`). |
+| `--umi-r1 START:LEN`, `--umi-r2 START:LEN` | The UMI lies in read 1 or read 2 at a 1-based position; pairs are copies only when their UMIs agree, and the UMI bases are left out of the sequence comparison. |
+| `--umi-in-name` | The UMI is the last `:` or `_` separated field of the read 1 name (bcl-convert, UMI-tools extract, fastp). |
+| `--optical` | Count optical duplicates (Picard's rule) within the groups of copies; reported in the aware duplication section. Needs Illumina read names (tile:x:y). |
+| `--optical-distance N` | Pixel distance for `--optical` (default 100; Picard advises 2500 for patterned flow cells). |
+| `--umi-mismatches N` | Bases in which the UMIs of two copies may differ (default 0). |
+| `--acceptance FILE` | Grade the sample against acceptance rules; writes `acceptance.txt` and an `acceptance` section of the JSON summary. |
+| `--acceptance-exit` | With `--acceptance`, exit with status 2 when a sample fails its rules. |
+| `--screen DB` | Contamination screen against a database from `--screen-build`; writes `screen.txt`. |
+| `--screen-reads N` | Reads per file for `--screen` (default 1000000; 0: all). |
+| `--screen-build DB` with `--screen-refs name=file,...` | Build a screen database from FASTA files (at most 32 references), then exit. |
+| `--trim-preview` | Write `trimming_preview.txt`: bases and reads removed by 3' quality trimming at 10, 20 and 30 (as cutadapt `-q`), reads left shorter than 20, 36 and 50 bases, and an adapter-trimming estimate. FASTQ files only. |
+| `--trim-preview-reads N` | Reads per file for `--trim-preview` (default 1000000; 0: all). |
+| `--insert-size-pairs N` | With `--paired-with`, the number of pairs (from the start) whose mate overlap gives `paired_insert_size.txt` (default 1000000; 0: all). |
+| `--complexity` | Single-end: count every read's duplication key exactly and write `complexity.txt` with the expected distinct reads at 2x to 100x the sequenced reads (paired input reports it in `paired_duplication.txt` always). |
+| `--paired-data mates\|combined\|both` | With `--paired-with`, which `fastqc_data.txt` files to emit for MultiQC: separate mates (default), a single pooled sample, or both. |
+| `--assay TYPE` | Assay-aware pass/warn/fail grading (`rnaseq`, `amplicon`, `wgbs`/`emseq`/`rrbs`, `chipseq`, `atac`, `smallrna`, `wgs`, …; default `generic` is byte-identical to falco). |
+| `--conversion-residual F` | For bisulfite/EM assays, the unconverted fraction outside CpG (0–1; C among C+T followed by a base other than G in C→T reads, G among G+A preceded by a base other than C in G→A reads; each read's strand from its composition) above which a possible incomplete-conversion warning is emitted (default 0.2). |
+| `--legacy-n-content-grade` | Grade Per base N content as falco 1.x does (never warns or fails), for output byte-identical to falco 1.3.2. |
+| `--name NAME` | Sample name for the report `Filename` / MultiQC, instead of the input basename. |
+| `-t, --threads N` | Parse with N threads; works for FASTQ, gzipped FASTQ, SAM and BAM (byte-identical output at every thread count). |
+
+The FastQC-compatible options carried over from falco — `-o/--outdir`,
+`-f/--format`, `-c/--contaminants`, `-a/--adapters`, `-l/--limits`, `--nogroup`,
+`-s/-subsample`, `-b/-bisulfite`, `-r/-reverse-complement`, the `-skip-*` flags
+and `-D`/`-R`/`-S` filename overrides — are unchanged. (The FastQC dummy flags
+that falco silently ignored, such as `--casava`, `--nano`, `--extract`,
+`--java`, `--kmers`, `--dir` and `--min_length`, have been dropped.)
+
+Run `falcoAmadeus --help` for the complete list.
 
 Copyright and license
 =====================
@@ -297,7 +411,9 @@ FalcoAmadeus is a **fork** of falco.
 * The original falco code is Copyright (C) 2019–2022 Guilherme de Sena Brandine
   and Andrew D. Smith, released under the GNU General Public License. Their
   authorship of the original work is gratefully acknowledged.
-* The FalcoAmadeus fork and all modifications to it are
+* The FalcoAmadeus fork and all modifications to it — the parallel parser, the
+  paired-end analysis, assay-aware grading, the redesigned HTML report, the new
+  command-line options, and everything else added here — are
   Copyright (C) 2026 Joachim Wolff.
 
 FalcoAmadeus is free software: you can redistribute it and/or modify it under
