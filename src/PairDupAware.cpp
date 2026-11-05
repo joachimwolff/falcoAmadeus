@@ -12,7 +12,9 @@
 #include <cstdio>
 #include <fstream>
 #include <functional>
-#include <malloc.h>
+#if defined(__GLIBC__)
+#include <malloc.h>  // malloc_trim
+#endif
 #include <memory>
 #include <tuple>
 #include <utility>
@@ -584,8 +586,10 @@ concat_field(std::vector<MateSeqs> &parts, V &out, F f,
     V().swap(src);
   }
   // the parts' pages go back to the system before the next field is
-  // allocated (they are small heap blocks, which free() keeps)
+  // allocated (they are small heap blocks, which glibc's free() keeps)
+#if defined(__GLIBC__)
   malloc_trim(0);
+#endif
 }
 }  // namespace
 
