@@ -185,45 +185,47 @@ count, for every change):
   model, read subsampling) reproduces the serial trajectory exactly; that is
   what keeps the output byte-identical rather than approximately equal.
 - **Bounded memory.** Inputs stream through reused chunk buffers with
-  drop-behind page management, so peak memory stays flat (roughly 35 to
-  250&nbsp;MB depending on format and thread count) no matter how large the
-  input is.
+  drop-behind page management, so peak memory stays flat (roughly 20 to
+  200&nbsp;MB for single-end input and under 500&nbsp;MB in paired mode,
+  depending on format and thread count) no matter how large the input is.
 
-### Benchmark: 163 million reads, three tools, four formats
+### Benchmark against falco 2.0.3, falco 1.3.2 and FastQC 0.12.1
 
-Wall time on 163,264,569 reads (SRR10315318), AMD Ryzen 9 7950X (16
-cores/32 threads), 125&nbsp;GB RAM, NVMe storage, warm page cache; medians of
-two interleaved runs (falco 1.3.1 is single-threaded and was run once per
-format):
+AMD Ryzen Threadripper 7970X (32 cores, 64 threads), warm page cache, whole
+machine; medians of two (single-end) or three (paired-end) runs. falco 2.0.3
+was run with its default duplication and with `--orig-dups` (the FastQC
+estimate, as falcoAmadeus reports it); the faster of the two is shown. falco
+1.3.2 and FastQC run single-threaded. Wall time, with peak memory in
+parentheses:
 
-| Input | falco 1.3.1 | falco2 `-t 8` | FalcoAmadeus `-t 8` | falco2 `-t 16` | FalcoAmadeus `-t 16` |
-| ----- | ----------: | ------------: | ------------------: | -------------: | -------------------: |
-| FASTQ (38.8&nbsp;GB)    | 192.5&nbsp;s | 6.5&nbsp;s  | **5.4&nbsp;s**  | 4.2&nbsp;s  | **3.6&nbsp;s**  |
-| FASTQ.gz (4.4&nbsp;GB)  | 231.6&nbsp;s | 47.3&nbsp;s | **18.6&nbsp;s** | 45.0&nbsp;s | **17.3&nbsp;s** |
-| SAM (39.1&nbsp;GB)      | 203.7&nbsp;s | n/a*        | **5.6&nbsp;s**  | n/a*        | **5.7&nbsp;s**  |
-| BAM (4.0&nbsp;GB)       | 191.5&nbsp;s | 8.7&nbsp;s  | **7.8&nbsp;s**  | 6.8&nbsp;s  | **6.1&nbsp;s**  |
+**Single-end, 29.9 million reads of 1 to 76 bp (SRR14777166)**
 
-Peak resident memory for the same runs:
+| Input | FastQC `-t 1` | falco 1.3.2 | falco 2.0.3 `-t 1` | falcoAmadeus `-t 1` | falco 2.0.3 `-t 8` | falcoAmadeus `-t 8` | falco 2.0.3 `-t 32` | falcoAmadeus `-t 32` |
+| ----- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| FASTQ      | 32.6&nbsp;s | 20.4&nbsp;s | 5.70&nbsp;s (287&nbsp;MB) | **3.59&nbsp;s** (31&nbsp;MB) | 1.04&nbsp;s (299&nbsp;MB) | **0.57&nbsp;s** (95&nbsp;MB) | 0.49&nbsp;s (322&nbsp;MB) | **0.23&nbsp;s** (103&nbsp;MB) |
+| gzip FASTQ | 34.6&nbsp;s | 23.2&nbsp;s | 9.65&nbsp;s (298&nbsp;MB) | **4.35&nbsp;s** (63&nbsp;MB) | 5.28&nbsp;s (296&nbsp;MB) | **1.73&nbsp;s** (101&nbsp;MB) | 5.22&nbsp;s (311&nbsp;MB) | **1.88&nbsp;s** (100&nbsp;MB) |
+| BGZF FASTQ | 35.1&nbsp;s | 23.4&nbsp;s | 6.75&nbsp;s (229&nbsp;MB) | **4.51&nbsp;s** (65&nbsp;MB) | 1.15&nbsp;s (228&nbsp;MB) | **0.82&nbsp;s** (185&nbsp;MB) | 0.56&nbsp;s (233&nbsp;MB) | **0.42&nbsp;s** (198&nbsp;MB) |
+| SAM        | 47.1&nbsp;s | 19.6&nbsp;s | aborts* | **3.50&nbsp;s** (30&nbsp;MB) | aborts* | **0.60&nbsp;s** (94&nbsp;MB) | aborts* | **0.30&nbsp;s** (107&nbsp;MB) |
+| BAM        | 38.6&nbsp;s | 17.2&nbsp;s | 8.04&nbsp;s (229&nbsp;MB) | **5.17&nbsp;s** (17&nbsp;MB) | 1.33&nbsp;s (215&nbsp;MB) | **0.98&nbsp;s** (129&nbsp;MB) | 1.48&nbsp;s (221&nbsp;MB) | **0.84&nbsp;s** (154&nbsp;MB) |
 
-| Input | falco 1.3.1 | falco2 `-t 8` | FalcoAmadeus `-t 8` | falco2 `-t 16` | FalcoAmadeus `-t 16` |
-| ----- | ----------: | ------------: | ------------------: | -------------: | -------------------: |
-| FASTQ    | 90&nbsp;MB | 276&nbsp;MB | **205&nbsp;MB** | 290&nbsp;MB | **223&nbsp;MB** |
-| FASTQ.gz | 89&nbsp;MB | 284&nbsp;MB | **133&nbsp;MB** | 308&nbsp;MB | **147&nbsp;MB** |
-| SAM      | 90&nbsp;MB | n/a*        | 224&nbsp;MB     | n/a*        | 239&nbsp;MB     |
-| BAM      | 90&nbsp;MB | 211&nbsp;MB | **169&nbsp;MB** | 216&nbsp;MB | **185&nbsp;MB** |
+\* falco 2.0.3 aborts (exit 134) on this samtools-generated SAM file, which
+samtools reads completely; falcoAmadeus, falco 1.3.2 and FastQC process all
+reads.
 
-\* falco2 here is the development build of August 2026, which read 0 of the
-163.3M records from this samtools-generated SAM file, so its SAM cells are
-not comparable. FalcoAmadeus and falco 1.3.1 both
-process all reads.
+**Paired-end, 10 million HG002 pairs of 2 x 126 bp (SRR12898355)**,
+falcoAmadeus in its paired mode (`--paired-with`), the others on the two
+files:
 
-FalcoAmadeus is faster than falco2 in every valid cell while using less
-memory, and 12x (gzip) to 53x (FASTQ) faster than single-threaded falco
-1.3.1. At `-t 1` it also beats falco2's single-core runs on every format
-(measured on a 30M-read set: FASTQ 4.1&nbsp;s vs 5.7&nbsp;s, gzip 5.2&nbsp;s
-vs 9.7&nbsp;s, BAM 5.9&nbsp;s vs 7.9&nbsp;s, at 4 to 8 times less memory).
+| Input | FastQC `-t 1` | falco 1.3.2 | falco 2.0.3 `-t 1` | falcoAmadeus `-t 1` | falco 2.0.3 `-t 8` | falcoAmadeus `-t 8` | falco 2.0.3 `-t 32` | falcoAmadeus `-t 32` |
+| ----- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| FASTQ      | 49.2&nbsp;s | 21.7&nbsp;s | 6.55&nbsp;s (632&nbsp;MB) | **4.25&nbsp;s** (267&nbsp;MB) | 1.08&nbsp;s (566&nbsp;MB) | **0.68&nbsp;s** (314&nbsp;MB) | 0.44&nbsp;s (708&nbsp;MB) | **0.36&nbsp;s** (438&nbsp;MB) |
+| gzip FASTQ | 62.1&nbsp;s | 32.7&nbsp;s | 18.3&nbsp;s (640&nbsp;MB) | **8.91&nbsp;s** (307&nbsp;MB) | 7.21&nbsp;s (572&nbsp;MB) | **3.16&nbsp;s** (464&nbsp;MB) | 6.83&nbsp;s (716&nbsp;MB) | **3.44&nbsp;s** (469&nbsp;MB) |
 
-[![Three-tool benchmark, 163M reads](img/benchmark_3tool_163M.png)](img/benchmark_3tool_163M.png)
+falcoAmadeus is faster than falco 2.0.3 with less memory in every cell, and
+3 to 6 times faster than falco 1.3.2 on a single thread. The measurements,
+including CPU time, cold page cache and runs pinned to 8 hardware threads,
+are in [`paper/data`](paper/data/), and the figures are made by
+[`paper/scripts/make_figures.py`](paper/scripts/make_figures.py).
 
 The binary is installed and invoked as `falcoAmadeus`. Apart from the program
 name and the added options above, all usage is identical to upstream falco.
