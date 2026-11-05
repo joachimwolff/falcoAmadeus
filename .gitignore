@@ -38,3 +38,4 @@ test-suite.log
 
 # build output
 /falcoAmadeus
+!docs/requirements.txt
