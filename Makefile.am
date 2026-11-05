@@ -48,6 +48,20 @@ falcoAmadeus_SOURCES = \
 	src/FalcoConfig.cpp \
 	src/OptionParser.cpp \
 	src/smithlab_utils.cpp \
+	src/PairDupAware.cpp \
+	src/Complexity.cpp \
+	src/InsertSize.cpp \
+	src/Screen.cpp \
+	src/TrimPreview.cpp \
+	src/UmiQc.cpp \
+	src/JsonReport.cpp \
+	src/JsonReport.hpp \
+	src/Screen.hpp \
+	src/TrimPreview.hpp \
+	src/UmiQc.hpp \
+	src/InsertSize.hpp \
+	src/Complexity.hpp \
+	src/PairDupAware.hpp \
 	src/Module.hpp \
 	src/FastqStats.hpp \
 	src/HtmlMaker.hpp \

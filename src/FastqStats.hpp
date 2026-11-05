@@ -23,6 +23,12 @@
 
 #include "dup_hash_map.hpp"
 #include <array>
+#include <atomic>
+#include <mutex>
+#include <new>
+#include <cstring>
+#include <cstdlib>
+#include <type_traits>
 #include <cstdint>
 #include "FalcoConfig.hpp"
 // log of a power of two, to use in bit shifting for fast index acces
@@ -119,6 +125,75 @@ struct GCModel {
  ******************** FASTQ STATS ****************************
  *************************************************************/
 
+// [FalcoAmadeus] Allocator for zero-initialised storage from calloc: a large
+// block comes as untouched zero pages, and zero values are not written (also
+// when the vector grows and copies its elements), so only the entries that
+// receive counts occupy memory.
+template <class T>
+struct ZeroPageAlloc {
+  using value_type = T;
+  ZeroPageAlloc() = default;
+  template <class U>
+  ZeroPageAlloc(const ZeroPageAlloc<U> &) {}
+  T *allocate(std::size_t n) {
+    void *p = std::calloc(n, sizeof(T));
+    if (!p)
+      throw std::bad_alloc();
+    return static_cast<T *>(p);
+  }
+  void deallocate(T *p, std::size_t) { std::free(p); }
+  template <class U>
+  void construct(U *) noexcept {}  // calloc already zeroed it
+  template <class U, class V>
+  void construct(U *p, V &&v) {
+    if constexpr (std::is_arithmetic<U>::value) {
+      if (v != 0)  // the storage is zero already
+        *p = static_cast<U>(v);
+    }
+    else {
+      ::new (static_cast<void *>(p)) U(std::forward<V>(v));
+    }
+  }
+  template <class U>
+  bool operator==(const ZeroPageAlloc<U> &) const { return true; }
+  template <class U>
+  bool operator!=(const ZeroPageAlloc<U> &) const { return false; }
+};
+
+// [FalcoAmadeus] Fixed-size zero-initialised array in calloc'd storage.
+// Large calloc blocks come from fresh zero pages, so the parts a run never
+// writes (e.g. the per-position rows beyond the longest read) never become
+// resident; every worker thread carries one of these per large table.
+template <class T, std::size_t N>
+class ZeroedArray {
+ public:
+  ZeroedArray() : p_(static_cast<T *>(std::calloc(N, sizeof(T)))) {
+    if (p_ == nullptr)
+      throw std::bad_alloc();
+  }
+  ZeroedArray(const ZeroedArray &o) : ZeroedArray() {
+    std::memcpy(p_, o.p_, N * sizeof(T));
+  }
+  ZeroedArray &operator=(const ZeroedArray &o) {
+    if (this != &o)
+      std::memcpy(p_, o.p_, N * sizeof(T));
+    return *this;
+  }
+  ~ZeroedArray() { std::free(p_); }
+  T &operator[](std::size_t i) { return p_[i]; }
+  const T &operator[](std::size_t i) const { return p_[i]; }
+  T *data() { return p_; }
+  const T *data() const { return p_; }
+  static constexpr std::size_t size() { return N; }
+  T *begin() { return p_; }
+  T *end() { return p_ + N; }
+  const T *begin() const { return p_; }
+  const T *end() const { return p_ + N; }
+
+ private:
+  T *p_;
+};
+
 struct FastqStats {
   // number of bases for static allocation.
   static const size_t SHORT_READ_THRESHOLD = 500;
@@ -157,6 +232,11 @@ struct FastqStats {
  public:
   /*********** SINGLE NUMBERS FROM THE ENTIRE FASTQ ****************/
 
+  // [FalcoAmadeus] bases by CpG context for the bisulfite/EM conversion
+  // estimate (bisulfite/EM profiles only): C, T followed by non-G; G, A
+  // preceded by non-C (StreamReader count_conversion_context)
+  std::array<std::size_t, 4> conv_ctx{};
+
   // lowest quality char to infer encoding
   char lowest_char;
   char encoding_offset;
@@ -176,8 +256,30 @@ struct FastqStats {
   size_t num_extra_bases;  // number of bases outside of buffer
   size_t total_gc; // sum of all G+C bases in all reads
 
-  // Pre-calculated GC model increments
-  static const std::array<GCModel, SHORT_READ_THRESHOLD> gc_models;
+  // Pre-calculated GC model increments, built per read length on first use.
+  // Building all 500 lengths up front (~125k small vectors) cost ~9 ms at
+  // every program start while a file typically has one or a few lengths.
+  // Each length is built exactly once (call_once), so concurrent readers
+  // are safe; later lookups cost one acquire load (libstdc++'s call_once
+  // sets up thread-local state and calls into the library on every call,
+  // which dominated the serial GC replay of short reads).
+  class GCModelTable {
+   public:
+    const GCModel &operator[](size_t len) const {
+      if (!ready_[len].load(std::memory_order_acquire))
+        std::call_once(flags_[len], [this, len] {
+          models_[len] = GCModel(static_cast<int>(len));
+          ready_[len].store(true, std::memory_order_release);
+        });
+      return models_[len];
+    }
+
+   private:
+    mutable std::array<std::once_flag, SHORT_READ_THRESHOLD> flags_;
+    mutable std::array<std::atomic<bool>, SHORT_READ_THRESHOLD> ready_{};
+    mutable std::array<GCModel, SHORT_READ_THRESHOLD> models_;
+  };
+  static const GCModelTable gc_models;
 
   /*********************************************************
    *********** METRICS COLLECTED DURING IO *****************
@@ -218,7 +320,7 @@ struct FastqStats {
 
   /*********** PER QUALITY VALUE METRICS ****************/
   // Counts of quality in each base position
-  std::array<size_t, kNumQualityValues * SHORT_READ_THRESHOLD> position_quality_count;
+  ZeroedArray<size_t, kNumQualityValues * SHORT_READ_THRESHOLD> position_quality_count;
 
   // [FalcoAmadeus] Transposed per-base quality tile [quality*THRESHOLD + pos].
   // The straight `++position_quality_count[(pos << 7) | qv]` scatter walks a
@@ -238,10 +340,18 @@ struct FastqStats {
   // position_quality_count writers (none remain in-buffer today) with tile
   // writers would also be safe -- addition commutes -- as long as the tile is
   // fully flushed before any read.
-  std::array<std::uint16_t, kNumQualityValues * SHORT_READ_THRESHOLD> qual_tile;
+  ZeroedArray<std::uint16_t, kNumQualityValues * SHORT_READ_THRESHOLD> qual_tile;
   std::uint32_t qual_tile_reads;  // reads accumulated since the last flush
+  // The same for the positions past SHORT_READ_THRESHOLD of long reads
+  // (position-major, kNumQualityValues counters per position, grown with
+  // allocate_new_base): the full long table is 1 KB per position, so with
+  // many threads its rows no longer fit in the cache.
+  std::vector<std::uint16_t> long_qual_tile;
+  std::uint32_t long_qtile_reads = 0;  // long reads since the last flush
   static const std::uint32_t kQualTileFlushReads = 60000;
-  void flush_qtile();  // fold qual_tile into position_quality_count
+  // fold qual_tile into position_quality_count (and, with_long, the long
+  // tile into long_position_quality_count)
+  void flush_qtile(bool with_long = true);
 
   // Counts of average quality (truncated) per sequence
   std::array<size_t, kNumQualityValues> quality_count;
@@ -258,24 +368,32 @@ struct FastqStats {
   /*********** PER TILE SEQUENCE QUALITY OVERSERQUENCES ********/
   std::unordered_map <size_t, std::vector<double> > tile_position_quality;
   std::unordered_map <size_t, std::vector<size_t> > tile_position_count;
+  // [FalcoAmadeus] tile numbers too large for the parallel drivers' 32-bit
+  // tile records (see encode_tile in StreamReader.cpp)
+  std::vector<size_t> big_tiles;
 
   /*********** SLOW DATA STRUCTURES FOR LONGER READS ************/
   // Leftover memory using dynamic allocation
   std::vector<size_t> long_base_count;
   std::vector<size_t> long_n_base_count;
-  std::vector<size_t> long_position_quality_count;
+  std::vector<size_t, ZeroPageAlloc<size_t>> long_position_quality_count;
   std::vector<size_t> long_read_length_freq;
   std::vector<size_t> long_cumulative_read_length_freq;
 
   /********** KMER FREQUENCY ****************/
-  // A (4^K + 1)*SHORT_READ_THRESHOLD std::vector to count all possible kmers
-  std::vector<size_t> kmer_count;
+  // Zero-initialised storage from calloc: a large table comes as untouched
+  // zero pages, so only the rows (read positions) that receive counts occupy
+  // memory, instead of every worker thread writing the whole table.
+  // A (4^K + 1)*SHORT_READ_THRESHOLD table to count all possible kmers
+  std::vector<size_t, ZeroPageAlloc<size_t>> kmer_count;
 
   // How many kmers were counted in each position
   std::array<size_t, SHORT_READ_THRESHOLD> pos_kmer_count;
 
   // How many adapters were counted in each position
-  std::array<size_t, Constants::max_adapters * SHORT_READ_THRESHOLD> pos_adapter_count;
+  // (calloc'd: 512 KB of which only the rows of the configured adapters and
+  // the read positions in use are touched)
+  ZeroedArray<size_t, Constants::max_adapters * SHORT_READ_THRESHOLD> pos_adapter_count;
 
   /*********** DUPLICATION ******************/
   // First 100k unique sequences and how often they were seen. Open-addressing

@@ -1,0 +1,1315 @@
+/* [FalcoAmadeus] Error- and UMI-aware paired duplication; see
+ * PairDupAware.hpp for the definition.
+ */
+#include "PairDupAware.hpp"
+
+#include "FalcoConfig.hpp"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <cstdio>
+#include <fstream>
+#include <functional>
+#if defined(__GLIBC__)
+#include <malloc.h>  // malloc_trim
+#endif
+#include <memory>
+#include <tuple>
+#include <utility>
+#include <stdexcept>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+namespace {
+
+constexpr std::uint64_t LOW_BITS = 0x5555555555555555ULL;
+constexpr std::uint8_t NO_UMI = 0xff;
+constexpr std::size_t MAX_UMI = 32;
+// MateSeqs::no_align: an adapter position before base 30, NO_ADAPTER for
+// none, with UNALIGNED set for a read that does not align by itself
+constexpr std::uint8_t NO_ADAPTER = 0x7f;
+constexpr std::uint8_t UNALIGNED = 0x80;
+// mates whose key is shorter than this many bases per block are compared
+// exactly: shorter blocks would put most reads of that length into one group
+constexpr unsigned MIN_BLOCK = 4;
+// groups of more classes than this sharing the blocks of a pass are split
+// further before classes are compared (see refine in aware_duplication);
+// FA_REFINE_MIN overrides it (tests force deep splitting with small values)
+std::size_t
+refine_min() {
+  static const std::size_t v = [] {
+    const char *e = std::getenv("FA_REFINE_MIN");
+    return e ? static_cast<std::size_t>(std::strtoull(e, nullptr, 10))
+             : std::size_t(64);
+  }();
+  return v;
+}
+
+inline std::uint64_t
+mix64(std::uint64_t x) {  // splitmix64 finalizer
+  x ^= x >> 30;
+  x *= 0xbf58476d1ce4e5b9ULL;
+  x ^= x >> 27;
+  x *= 0x94d049bb133111ebULL;
+  x ^= x >> 31;
+  return x;
+}
+
+// same construction as the exact paired key: independent of the mate order
+inline std::uint64_t
+unordered_key(const std::uint64_t a, const std::uint64_t b) {
+  const std::uint64_t lo = a < b ? a : b, hi = a < b ? b : a;
+  return mix64(lo * 0x9e3779b97f4a7c15ULL ^ mix64(hi + 0x632be59bd9b4e019ULL));
+}
+
+// two-bit code of a base; N and any other character return 4
+inline unsigned
+base_code(const char c) {
+  switch (c) {
+  case 'A': case 'a': return 0;
+  case 'C': case 'c': return 1;
+  case 'G': case 'g': return 2;
+  case 'T': case 't': return 3;
+  default: return 4;
+  }
+}
+
+// Packs n bases (n <= 32 * nw) two bits each; N is stored as 0 and marked in
+// `nmask` at the low bit of its slot. Returns whether any N was seen.
+bool
+pack(const char *s, const std::size_t n, std::uint64_t *w, std::uint64_t *nmask,
+     const std::size_t nw) {
+  std::fill(w, w + nw, 0);
+  std::fill(nmask, nmask + nw, 0);
+  bool any_n = false;
+  for (std::size_t p = 0; p < n; ++p) {
+    const unsigned c = base_code(s[p]);
+    const unsigned sh = 2 * (p % 32);
+    if (c == 4) {
+      nmask[p / 32] |= std::uint64_t(1) << sh;
+      any_n = true;
+    }
+    else
+      w[p / 32] |= std::uint64_t(c) << sh;
+  }
+  return any_n;
+}
+
+// Number of positions that differ: bases differ, or exactly one is N.
+inline unsigned
+mismatches(const std::uint64_t *x, const std::uint64_t *nx,
+           const std::uint64_t *y, const std::uint64_t *ny,
+           const std::size_t nw) {
+  unsigned s = 0;
+  for (std::size_t i = 0; i < nw; ++i) {
+    std::uint64_t d = x[i] ^ y[i];
+    d = (d | (d >> 1)) & LOW_BITS;
+    d = (d | nx[i] | ny[i]) & ~(nx[i] & ny[i]);
+    s += static_cast<unsigned>(__builtin_popcountll(d));
+  }
+  return s;
+}
+
+// The UMI in a read name: the last ':' or '_' separated field of the name
+// (up to the first whitespace, without a /1, /2, .1 or .2 mate suffix),
+// when it consists of bases (separators '+' and '-' of dual UMIs are
+// dropped). Returns false when the name carries none.
+bool
+umi_from_name(const char *h, const std::size_t hlen, std::string &out) {
+  std::size_t b = (hlen > 0 && h[0] == '@') ? 1 : 0, e = b;
+  while (e < hlen && h[e] != ' ' && h[e] != '\t' && h[e] != '\r' &&
+         h[e] != '\n')
+    ++e;
+  if (e - b >= 2 && (h[e - 2] == '/' || h[e - 2] == '.') &&
+      (h[e - 1] == '1' || h[e - 1] == '2'))
+    e -= 2;
+  std::size_t f = e;
+  while (f > b && h[f - 1] != ':' && h[f - 1] != '_')
+    --f;
+  if (f == b)
+    return false;  // no separator: the whole name is not a UMI
+  out.clear();
+  for (std::size_t i = f; i < e; ++i) {
+    const char c = h[i];
+    if (c == '+' || c == '-')
+      continue;
+    if (base_code(c) == 4 && c != 'N' && c != 'n')
+      return false;
+    out.push_back(c);
+  }
+  return !out.empty();
+}
+
+std::size_t
+dup_slot(const std::size_t copies) {
+  if (copies >= 10000) return 15;
+  if (copies >= 5000) return 14;
+  if (copies >= 1000) return 13;
+  if (copies >= 500) return 12;
+  if (copies >= 100) return 11;
+  if (copies >= 50) return 10;
+  if (copies >= 10) return 9;
+  return copies - 1;
+}
+
+// Allocator that leaves elements uninitialised: the large entry arrays are
+// first written by the threads that fill them, in parallel.
+template <class T>
+struct NoInit : std::allocator<T> {
+  template <class U>
+  struct rebind {
+    using other = NoInit<U>;
+  };
+  NoInit() = default;
+  template <class U>
+  NoInit(const NoInit<U> &) {}
+  template <class U>
+  void construct(U *p) noexcept {
+    ::new (static_cast<void *>(p)) U;
+  }
+  template <class U, class... Args>
+  void construct(U *p, Args &&...args) {
+    ::new (static_cast<void *>(p)) U(std::forward<Args>(args)...);
+  }
+};
+
+// Entries generated per item, grouped by the top bits of their key and
+// sorted within each group. `emit(i, sink)` calls sink(entry) for the
+// entries of item i; `top(entry)` returns the group (< 1 << GROUP_BITS).
+// Generating twice (count, then fill) avoids a second copy of the entries.
+constexpr unsigned GROUP_BITS = 12;
+constexpr std::size_t GROUPS = std::size_t(1) << GROUP_BITS;
+
+template <class T, class Emit, class Top>
+void
+generate_grouped(const std::size_t n, const std::size_t nthreads, Emit emit,
+                 Top top, std::vector<T, NoInit<T>> &out,
+                 std::vector<std::size_t> &gstart) {
+  std::vector<std::size_t> hist(nthreads * GROUPS, 0);
+#pragma omp parallel for num_threads(nthreads) schedule(static)
+  for (std::size_t t = 0; t < nthreads; ++t) {
+    std::size_t *h = &hist[t * GROUPS];
+    for (std::size_t i = n * t / nthreads; i < n * (t + 1) / nthreads; ++i)
+      emit(i, [&](const T &x) { ++h[top(x)]; });
+  }
+  gstart.assign(GROUPS + 1, 0);
+  std::vector<std::size_t> pos(nthreads * GROUPS);
+  std::size_t acc = 0;
+  for (std::size_t g = 0; g < GROUPS; ++g) {
+    gstart[g] = acc;
+    for (std::size_t t = 0; t < nthreads; ++t) {
+      pos[t * GROUPS + g] = acc;
+      acc += hist[t * GROUPS + g];
+    }
+  }
+  gstart[GROUPS] = acc;
+  out.resize(acc);  // reused across calls
+#pragma omp parallel for num_threads(nthreads) schedule(static)
+  for (std::size_t t = 0; t < nthreads; ++t) {
+    std::size_t *p = &pos[t * GROUPS];
+    for (std::size_t i = n * t / nthreads; i < n * (t + 1) / nthreads; ++i)
+      emit(i, [&](const T &x) { out[p[top(x)]++] = x; });
+  }
+#pragma omp parallel for num_threads(nthreads) schedule(dynamic, 16)
+  for (std::size_t g = 0; g < GROUPS; ++g)
+    std::sort(out.begin() + gstart[g], out.begin() + gstart[g + 1]);
+}
+
+// Union-find over the classes; a root is the smallest class of its group,
+// so the groups do not depend on the order in which links are found.
+class Groups {
+ public:
+  explicit Groups(const std::size_t n) : p_(n) {
+    for (std::size_t i = 0; i < n; ++i)
+      p_[i].store(static_cast<std::uint32_t>(i), std::memory_order_relaxed);
+  }
+  std::uint32_t find(std::uint32_t x) {
+    for (;;) {
+      const std::uint32_t px = p_[x].load(std::memory_order_relaxed);
+      if (px == x)
+        return x;
+      const std::uint32_t ppx = p_[px].load(std::memory_order_relaxed);
+      if (ppx != px) {  // path halving
+        std::uint32_t expect = px;
+        p_[x].compare_exchange_weak(expect, ppx, std::memory_order_relaxed);
+      }
+      x = ppx;
+    }
+  }
+  void unite(std::uint32_t a, std::uint32_t b) {
+    for (;;) {
+      a = find(a);
+      b = find(b);
+      if (a == b)
+        return;
+      if (a < b)
+        std::swap(a, b);  // link the larger root below the smaller
+      std::uint32_t expect = a;
+      if (p_[a].compare_exchange_strong(expect, b, std::memory_order_relaxed))
+        return;
+    }
+  }
+
+ private:
+  std::vector<std::atomic<std::uint32_t>> p_;
+};
+
+// Read access to one mate of the representative pairs.
+struct MateView {
+  const MateSeqs &m;
+  const std::uint64_t *w(const std::size_t i) const {
+    return &m.bases[i * MateSeqs::W];
+  }
+  unsigned length(const std::size_t i) const { return m.len[i] & 0x7f; }
+  // N mask of read i (zeros when the key has no N)
+  const std::uint64_t *n(const std::size_t i) const {
+    static const std::uint64_t zero[MateSeqs::W] = {0, 0, 0};
+    if (!(m.len[i] & 0x80))
+      return zero;
+    const auto it = std::lower_bound(m.n_idx.begin(), m.n_idx.end(), i);
+    return m.n_mask[it - m.n_idx.begin()].data();
+  }
+};
+
+// Hash of block k of nb of a mate key of length L, with an optional UMI
+// hash mixed in.
+inline std::uint64_t
+block_hash(const std::uint64_t *w, const std::uint64_t *nm, const unsigned L,
+           const unsigned k, const unsigned nb, const std::uint64_t salt) {
+  const unsigned lo = k * L / nb, hi = (k + 1) * L / nb;
+  std::uint64_t h = mix64((std::uint64_t(L) << 16 | (k << 8) | nb) ^ salt);
+  for (unsigned wi = lo / 32; wi * 32 < hi; ++wi) {
+    const unsigned a = std::max(lo, wi * 32) - wi * 32;
+    const unsigned b = std::min(hi, wi * 32 + 32) - wi * 32;
+    const std::uint64_t m =
+      (b - a == 32 ? ~std::uint64_t(0)
+                   : ((std::uint64_t(1) << (2 * (b - a))) - 1))
+      << (2 * a);
+    h = mix64(h ^ (w[wi] & m));
+    h = mix64(h ^ ((nm[wi] & m) * 0x9e3779b97f4a7c15ULL));
+  }
+  return h;
+}
+
+inline std::uint64_t
+umi_hash(const MateSeqs &m, const std::size_t i) {
+  return mix64(m.umi[i] ^ mix64(m.umi_n[i] + 0x2545f4914f6cdd1dULL) ^
+               (std::uint64_t(m.umi_len[i]) << 56));
+}
+
+inline bool
+umi_close(const MateSeqs &x, const std::size_t i, const MateSeqs &y,
+          const std::size_t j, unsigned &budget) {
+  if (x.umi_len[i] != y.umi_len[j])
+    return false;
+  if (x.umi_len[i] == 0 || x.umi_len[i] == NO_UMI)
+    return true;
+  const unsigned d =
+    mismatches(&x.umi[i], &x.umi_n[i], &y.umi[j], &y.umi_n[j], 1);
+  if (d > budget)
+    return false;
+  budget -= d;
+  return true;
+}
+
+}  // namespace
+
+namespace {
+
+// Picard (htsjdk) rapidParseInt: an optional '-', then digits up to the
+// first non-digit; at least one digit. Overflow wraps as Java's int does.
+bool
+rapid_parse_int(const char *s, const int from, const int to, std::int32_t &out) {
+  int i = from;
+  bool neg = false;
+  if (i < to && s[i] == '-') {
+    ++i;
+    neg = true;
+  }
+  std::uint32_t v = 0;
+  bool has = false;
+  for (; i < to; ++i) {
+    const char c = s[i];
+    if (c < '0' || c > '9')
+      break;
+    v = v * 10u + static_cast<std::uint32_t>(c - '0');
+    has = true;
+  }
+  if (!has)
+    return false;
+  out = static_cast<std::int32_t>(neg ? 0u - v : v);
+  return true;
+}
+
+}  // namespace
+
+bool
+parse_read_location(const char *name, std::size_t len, std::int16_t &tile,
+                    std::int32_t &x, std::int32_t &y) {
+  if (len > 0 && name[0] == '@') {
+    ++name;
+    --len;
+  }
+  std::size_t e = 0;
+  while (e < len && name[e] != ' ' && name[e] != '\t' && name[e] != '\r' &&
+         name[e] != '\n')
+    ++e;
+  // ReadNameParser.getLastThreeFields(name, ':', tokens)
+  const int n = static_cast<int>(e);
+  std::int32_t tok[3];
+  int idx = 2, fields = 0, end = n, i;
+  for (i = n - 1; 0 <= i && 0 <= idx; --i) {
+    if (name[i] == ':' || i == 0) {
+      ++fields;
+      const int from = (i == 0) ? 0 : i + 1;
+      if (!rapid_parse_int(name, from, end, tok[idx]))
+        return false;
+      --idx;
+      end = i;
+    }
+  }
+  for (; 0 <= i; --i)
+    if (name[i] == ':' || i == 0)
+      ++fields;
+  if (fields != 5 && fields != 7)
+    return false;
+  tile = static_cast<std::int16_t>(tok[0]);
+  x = tok[1];
+  y = tok[2];
+  return true;
+}
+
+void
+parse_umi_region(const std::string &arg, std::size_t &start,
+                 std::size_t &len) {
+  const std::size_t c = arg.find(':');
+  std::size_t s = 0, l = 0;
+  try {
+    if (c == std::string::npos)
+      throw std::invalid_argument(arg);
+    std::size_t used = 0;
+    s = std::stoul(arg.substr(0, c), &used);
+    if (used != c)
+      throw std::invalid_argument(arg);
+    l = std::stoul(arg.substr(c + 1), &used);
+    if (used != arg.size() - c - 1)
+      throw std::invalid_argument(arg);
+  }
+  catch (const std::logic_error &) {
+    throw std::runtime_error("UMI region must be START:LENGTH with a 1-based "
+                             "start, e.g. 1:8; got '" + arg + "'");
+  }
+  if (s < 1 || l < 1 || l > MAX_UMI)
+    throw std::runtime_error("UMI region '" + arg + "': the start must be at "
+                             "least 1 and the length between 1 and " +
+                             std::to_string(MAX_UMI));
+  start = s - 1;
+  len = l;
+}
+
+void
+MateSeqs::add(const char *name, const std::size_t name_len, const char *seq,
+              const std::size_t seq_len, const AwareDupOptions &opt,
+              const int mate) {
+  const std::size_t idx = len.size();
+  const std::size_t us = mate == 1 ? opt.umi1_start : opt.umi2_start;
+  const std::size_t ul = mate == 1 ? opt.umi1_len : opt.umi2_len;
+  // the read without its UMI, then the FastQC duplication key of the rest
+  char key[Constants::unique_reads_max_length];
+  std::size_t rest = seq_len, ub = 0, ue = 0;
+  if (ul > 0) {
+    ub = std::min(us, seq_len);
+    ue = std::min(us + ul, seq_len);
+    rest = seq_len - (ue - ub);
+  }
+  const std::size_t kl = rest <= Constants::unique_reads_max_length
+                           ? rest
+                           : Constants::unique_reads_truncate;
+  const char *kp = seq;
+  if (ul > 0 && ub < kl) {  // the UMI lies within the key: cut it out
+    std::size_t o = 0;
+    for (std::size_t p = 0; p < seq_len && o < kl; ++p)
+      if (p < ub || p >= ue)
+        key[o++] = seq[p];
+    kp = key;
+  }
+  std::uint64_t w[W], nm[W];
+  const bool any_n = pack(kp, kl, w, nm, W);
+  bases.insert(bases.end(), w, w + W);
+  len.push_back(static_cast<std::uint8_t>(kl | (any_n ? 0x80 : 0)));
+  if (any_n) {
+    n_idx.push_back(idx);
+    n_mask.push_back({nm[0], nm[1], nm[2]});
+  }
+  // the UMI of this mate: in the read, or (read 1 only) in the name
+  if (opt.has_umi()) {
+    std::uint64_t u = 0, un = 0;
+    std::uint8_t ulen = 0;
+    if (ul > 0) {
+      ulen = static_cast<std::uint8_t>(ue - ub);
+      pack(seq + ub, ue - ub, &u, &un, 1);
+    }
+    else if (opt.umi_in_name && mate == 1) {
+      std::string s;
+      if (umi_from_name(name, name_len, s)) {
+        if (s.size() > MAX_UMI)
+          throw std::runtime_error(
+            "UMI in read name longer than " + std::to_string(MAX_UMI) +
+            " bases: " + std::string(name, name_len));
+        ulen = static_cast<std::uint8_t>(s.size());
+        pack(s.data(), s.size(), &u, &un, 1);
+      }
+      else {
+        ulen = NO_UMI;
+        ++no_umi;
+      }
+    }
+    umi.push_back(u);
+    umi_n.push_back(un);
+    umi_len.push_back(ulen);
+  }
+  if (opt.optical_distance >= 0) {
+    // whether the read would align (bwa mem reports alignments of score 30
+    // or more, so at least 30 matching bases): the position of an adapter
+    // before base 30 (its first 12 bases, at most one mismatch; position 0
+    // also for a read beginning with the adapter's bases 2 to 4 onwards, an
+    // adapter dimer), and whether the read is shorter than 30 bases or its
+    // key mostly N (see no_align)
+    constexpr std::size_t kMinAligned = 30;
+    std::uint8_t code = NO_ADAPTER;
+    for (const std::string &ad : opt.adapters) {
+      for (std::size_t k = 1; k <= 3 && code != 0; ++k) {
+        const std::size_t m = ad.size() - k;
+        if (m < 9 || seq_len < m)
+          continue;
+        unsigned mm = 0;
+        for (std::size_t j = 0; j < m && mm <= 1; ++j)
+          mm += (seq[j] != ad[k + j]);
+        if (mm <= 1)
+          code = 0;
+      }
+      for (std::size_t p = 0; p < std::min<std::size_t>(code, kMinAligned) &&
+                              p + ad.size() <= seq_len;
+           ++p) {
+        unsigned mm = 0;
+        for (std::size_t j = 0; j < ad.size() && mm <= 1; ++j)
+          mm += (seq[p + j] != ad[j]);
+        if (mm <= 1)
+          code = static_cast<std::uint8_t>(p);
+      }
+    }
+    std::size_t nn = 0;
+    for (std::size_t j = 0; j < kl; ++j)
+      nn += (base_code(kp[j]) == 4);
+    if (seq_len < kMinAligned || 2 * nn > kl)
+      code |= UNALIGNED;
+    no_align.push_back(code);
+  }
+  if (opt.optical_distance >= 0 && mate == 1) {
+    std::int16_t t = -1;
+    std::int32_t px = -1, py = -1;
+    if (!parse_read_location(name, name_len, t, px, py))
+      t = -1;
+    tile.push_back(t);
+    x.push_back(px);
+    y.push_back(py);
+  }
+}
+
+void
+MateSeqs::clear() {
+  bases.clear();
+  len.clear();
+  n_idx.clear();
+  n_mask.clear();
+  umi.clear();
+  umi_n.clear();
+  umi_len.clear();
+  tile.clear();
+  x.clear();
+  y.clear();
+  no_align.clear();
+  no_umi = 0;
+}
+
+void
+MateSeqs::shrink() {
+  bases.shrink_to_fit();
+  len.shrink_to_fit();
+  n_idx.shrink_to_fit();
+  n_mask.shrink_to_fit();
+  umi.shrink_to_fit();
+  umi_n.shrink_to_fit();
+  umi_len.shrink_to_fit();
+  tile.shrink_to_fit();
+  x.shrink_to_fit();
+  y.shrink_to_fit();
+  no_align.shrink_to_fit();
+}
+
+void
+MateSeqs::append(const MateSeqs &part) {
+  const std::size_t off = size();
+  bases.insert(bases.end(), part.bases.begin(), part.bases.end());
+  len.insert(len.end(), part.len.begin(), part.len.end());
+  for (const std::uint64_t i : part.n_idx)
+    n_idx.push_back(off + i);
+  n_mask.insert(n_mask.end(), part.n_mask.begin(), part.n_mask.end());
+  umi.insert(umi.end(), part.umi.begin(), part.umi.end());
+  umi_n.insert(umi_n.end(), part.umi_n.begin(), part.umi_n.end());
+  umi_len.insert(umi_len.end(), part.umi_len.begin(), part.umi_len.end());
+  tile.insert(tile.end(), part.tile.begin(), part.tile.end());
+  x.insert(x.end(), part.x.begin(), part.x.end());
+  y.insert(y.end(), part.y.begin(), part.y.end());
+  no_align.insert(no_align.end(), part.no_align.begin(), part.no_align.end());
+  no_umi += part.no_umi;
+}
+
+namespace {
+// concatenates field `f` of the parts into out.f, then releases it
+template <class V, class F>
+void
+concat_field(std::vector<MateSeqs> &parts, V &out, F f,
+             const std::size_t nthreads) {
+  std::vector<std::size_t> off(parts.size() + 1, 0);
+  for (std::size_t i = 0; i < parts.size(); ++i)
+    off[i + 1] = off[i] + f(parts[i]).size();
+  out.resize(off.back());
+#pragma omp parallel for num_threads(nthreads) schedule(dynamic, 4)
+  for (std::size_t i = 0; i < parts.size(); ++i) {
+    V &src = f(parts[i]);
+    std::copy(src.begin(), src.end(), out.begin() + off[i]);
+    V().swap(src);
+  }
+  // the parts' pages go back to the system before the next field is
+  // allocated (they are small heap blocks, which glibc's free() keeps)
+#if defined(__GLIBC__)
+  malloc_trim(0);
+#endif
+}
+}  // namespace
+
+MateSeqs
+MateSeqs::concat(std::vector<MateSeqs> &parts, std::size_t nthreads) {
+  nthreads = std::max<std::size_t>(1, nthreads);
+  MateSeqs m;
+  // N records carry the read index within their part
+  std::size_t off = 0;
+  for (MateSeqs &p : parts) {
+    for (std::uint64_t &i : p.n_idx)
+      i += off;
+    off += p.size();
+    m.no_umi += p.no_umi;
+  }
+  concat_field(parts, m.bases, [](MateSeqs &p) -> auto & { return p.bases; },
+               nthreads);
+  concat_field(parts, m.len, [](MateSeqs &p) -> auto & { return p.len; },
+               nthreads);
+  concat_field(parts, m.n_idx, [](MateSeqs &p) -> auto & { return p.n_idx; },
+               nthreads);
+  concat_field(parts, m.n_mask,
+               [](MateSeqs &p) -> auto & { return p.n_mask; }, nthreads);
+  concat_field(parts, m.umi, [](MateSeqs &p) -> auto & { return p.umi; },
+               nthreads);
+  concat_field(parts, m.umi_n, [](MateSeqs &p) -> auto & { return p.umi_n; },
+               nthreads);
+  concat_field(parts, m.umi_len,
+               [](MateSeqs &p) -> auto & { return p.umi_len; }, nthreads);
+  concat_field(parts, m.tile, [](MateSeqs &p) -> auto & { return p.tile; },
+               nthreads);
+  concat_field(parts, m.x, [](MateSeqs &p) -> auto & { return p.x; },
+               nthreads);
+  concat_field(parts, m.y, [](MateSeqs &p) -> auto & { return p.y; },
+               nthreads);
+  concat_field(parts, m.no_align,
+               [](MateSeqs &p) -> auto & { return p.no_align; }, nthreads);
+  std::vector<MateSeqs>().swap(parts);
+  return m;
+}
+
+namespace {
+
+// Picard's OpticalDuplicateFinder.findOpticalDuplicates applies to sets of
+// at most this many pairs
+constexpr std::size_t MAX_OPTICAL_SET = 300000;
+
+// Optical duplicates in one set (Picard's count): two members are close when
+// they share a tile and differ by at most d pixels in x and in y (x and y as
+// Picard keeps them, see below); each
+// cluster of close members (single linkage) keeps one, the others are
+// optical duplicates. Picard's keeper and its fast path for two or three
+// members flag different members but count the same.
+std::size_t
+optical_in_set(std::vector<std::array<std::int32_t, 3>> &loc, const int d) {
+  std::sort(loc.begin(), loc.end());
+  const std::size_t L = loc.size();
+  std::vector<std::uint32_t> parent(L);
+  for (std::size_t i = 0; i < L; ++i)
+    parent[i] = static_cast<std::uint32_t>(i);
+  auto find = [&](std::uint32_t a) {
+    while (parent[a] != a)
+      a = parent[a] = parent[parent[a]];
+    return a;
+  };
+  std::size_t clusters = L;
+  for (std::size_t i = 0; i < L; ++i)
+    for (std::size_t j = i + 1; j < L && loc[j][0] == loc[i][0] &&
+                                static_cast<std::int64_t>(loc[j][1]) - loc[i][1] <= d;
+         ++j) {
+      const std::int64_t dy = static_cast<std::int64_t>(loc[j][2]) - loc[i][2];
+      if (dy <= d && -dy <= d) {
+        const std::uint32_t a = find(static_cast<std::uint32_t>(i)),
+                            b = find(static_cast<std::uint32_t>(j));
+        if (a != b) {
+          parent[a] = b;
+          --clusters;
+        }
+      }
+    }
+  return L - clusters;
+}
+
+// Optical duplicates within the groups of copies. The mates of a pair are
+// in the order of the group's first pair or swapped (Picard's FR and RF
+// orientations, examined apart); a pair is swapped when its mates are
+// closer to the first pair's in the other order.
+void
+optical_duplicates(const MateSeqs &m1, const MateSeqs &m2, const bool single,
+                   const std::vector<std::uint32_t> &rep,
+                   const std::vector<std::uint32_t> &root,
+                   const std::vector<std::uint32_t> &pair_class, const int d,
+                   const std::size_t nthreads, AwareDupResult &r) {
+  const std::size_t n = m1.size(), C = rep.size();
+  r.optical = true;
+  // pairs that would not align are not in Picard's sets: a mate too short
+  // or mostly N, or an insert under 30 bases (an adapter before base 30 in
+  // both mates at about the same position; in the read, single-end)
+  auto aligns = [&](const std::size_t i) {
+    const std::uint8_t a = m1.no_align[i];
+    if (a & UNALIGNED)
+      return false;
+    if (single)
+      return a == NO_ADAPTER;
+    const std::uint8_t b = m2.no_align[i];
+    if (b & UNALIGNED)
+      return false;
+    return a == NO_ADAPTER || b == NO_ADAPTER || (a > b ? a - b : b - a) > 3;
+  };
+  for (std::size_t i = 0; i < n; ++i) {
+    r.located += (m1.tile[i] != -1);
+    r.not_aligning += !aligns(i);
+  }
+  std::vector<std::uint32_t> start(C + 1, 0);
+  for (std::size_t i = 0; i < n; ++i)
+    ++start[root[pair_class[i]] + 1];
+  for (std::size_t c = 0; c < C; ++c)
+    start[c + 1] += start[c];
+  std::vector<std::uint32_t> member(n), fill(start.begin(), start.end() - 1);
+  for (std::size_t i = 0; i < n; ++i)
+    member[fill[root[pair_class[i]]]++] = static_cast<std::uint32_t>(i);
+  { std::vector<std::uint32_t>().swap(fill); }
+  const MateView v1{m1}, v2{m2};
+  std::size_t opt_total = 0, skipped = 0;
+#pragma omp parallel for num_threads(nthreads) schedule(dynamic, 256) \
+  reduction(+ : opt_total, skipped)
+  for (std::size_t g = 0; g < C; ++g) {
+    const std::size_t b = start[g], e = start[g + 1];
+    if (e - b < 2)
+      continue;
+    const std::size_t first = rep[g];
+    std::vector<std::array<std::int32_t, 3>> loc[2];
+    std::size_t size[2] = {0, 0};
+    for (std::size_t k = b; k < e; ++k) {
+      const std::size_t i = member[k];
+      if (!aligns(i))
+        continue;
+      int o = 0;
+      if (!single && i != first) {
+        const unsigned same =
+          mismatches(v1.w(i), v1.n(i), v1.w(first), v1.n(first), MateSeqs::W) +
+          mismatches(v2.w(i), v2.n(i), v2.w(first), v2.n(first), MateSeqs::W);
+        const unsigned swapped =
+          mismatches(v1.w(i), v1.n(i), v2.w(first), v2.n(first), MateSeqs::W) +
+          mismatches(v2.w(i), v2.n(i), v1.w(first), v1.n(first), MateSeqs::W);
+        o = swapped < same;
+      }
+      ++size[o];
+      // x and y as Picard's MarkDuplicates keeps them (ReadEnds extends
+      // PhysicalLocationShort: 16 bits, values above 32767 wrap)
+      if (m1.tile[i] != -1)
+        loc[o].push_back({m1.tile[i], static_cast<std::int16_t>(m1.x[i]),
+                          static_cast<std::int16_t>(m1.y[i])});
+    }
+    for (int o = 0; o < 2; ++o) {
+      if (size[o] > MAX_OPTICAL_SET) {
+        ++skipped;
+        continue;
+      }
+      if (loc[o].size() >= 2)
+        opt_total += optical_in_set(loc[o], d);
+    }
+  }
+  r.optical_dups = opt_total;
+  r.optical_skipped = skipped;
+}
+
+}  // namespace
+
+AwareDupResult
+aware_duplication(MateSeqs &m1, MateSeqs &m2, const AwareDupOptions &opt,
+                  std::size_t nthreads, const std::string &cluster_out) {
+  nthreads = std::max<std::size_t>(1, nthreads);
+  static const bool fa_times = std::getenv("FA_TIMES") != nullptr;
+  auto tmark = std::chrono::steady_clock::now();
+  auto lap = [&](const char *what) {
+    if (!fa_times)
+      return;
+    const auto now = std::chrono::steady_clock::now();
+    long rss = 0, hwm = 0;
+    if (FILE *f = std::fopen("/proc/self/status", "r")) {
+      char line[256];
+      while (std::fgets(line, sizeof line, f)) {
+        std::sscanf(line, "VmRSS: %ld", &rss);
+        std::sscanf(line, "VmHWM: %ld", &hwm);
+      }
+      std::fclose(f);
+    }
+    std::fprintf(stderr, "[FA_TIMES aware] %s %.3f (RSS %ld MB, peak %ld MB)\n",
+                 what, std::chrono::duration<double>(now - tmark).count(),
+                 rss >> 10, hwm >> 10);
+    tmark = now;
+  };
+  lap("start");
+  AwareDupResult r;
+  const std::size_t n = m1.size();
+  // single-end: no second mate, a read is the unit
+  const bool single = m2.size() == 0;
+  if (!single && m2.size() != n)
+    throw std::runtime_error("aware duplication: mates differ in size");
+  if (n >= (std::size_t(1) << 32) - 1)
+    throw std::runtime_error("aware duplication: more than 2^32 read pairs");
+  r.pairs = n;
+  r.single = single;
+  r.no_umi = m1.no_umi;
+  const bool name_umi = opt.umi_in_name;
+  const bool umi1 = opt.umi1_len > 0, umi2 = opt.umi2_len > 0;
+
+  // a mate's key with its N positions and (in-read) UMI, for the exact
+  // classes
+  const MateView e1{m1}, e2{m2};
+  auto mate_hash = [&](const MateView &v, const bool in_read_umi,
+                       const std::size_t i) {
+    const std::uint64_t *w = v.w(i), *nm = v.n(i);
+    std::uint64_t h = mix64(v.m.len[i] ^ 0x9e3779b97f4a7c15ULL);
+    for (std::size_t k = 0; k < MateSeqs::W; ++k)
+      h = mix64(h ^ w[k]) ^ mix64(nm[k] + k);
+    // an in-read UMI travels with its mate; a name UMI belongs to the pair
+    if (in_read_umi)
+      h = mix64(h ^ umi_hash(v.m, i));
+    return h;
+  };
+
+  // 1. exact classes: identical mates (either order) and identical UMIs
+  struct KI {
+    std::uint64_t k;
+    std::uint32_t i;
+    bool operator<(const KI &o) const { return k < o.k || (k == o.k && i < o.i); }
+  };
+  std::vector<KI, NoInit<KI>> ki;
+  std::vector<std::size_t> gstart;
+  generate_grouped<KI>(
+    n, nthreads,
+    [&](const std::size_t i, auto sink) {
+      std::uint64_t k =
+        single ? mate_hash(e1, umi1, i)
+               : unordered_key(mate_hash(e1, umi1, i), mate_hash(e2, umi2, i));
+      if (name_umi)
+        k = mix64(k ^ umi_hash(m1, i));
+      sink(KI{k, static_cast<std::uint32_t>(i)});
+    },
+    [](const KI &x) { return x.k >> (64 - GROUP_BITS); }, ki, gstart);
+
+  // the first pair of each class (smallest index) represents it; classes are
+  // numbered in the order of their representatives
+  std::vector<std::uint32_t> cnt(n, 0);
+#pragma omp parallel for num_threads(nthreads) schedule(dynamic, 16)
+  for (std::size_t g = 0; g < GROUPS; ++g)
+    for (std::size_t a = gstart[g]; a < gstart[g + 1];) {
+      std::size_t b = a + 1;
+      while (b < gstart[g + 1] && ki[b].k == ki[a].k)
+        ++b;
+      cnt[ki[a].i] = static_cast<std::uint32_t>(b - a);
+      a = b;
+    }
+  std::vector<std::uint32_t> rep, ccount;
+  for (std::size_t i = 0; i < n; ++i)
+    if (cnt[i] > 0) {
+      rep.push_back(static_cast<std::uint32_t>(i));
+      ccount.push_back(cnt[i]);
+      cnt[i] = static_cast<std::uint32_t>(rep.size() - 1);  // class id
+    }
+  const std::size_t C = rep.size();
+  r.exact_classes = C;
+  std::vector<std::uint32_t> pair_class;
+  const bool optical = opt.optical_distance >= 0 && m1.tile.size() == n &&
+                       m1.no_align.size() == n &&
+                       (single || m2.no_align.size() == n);
+  if (!cluster_out.empty() || optical) {
+    pair_class.resize(n);
+#pragma omp parallel for num_threads(nthreads) schedule(dynamic, 16)
+    for (std::size_t g = 0; g < GROUPS; ++g)
+      for (std::size_t a = gstart[g]; a < gstart[g + 1];) {
+        std::size_t b = a + 1;
+        while (b < gstart[g + 1] && ki[b].k == ki[a].k)
+          ++b;
+        const std::uint32_t c = cnt[ki[a].i];
+        for (std::size_t x = a; x < b; ++x)
+          pair_class[ki[x].i] = c;
+        a = b;
+      }
+  }
+  { std::vector<KI, NoInit<KI>>().swap(ki); }
+  { std::vector<std::uint32_t>().swap(cnt); }
+  lap("exact classes");
+
+  // 2. links between classes within the tolerances
+  Groups groups(C);
+  const unsigned D = opt.mismatches, U = opt.umi_mismatches;
+  if (D > 0 || U > 0) {
+    const MateView v1{m1}, v2{m2};
+    const unsigned nb = D + 1;
+    // pairs x and y (classes) are copies in one of the two mate orders
+    auto close = [&](const std::uint32_t x, const std::uint32_t y) {
+      const std::size_t a = rep[x], b = rep[y];
+      if (name_umi) {
+        unsigned bu = U;
+        if (!umi_close(m1, a, m1, b, bu))
+          return false;
+      }
+      if (single) {
+        unsigned bu = U;
+        return v1.length(a) == v1.length(b) &&
+               (name_umi || !umi1 || umi_close(m1, a, m1, b, bu)) &&
+               mismatches(v1.w(a), v1.n(a), v1.w(b), v1.n(b), MateSeqs::W) <=
+                 D;
+      }
+      for (int swap = 0; swap < 2; ++swap) {
+        const MateView &p = swap ? v2 : v1, &q = swap ? v1 : v2;
+        const MateSeqs &pm = swap ? m2 : m1, &qm = swap ? m1 : m2;
+        if (v1.length(a) != p.length(b) || v2.length(a) != q.length(b))
+          continue;
+        if (!name_umi && (umi1 || umi2)) {
+          unsigned bu = U;
+          if (!umi_close(m1, a, pm, b, bu) || !umi_close(m2, a, qm, b, bu))
+            continue;
+        }
+        const unsigned d1 = mismatches(v1.w(a), v1.n(a), p.w(b), p.n(b),
+                                       MateSeqs::W);
+        if (d1 > D)
+          continue;
+        if (d1 + mismatches(v2.w(a), v2.n(a), q.w(b), q.n(b), MateSeqs::W) <=
+            D)
+          return true;
+      }
+      return false;
+    };
+    const bool umi_in_blocks = U == 0;
+    // pairs with a mate key too short for the blocks are only grouped exactly
+    auto blockable = [&](const std::size_t a) {
+      return v1.length(a) >= MIN_BLOCK * nb &&
+             (single || v2.length(a) >= MIN_BLOCK * nb);
+    };
+    std::vector<std::uint64_t, NoInit<std::uint64_t>> ent;
+    std::atomic<std::size_t> comparisons{0};
+    std::size_t largest = 0;
+    for (unsigned bi = 0; bi < nb; ++bi)
+      for (unsigned bj = bi; bj < (single ? bi + 1 : nb); ++bj) {
+        generate_grouped<std::uint64_t>(
+          C, nthreads,
+          [&](const std::size_t c, auto sink) {
+            const std::size_t a = rep[c];
+            if (!blockable(a))
+              return;
+            const std::uint64_t s1 =
+              umi_in_blocks && umi1 ? umi_hash(m1, a) : 0;
+            const std::uint64_t s2 =
+              umi_in_blocks && umi2 ? umi_hash(m2, a) : 0;
+            const std::uint64_t su =
+              umi_in_blocks && name_umi ? umi_hash(m1, a) : 0;
+            const unsigned L1 = v1.length(a);
+            const std::uint64_t *w1 = v1.w(a), *n1 = v1.n(a);
+            if (single) {  // one block of the read
+              const std::uint64_t k =
+                mix64(block_hash(w1, n1, L1, bi, nb, s1)) ^ su;
+              sink((k & 0xffffffff00000000ULL) | c);
+              return;
+            }
+            const unsigned L2 = v2.length(a);
+            const std::uint64_t *w2 = v2.w(a), *n2 = v2.n(a);
+            auto put = [&](const unsigned i, const unsigned j) {
+              const std::uint64_t k =
+                unordered_key(block_hash(w1, n1, L1, i, nb, s1),
+                              block_hash(w2, n2, L2, j, nb, s2)) ^ su;
+              sink((k & 0xffffffff00000000ULL) | c);
+            };
+            put(bi, bj);
+            if (bi != bj)
+              put(bj, bi);
+          },
+          [](const std::uint64_t x) { return x >> (64 - GROUP_BITS); }, ent,
+          gstart);
+        // A large group of classes sharing the blocks of this pass (e.g. the
+        // adapter blocks of many short inserts) is split further: two
+        // copies there differ in at most D of the remaining positions (both
+        // mates without the shared blocks, the mates ordered by the shared
+        // blocks' hashes, which is the same order for copies in either mate
+        // order), so they share one of D + 1 parts of those positions
+        // (pigeonhole again), and within a part the same holds for the
+        // positions left. Classes are compared within the final parts.
+        struct Member {
+          std::uint32_t c;   // class
+          std::uint32_t off; // its bases (codes 0-4) in the pool
+          std::uint16_t la, lb;
+          std::uint8_t ba, bb;  // the shared block of each mate
+          bool operator<(const Member &o) const {
+            return std::tie(la, lb, ba, bb, c) <
+                   std::tie(o.la, o.lb, o.ba, o.bb, o.c);
+          }
+          bool same_layout(const Member &o) const {
+            return la == o.la && lb == o.lb && ba == o.ba && bb == o.bb;
+          }
+        };
+        constexpr unsigned MAX_REFINE_DEPTH = 6;
+        const std::size_t REFINE_MIN = refine_min();
+        auto compare_all = [&](const std::vector<std::uint32_t> &cls,
+                               std::size_t &local) {
+          for (std::size_t x = 0; x + 1 < cls.size(); ++x)
+            for (std::size_t y = x + 1; y < cls.size(); ++y) {
+              const std::uint32_t cx = cls[x], cy = cls[y];
+              if (cx == cy || groups.find(cx) == groups.find(cy))
+                continue;
+              ++local;
+              if (close(cx, cy))
+                groups.unite(cx, cy);
+            }
+        };
+        auto refine = [&](const std::size_t a, const std::size_t b,
+                          const std::uint64_t key, std::size_t &local) {
+          const unsigned parts = D + 1;
+          std::vector<Member> mem;
+          std::vector<std::uint8_t> pool;
+          auto code_at = [](const std::uint64_t *w, const std::uint64_t *nm,
+                            const unsigned pos) -> std::uint8_t {
+            const unsigned sh = 2 * (pos % 32);
+            if ((nm[pos / 32] >> sh) & 1)
+              return 4;
+            return static_cast<std::uint8_t>((w[pos / 32] >> sh) & 3);
+          };
+          auto add = [&](const std::uint32_t c, const std::uint64_t *wa,
+                         const std::uint64_t *na, const unsigned La,
+                         const unsigned ba, const std::uint64_t *wb,
+                         const std::uint64_t *nb2, const unsigned Lb,
+                         const unsigned bb) {
+            Member m{c, static_cast<std::uint32_t>(pool.size()),
+                     static_cast<std::uint16_t>(La),
+                     static_cast<std::uint16_t>(Lb),
+                     static_cast<std::uint8_t>(ba),
+                     static_cast<std::uint8_t>(bb)};
+            for (unsigned i = 0; i < La; ++i)
+              pool.push_back(code_at(wa, na, i));
+            for (unsigned i = 0; i < Lb; ++i)
+              pool.push_back(code_at(wb, nb2, i));
+            mem.push_back(m);
+          };
+          std::uint32_t last = ~std::uint32_t(0);
+          for (std::size_t x = a; x < b; ++x) {
+            const std::uint32_t c = static_cast<std::uint32_t>(ent[x]);
+            if (c == last)  // one class can carry the key twice
+              continue;
+            last = c;
+            const std::size_t ra = rep[c];
+            const std::uint64_t s1 =
+              umi_in_blocks && umi1 ? umi_hash(m1, ra) : 0;
+            const std::uint64_t s2 =
+              umi_in_blocks && umi2 ? umi_hash(m2, ra) : 0;
+            const std::uint64_t su =
+              umi_in_blocks && name_umi ? umi_hash(m1, ra) : 0;
+            const unsigned L1 = v1.length(ra);
+            const std::uint64_t *w1 = v1.w(ra), *n1 = v1.n(ra);
+            if (single) {
+              add(c, w1, n1, L1, bi, nullptr, nullptr, 0, 0);
+              continue;
+            }
+            const unsigned L2 = v2.length(ra);
+            const std::uint64_t *w2 = v2.w(ra), *n2 = v2.n(ra);
+            for (int t = 0; t < (bi != bj ? 2 : 1); ++t) {
+              const unsigned p = t ? bj : bi, q = t ? bi : bj;
+              const std::uint64_t h1 = block_hash(w1, n1, L1, p, nb, s1),
+                                  h2 = block_hash(w2, n2, L2, q, nb, s2);
+              if (((unordered_key(h1, h2) ^ su) >> 32) != key)
+                continue;  // this order did not give the key
+              if (h1 <= h2)
+                add(c, w1, n1, L1, p, w2, n2, L2, q);
+              if (h2 <= h1)
+                add(c, w2, n2, L2, q, w1, n1, L1, p);
+            }
+          }
+          std::sort(mem.begin(), mem.end());
+          // one level: members (indices into mem) that share all positions
+          // outside `free`, which holds at most D differences for copies
+          std::function<void(const std::vector<std::uint32_t> &,
+                             const std::vector<std::uint16_t> &, unsigned)>
+            level = [&](const std::vector<std::uint32_t> &ms,
+                        const std::vector<std::uint16_t> &free,
+                        const unsigned depth) {
+              if (ms.size() <= REFINE_MIN || depth > MAX_REFINE_DEPTH ||
+                  free.size() < parts) {
+                std::vector<std::uint32_t> cls(ms.size());
+                for (std::size_t i = 0; i < ms.size(); ++i)
+                  cls[i] = mem[ms[i]].c;
+                compare_all(cls, local);
+                return;
+              }
+              std::vector<std::pair<std::uint64_t, std::uint32_t>> hs;
+              for (unsigned k = 0; k < parts; ++k) {
+                const std::size_t lo = k * free.size() / parts,
+                                  hi = (k + 1) * free.size() / parts;
+                hs.clear();
+                for (const std::uint32_t i : ms) {
+                  const std::uint8_t *sq = &pool[mem[i].off];
+                  std::uint64_t h = mix64(k + 1), acc = 0;
+                  unsigned cnt = 0;
+                  for (std::size_t f = lo; f < hi; ++f) {
+                    acc = acc * 5 + sq[free[f]];
+                    if (++cnt == 27) {
+                      h = mix64(h ^ acc);
+                      acc = 0;
+                      cnt = 0;
+                    }
+                  }
+                  hs.emplace_back(mix64(h ^ acc ^ (std::uint64_t(cnt) << 58)),
+                                  i);
+                }
+                std::sort(hs.begin(), hs.end());
+                std::vector<std::uint16_t> rest;
+                rest.insert(rest.end(), free.begin(), free.begin() + lo);
+                rest.insert(rest.end(), free.begin() + hi, free.end());
+                for (std::size_t u = 0; u < hs.size();) {
+                  std::size_t e = u + 1;
+                  while (e < hs.size() && hs[e].first == hs[u].first)
+                    ++e;
+                  if (e - u >= 2) {
+                    std::vector<std::uint32_t> sub;
+                    for (std::size_t x = u; x < e; ++x)
+                      sub.push_back(hs[x].second);
+                    level(sub, rest, depth + 1);
+                  }
+                  u = e;
+                }
+              }
+            };
+          for (std::size_t u = 0; u < mem.size();) {
+            std::size_t e = u + 1;
+            while (e < mem.size() && mem[e].same_layout(mem[u]))
+              ++e;
+            if (e - u >= 2) {
+              const Member &m = mem[u];
+              const unsigned alo = m.ba * m.la / nb, ahi = (m.ba + 1) * m.la / nb;
+              const unsigned blo = single ? 0 : m.bb * m.lb / nb,
+                             bhi = single ? 0 : (m.bb + 1) * m.lb / nb;
+              std::vector<std::uint16_t> free;
+              for (unsigned i = 0; i < m.la; ++i)
+                if (i < alo || i >= ahi)
+                  free.push_back(static_cast<std::uint16_t>(i));
+              for (unsigned i = 0; i < m.lb; ++i)
+                if (i < blo || i >= bhi)
+                  free.push_back(static_cast<std::uint16_t>(m.la + i));
+              std::vector<std::uint32_t> ms;
+              for (std::size_t x = u; x < e; ++x)
+                ms.push_back(static_cast<std::uint32_t>(x));
+              level(ms, free, 1);
+            }
+            u = e;
+          }
+        };
+#pragma omp parallel for num_threads(nthreads) schedule(dynamic, 1) \
+  reduction(max : largest)
+        for (std::size_t g = 0; g < GROUPS; ++g) {
+          std::size_t local = 0;
+          for (std::size_t a = gstart[g]; a < gstart[g + 1];) {
+            const std::uint64_t key = ent[a] >> 32;
+            std::size_t b = a + 1;
+            while (b < gstart[g + 1] && (ent[b] >> 32) == key)
+              ++b;
+            largest = std::max(largest, b - a);
+            if (b - a > REFINE_MIN && D > 0) {
+              refine(a, b, key, local);
+              a = b;
+              continue;
+            }
+            for (std::size_t x = a; x + 1 < b; ++x) {
+              const std::uint32_t cx = static_cast<std::uint32_t>(ent[x]);
+              for (std::size_t y = x + 1; y < b; ++y) {
+                const std::uint32_t cy = static_cast<std::uint32_t>(ent[y]);
+                if (cx == cy || groups.find(cx) == groups.find(cy))
+                  continue;
+                ++local;
+                if (close(cx, cy))
+                  groups.unite(cx, cy);
+              }
+            }
+            a = b;
+          }
+          comparisons += local;
+        }
+      }
+    r.comparisons = comparisons.load();
+    lap("links");
+    if (std::getenv("FA_AWARE_STATS"))
+      std::fprintf(stderr,
+                   "[aware] pairs %zu classes %zu comparisons %zu "
+                   "largest block group %zu\n",
+                   n, C, r.comparisons, largest);
+  }
+
+  // 3. group sizes in pairs, and the duplication levels
+  std::vector<std::uint32_t> root(C);
+#pragma omp parallel for num_threads(nthreads) schedule(static)
+  for (std::size_t c = 0; c < C; ++c)
+    root[c] = groups.find(static_cast<std::uint32_t>(c));
+  std::vector<std::uint64_t> gsize(C, 0);
+  for (std::size_t c = 0; c < C; ++c)
+    gsize[root[c]] += ccount[c];
+  std::array<std::size_t, 16> db{}, tb{};
+  std::vector<std::uint64_t> small(1024, 0);
+  for (std::size_t c = 0; c < C; ++c)
+    if (gsize[c] > 0) {
+      if (gsize[c] < small.size())
+        ++small[gsize[c]];
+      else
+        ++r.family_sizes[gsize[c]];
+      ++r.clusters;
+      const std::size_t sl = dup_slot(gsize[c]);
+      ++db[sl];
+      tb[sl] += gsize[c];
+    }
+  for (std::size_t z = 1; z < small.size(); ++z)
+    if (small[z] > 0)
+      r.family_sizes[z] = small[z];
+  for (std::size_t s = 0; s < 16; ++s) {
+    r.dedup_bins[s] = 100.0 * static_cast<double>(db[s]) /
+                      std::max<double>(1.0, static_cast<double>(r.clusters));
+    r.total_bins[s] = 100.0 * static_cast<double>(tb[s]) /
+                      std::max<double>(1.0, static_cast<double>(n));
+  }
+
+  lap("groups");
+  if (optical) {
+    optical_duplicates(m1, m2, single, rep, root, pair_class,
+                       opt.optical_distance, nthreads, r);
+    lap("optical");
+  }
+  if (!cluster_out.empty()) {
+    std::ofstream o(cluster_out, std::ofstream::binary);
+    for (std::size_t i = 0; i < n; ++i) {
+      const std::uint32_t g = rep[root[pair_class[i]]];
+      o.write(reinterpret_cast<const char *>(&g), sizeof g);
+    }
+    if (!o.good())
+      throw std::runtime_error("cannot write " + cluster_out);
+  }
+  return r;
+}
+
+void
+write_aware_section(std::ostream &os, const AwareDupResult &r,
+                    const AwareDupOptions &opt) {
+  auto region = [](const std::size_t s, const std::size_t l) {
+    return std::to_string(s + 1) + ":" + std::to_string(l);
+  };
+  std::string umi = "none";
+  if (opt.umi_in_name)
+    umi = "read name";
+  else if (opt.umi1_len > 0 && opt.umi2_len > 0)
+    umi = "read 1 " + region(opt.umi1_start, opt.umi1_len) + ", read 2 " +
+          region(opt.umi2_start, opt.umi2_len);
+  else if (opt.umi1_len > 0)
+    umi = "read 1 " + region(opt.umi1_start, opt.umi1_len);
+  else if (opt.umi2_len > 0)
+    umi = "read 2 " + region(opt.umi2_start, opt.umi2_len);
+  const char *unit = r.single ? "reads" : "pairs";
+  if (r.single)
+    os << "#Error- and UMI-aware duplicate rate (%): two reads are copies "
+          "when their keys have the same length and differ in at most the "
+          "allowed number of bases (an N matches only an N), and their UMIs "
+          "differ in at most the allowed number of bases. Keys are the "
+          "FastQC duplication keys (the first 50 bases of reads longer than "
+          "75), after removing an in-read UMI. Copies are grouped "
+          "transitively; independent of read order.\n";
+  else
+    os << "#Error- and UMI-aware paired duplicate rate (%): two pairs are "
+          "copies when, in either mate order, both mates have keys of the "
+          "same length that differ in at most the allowed number of bases in "
+          "total (an N matches only an N), and their UMIs differ in at most "
+          "the allowed number of bases. Keys as above, after removing an "
+          "in-read UMI. Copies are grouped transitively; independent of read "
+          "order.\n";
+  os << "Mismatches allowed per " << (r.single ? "read" : "pair") << "\t"
+     << opt.mismatches << "\n";
+  os << "UMI\t" << umi << "\n";
+  os << "UMI mismatches allowed\t" << opt.umi_mismatches << "\n";
+  if (opt.umi_in_name)
+    os << (r.single ? "Reads" : "Pairs")
+       << " without a UMI in the read name\t" << r.no_umi << "\n";
+  os << "Distinct " << unit << " (sequence and UMI)\t" << r.exact_classes
+     << "\n";
+  os << "Groups of copies\t" << r.clusters << "\n";
+  os << (r.single ? "Aware" : "Paired-end aware") << "\t"
+     << r.duplicate_rate() << "\n";
+  os << (r.single ? "#Aware duplication levels\n"
+                  : "#Paired-end aware duplication levels\n");
+  os << "#Duplication Level\tPercentage of deduplicated\t"
+     << "Percentage of total\n";
+  static const char *labels[16] = {"1",   "2",   "3",    "4",   "5",  "6",
+                                   "7",   "8",   "9",    ">10", ">50", ">100",
+                                   ">500", ">1k", ">5k", ">10k+"};
+  for (std::size_t i = 0; i < 16; ++i)
+    os << labels[i] << "\t" << r.dedup_bins[i] << "\t" << r.total_bins[i]
+       << "\n";
+  if (r.optical) {
+    const double u = static_cast<double>(std::max<std::size_t>(1, r.pairs));
+    const std::size_t dups = r.pairs - r.clusters;
+    os << "#Optical duplicates (Picard's rule within the groups of copies "
+          "above: same tile, at most the pixel distance apart in x and y; "
+          "one per cluster kept). Locations from the read 1 names (tile, x, "
+          "y as the last three of 5 or 7 ':' separated fields). Mate orders "
+          "examined apart (Picard's FR and RF). Pairs with a mate that would "
+          "not align (fewer than 30 bases before an adapter, as bwa mem "
+          "needs a score of 30, or a key that is mostly N) are left out, as "
+          "Picard examines aligned pairs only.\n";
+    os << "Optical pixel distance\t" << opt.optical_distance << "\n";
+    os << (r.single ? "Reads" : "Pairs") << " with a location in the name\t"
+       << r.located << "\t" << 100.0 * static_cast<double>(r.located) / u
+       << "\n";
+    os << (r.single ? "Reads" : "Pairs")
+       << " left out (would not align: insert under 30 bases or mostly N)\t"
+       << r.not_aligning << "\t"
+       << 100.0 * static_cast<double>(r.not_aligning) / u << "\n";
+    os << "Optical duplicates\t" << r.optical_dups << "\t"
+       << 100.0 * static_cast<double>(r.optical_dups) / u << "\n";
+    os << "Optical share of the duplicates (%)\t"
+       << (dups ? 100.0 * static_cast<double>(r.optical_dups) /
+                    static_cast<double>(dups)
+                : 0.0)
+       << "\n";
+    os << "Duplicates without the optical ones\t" << dups - r.optical_dups
+       << "\t" << 100.0 * static_cast<double>(dups - r.optical_dups) / u
+       << "\n";
+    os << "Sets above 300000 (not examined, as Picard)\t"
+       << r.optical_skipped << "\n";
+  }
+}

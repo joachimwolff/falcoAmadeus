@@ -1,0 +1,5 @@
+dataset	pairs	check	values_compared	equal
+DRR041223	3183182	yield curve vs preseq lc_extrap -Q	10000	yes
+DRR041223	3183182	insert-size histogram vs fastp	513	yes
+SRR12898355_10M	10000000	yield curve vs preseq lc_extrap -Q	10000	yes
+SRR12898355_10M	10000000	insert-size histogram vs fastp	513	yes

@@ -1,0 +1,114 @@
+name: falco1 parity
+
+# Verify the project's core claim on every push and pull request: default
+# single-end output is byte-identical to upstream falco 1.3.2, modulo two
+# documented differences, with --legacy-n-content-grade (by default
+# falcoAmadeus grades Per base N content as FastQC does; falco 1.3.2 compares
+# a fraction with the percent limits, so the module never warns or fails):
+#   1. line 1 of fastqc_data.txt names the tool and version;
+#   2. the Overrepresented Sequences section lists count-TIED entries in a
+#      deterministic (frequency, then sequence) order, whereas upstream emits
+#      hash-map order (which itself varies across libstdc++ builds).
+# The comparison therefore drops line 1 and sorts the overrepresented data
+# lines on both sides; everything else must match byte for byte, as must the
+# whole summary.txt. Runs each bundled test FASTQ at -t 1 and -t 8, plus a
+# gzipped copy, so single-threaded, parallel, and gz paths are all checked
+# against upstream.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  parity:
+    name: Output parity with upstream falco 1.3.2
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential autoconf automake zlib1g-dev
+
+      - name: Build falcoAmadeus
+        run: |
+          ./autogen.sh
+          ./configure
+          make -j"$(nproc)"
+
+      - name: Build upstream falco 1.3.2
+        run: |
+          curl -sL -o falco-1.3.2.tar.gz \
+            https://github.com/smithlabcode/falco/releases/download/v1.3.2/falco-1.3.2.tar.gz
+          echo "d8dbc7d98d1aafdbf8199f8df3d7f76503a4f6a8924a151c953eb23dd47d44a0  falco-1.3.2.tar.gz" \
+            | sha256sum -c -
+          tar xzf falco-1.3.2.tar.gz
+          cd falco-1.3.2 && ./configure && make -j"$(nproc)"
+
+      - name: Compare outputs on the bundled test data
+        run: |
+          set -u
+          mkdir -p parity && tar -zxf test/test_data.tgz -C parity
+
+          # canonicalize: drop the version header line, sort the data lines of
+          # the Overrepresented Sequences section (ties are order-unstable
+          # upstream), keep everything else verbatim
+          cat > parity/canon.py <<'EOF'
+          import sys
+          lines = open(sys.argv[1]).read().splitlines(keepends=True)
+          out, i = [], 1  # skip the "##<tool> <version>" line
+          while i < len(lines):
+              out.append(lines[i])
+              if lines[i].startswith(">>Overrepresented sequences"):
+                  i += 1
+                  block = []
+                  while i < len(lines) and not lines[i].startswith(">>END_MODULE"):
+                      if lines[i].startswith("#"):
+                          out.append(lines[i])
+                      else:
+                          block.append(lines[i])
+                      i += 1
+                  out.extend(sorted(block))
+                  continue  # loop appends the END_MODULE line
+              i += 1
+          sys.stdout.write("".join(out))
+          EOF
+
+          CONF="-l Configuration/limits.txt -a Configuration/adapter_list.txt -c Configuration/contaminant_list.txt"
+          # the same limits with the Kmer Content module switched on
+          sed 's/^kmer\([[:space:]]*\)ignore\([[:space:]]*\)1/kmer\1ignore\20/' \
+            Configuration/limits.txt > parity/limits_kmer.txt
+          grep -q '^kmer[[:space:]]*ignore[[:space:]]*0' parity/limits_kmer.txt
+          KCONF="-l parity/limits_kmer.txt -a Configuration/adapter_list.txt -c Configuration/contaminant_list.txt"
+          fail=0
+          for f in parity/*.fastq; do
+            n=$(basename "$f" .fastq)
+            gzip -kf "$f"
+            for case in t1 t8 gz kmer; do
+              conf=$CONF
+              case $case in
+                t1) inp=$f;    fa_args="-t 1 --legacy-n-content-grade";;
+                t8) inp=$f;    fa_args="-t 8 --legacy-n-content-grade";;
+                gz) inp=$f.gz; fa_args="-t 8 --legacy-n-content-grade";;
+                kmer) inp=$f;  fa_args="-t 8 --legacy-n-content-grade"; conf=$KCONF;;
+              esac
+              rm -rf parity/out_f1 parity/out_fa
+              mkdir -p parity/out_f1 parity/out_fa
+              ./falco-1.3.2/falco $conf -o parity/out_f1 "$inp" > /dev/null 2>&1
+              ./falcoAmadeus  $conf $fa_args -o parity/out_fa "$inp" > /dev/null 2>&1
+              if ! diff <(python3 parity/canon.py parity/out_f1/fastqc_data.txt) \
+                        <(python3 parity/canon.py parity/out_fa/fastqc_data.txt) > /dev/null \
+                 || ! diff -q parity/out_f1/summary.txt parity/out_fa/summary.txt > /dev/null; then
+                echo "PARITY FAIL: $n ($case)"
+                diff <(python3 parity/canon.py parity/out_f1/fastqc_data.txt) \
+                     <(python3 parity/canon.py parity/out_fa/fastqc_data.txt) | head -20
+                fail=1
+              else
+                echo "parity ok: $n ($case)"
+              fi
+            done
+          done
+          exit $fail

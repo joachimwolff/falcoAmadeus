@@ -1,0 +1,86 @@
+run	description	reference	found_pct	only_pct
+SRR39821100	human RNA-seq (ENCODE)	human	87.4152	77.183
+SRR39821100	human RNA-seq (ENCODE)	mouse	3.73543	0.100017
+SRR39821100	human RNA-seq (ENCODE)	rat	3.34406	0.0217429
+SRR39821100	human RNA-seq (ENCODE)	fly	0	0
+SRR39821100	human RNA-seq (ENCODE)	worm	0.00434858	0.00434858
+SRR39821100	human RNA-seq (ENCODE)	yeast	0	0
+SRR39821100	human RNA-seq (ENCODE)	arabidopsis	0	0
+SRR39821100	human RNA-seq (ENCODE)	ecoli	0	0
+SRR39821100	human RNA-seq (ENCODE)	phix	2.95217e-05	0
+SRR39821100	human RNA-seq (ENCODE)	lambda	0	0
+SRR39821100	human RNA-seq (ENCODE)	human_mt	6.95503	0
+SRR39821100	human RNA-seq (ENCODE)	mouse_mt	0.0265051	0
+SRR39821100	human RNA-seq (ENCODE)	human_rrna	1.32241	0
+SRR39821100	human RNA-seq (ENCODE)	mycoplasma	0	0
+SRR39821100	human RNA-seq (ENCODE)	vectors	0.0011666	0
+SRR39821100	human RNA-seq (ENCODE)	Several references	10.2322	
+SRR39821100	human RNA-seq (ENCODE)	No reference	12.4587	
+DRR041223	mouse RNA-seq	human	3.04678	0.00385669
+DRR041223	mouse RNA-seq	mouse	79.2202	63.7472
+DRR041223	mouse RNA-seq	rat	14.0576	0.0539936
+DRR041223	mouse RNA-seq	fly	0	0
+DRR041223	mouse RNA-seq	worm	0	0
+DRR041223	mouse RNA-seq	yeast	0	0
+DRR041223	mouse RNA-seq	arabidopsis	0	0
+DRR041223	mouse RNA-seq	ecoli	0	0
+DRR041223	mouse RNA-seq	phix	0.000844106	0
+DRR041223	mouse RNA-seq	lambda	0	0
+DRR041223	mouse RNA-seq	human_mt	0.00192478	0
+DRR041223	mouse RNA-seq	mouse_mt	2.14051	0
+DRR041223	mouse RNA-seq	human_rrna	0.0900724	0
+DRR041223	mouse RNA-seq	mycoplasma	0	0
+DRR041223	mouse RNA-seq	vectors	0.0554466	0.528366
+DRR041223	mouse RNA-seq	Several references	15.4807	
+DRR041223	mouse RNA-seq	No reference	20.1859	
+ERR5029122	human WGS (1000 Genomes)	human	90.9159	90.466
+ERR5029122	human WGS (1000 Genomes)	mouse	0.187441	0
+ERR5029122	human WGS (1000 Genomes)	rat	0.170401	0
+ERR5029122	human WGS (1000 Genomes)	fly	0	0
+ERR5029122	human WGS (1000 Genomes)	worm	0	0
+ERR5029122	human WGS (1000 Genomes)	yeast	0	0
+ERR5029122	human WGS (1000 Genomes)	arabidopsis	0	0
+ERR5029122	human WGS (1000 Genomes)	ecoli	0	0
+ERR5029122	human WGS (1000 Genomes)	phix	0	0
+ERR5029122	human WGS (1000 Genomes)	lambda	0	0
+ERR5029122	human WGS (1000 Genomes)	human_mt	0.21321	0
+ERR5029122	human WGS (1000 Genomes)	mouse_mt	0.000748931	0
+ERR5029122	human WGS (1000 Genomes)	human_rrna	0.0576104	0
+ERR5029122	human WGS (1000 Genomes)	mycoplasma	0	0
+ERR5029122	human WGS (1000 Genomes)	vectors	0.00686248	0.00681605
+ERR5029122	human WGS (1000 Genomes)	Several references	0.451563	
+ERR5029122	human WGS (1000 Genomes)	No reference	9.07557	
+SRR41298237	16S amplicon	human	0	0
+SRR41298237	16S amplicon	mouse	0	0
+SRR41298237	16S amplicon	rat	0	0
+SRR41298237	16S amplicon	fly	0	0
+SRR41298237	16S amplicon	worm	0	0
+SRR41298237	16S amplicon	yeast	0	0
+SRR41298237	16S amplicon	arabidopsis	0	0
+SRR41298237	16S amplicon	ecoli	0	0
+SRR41298237	16S amplicon	phix	0.000176969	0
+SRR41298237	16S amplicon	lambda	0	0
+SRR41298237	16S amplicon	human_mt	0	0
+SRR41298237	16S amplicon	mouse_mt	0	0
+SRR41298237	16S amplicon	human_rrna	0.000399373	0
+SRR41298237	16S amplicon	mycoplasma	0	0
+SRR41298237	16S amplicon	vectors	0.0003733	0
+SRR41298237	16S amplicon	Several references	0	
+SRR41298237	16S amplicon	No reference	100	
+SRR39821074	human ChIP-seq	human	67.1636	66.6265
+SRR39821074	human ChIP-seq	mouse	0.160864	0.00861772
+SRR39821074	human ChIP-seq	rat	0.152246	0.0172354
+SRR39821074	human ChIP-seq	fly	0	0
+SRR39821074	human ChIP-seq	worm	0	0
+SRR39821074	human ChIP-seq	yeast	0	0
+SRR39821074	human ChIP-seq	arabidopsis	0	0
+SRR39821074	human ChIP-seq	ecoli	0.040748	0.040216
+SRR39821074	human ChIP-seq	phix	0.00860282	0
+SRR39821074	human ChIP-seq	lambda	0	0
+SRR39821074	human ChIP-seq	human_mt	0.32291	0
+SRR39821074	human ChIP-seq	mouse_mt	0.000629164	0
+SRR39821074	human ChIP-seq	human_rrna	0.0291368	0
+SRR39821074	human ChIP-seq	mycoplasma	0	0
+SRR39821074	human ChIP-seq	vectors	0.0111212	0
+SRR39821074	human ChIP-seq	Several references	0.540044	
+SRR39821074	human ChIP-seq	No reference	32.7674	

@@ -49,8 +49,9 @@ struct AssayProfile {
   // never warn/fail: composition is primer/adapter-locked and expected.
   bool suppress_per_base{false};
   // bisulfite/EM handling: C->T (Read1/OT) or G->A (Read2/OB) depletion is
-  // expected; grade only non-converted bases and soft-flag incomplete
-  // conversion (see kIncompleteConversionResidual).
+  // expected; each graded position is compared with the library's own mean
+  // composition (no genome-wide base balance assumed) and incomplete
+  // conversion is soft-flagged (see kIncompleteConversionResidual).
   bool methylation{false};
 
   // --- Per Sequence GC Content ---
@@ -61,15 +62,32 @@ struct AssayProfile {
 
   // --- Overrepresented Sequences ---
   bool downgrade_overrep{false};  // FAIL -> WARN (miRNAs/amplicons are signal)
+
+  // --- Per Base Sequence Content ---
+  // ignore this many trailing read positions when grading (3' end-repair /
+  // fill-in artifacts of methylation libraries)
+  std::size_t mask_3p{0};
+
+  // --- relaxed FAIL limits (0: the module never FAILs under relax_gc /
+  // downgrade_dup). An expected shift is graded WARN, but a deviation beyond
+  // this limit still FAILs, so a gross contamination stays visible.
+  double gc_fail{0};   // Per sequence GC: deviation from normal (percent)
+  double dup_fail{0};  // Duplication: deduplicated percentage at or below
+
+  // --- Adapter Content ---
+  // reads are longer than the molecules (small RNA): 3' adapter read-through
+  // is expected in raw reads; FAIL -> WARN, annotated
+  bool expect_adapter{false};
 };
 
-// Residual unmethylated-C (or -G) fraction below which a bisulfite/EM library
-// is considered adequately converted. This is only a raw-read HEURISTIC: the
-// genuine residual C scales with the sample's true methylation level, so the
-// authoritative check is the post-alignment non-CpG conversion rate (>99.5%),
-// which a raw-read tool cannot compute. Above this fraction we emit a soft
-// WARN annotation, never a hard FAIL.
-static constexpr double kIncompleteConversionResidual = 0.05;
+// Unconverted fraction outside CpG (C among C+T followed by a non-G in C->T
+// reads, likewise G in G->A reads) above which a bisulfite/EM library is
+// flagged as possibly incompletely converted. On the calibration runs
+// converted libraries lay at 0.3-15 % (non-CpG methylation, e.g. in stem
+// cells, raises it) and unconverted ones at 30 % or more. A raw-read estimate
+// only: the authoritative check is the post-alignment non-CpG conversion rate
+// (>99.5 %). Above this fraction a soft WARN annotation, never a hard FAIL.
+static constexpr double kIncompleteConversionResidual = 0.20;
 
 // Populate `profile` for `assay` (assumed already lower-cased). Returns false
 // for an unknown assay so the caller can print the valid list and exit.
@@ -83,6 +101,9 @@ std::string valid_assay_list();
  *************************************************************/
 
 // config from options, constants, magic numbers, etc
+struct PairedHooks;  // StreamReader.hpp
+struct AwareDupOptions;  // PairDupAware.hpp
+
 struct FalcoConfig {
   static const std::string FalcoVersion;
   FalcoConfig(const int argc, char *argv[]);
@@ -186,6 +207,24 @@ struct FalcoConfig {
   // writes: "mates" = per-mate forward+reverse fastqc_data.txt (default),
   // "combined" = a single pooled R1+R2 fastqc_data.txt only, "both" = all.
   std::string paired_data = "mates";
+  // [FalcoAmadeus] --paired-with refuses to run when R1/R2 read identifiers
+  // disagree (mates out of order or files from different runs), since every
+  // paired statistic would be meaningless. This overrides that check.
+  bool allow_unmatched_pairs = false;
+  // [FalcoAmadeus] grade Per base N content as falco 1.x did: its largest
+  // per-position N fraction (0 to 1) was compared with the percent limits,
+  // so the module never warned or failed
+  bool legacy_n_content_grade = false;
+  // [FalcoAmadeus] when non-empty, the FASTQ input is the concatenation of
+  // these files, streamed directly (paired-end combined view); filename is
+  // then the first file, used for format/tile detection.
+  std::vector<std::string> pooled_inputs;
+  // [FalcoAmadeus] per-read outputs for native paired-end mode (falco.cpp);
+  // honoured by the FASTQ parse drivers, null otherwise
+  PairedHooks *paired_hooks = nullptr;
+  // [FalcoAmadeus] error- and UMI-aware paired duplication options, when
+  // requested: the paired hooks then also collect its per-read records
+  const AwareDupOptions *aware_dup = nullptr;
 
   /*********** FUNCTIONS TO READ FILES *************/
   void define_file_format();

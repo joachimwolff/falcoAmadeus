@@ -1,0 +1,199 @@
+file	cutoff	field	preview	cutadapt	equal
+amplicon16s_SRR1619438.fastq	10	bases_removed	0.573958	0.573958	True
+amplicon16s_SRR1619438.fastq	10	reads_trimmed	3.9795	3.9795	True
+amplicon16s_SRR1619438.fastq	10	short20	0.0005	0.0005	True
+amplicon16s_SRR1619438.fastq	10	short36	0.014	0.014	True
+amplicon16s_SRR1619438.fastq	10	short50	0.019	0.019	True
+amplicon16s_SRR1619438.fastq	20	bases_removed	0.785057	0.785057	True
+amplicon16s_SRR1619438.fastq	20	reads_trimmed	4.546	4.546	True
+amplicon16s_SRR1619438.fastq	20	short20	0.0005	0.0005	True
+amplicon16s_SRR1619438.fastq	20	short36	0.126	0.126	True
+amplicon16s_SRR1619438.fastq	20	short50	0.24	0.24	True
+amplicon16s_SRR1619438.fastq	30	bases_removed	2.36174	2.36174	True
+amplicon16s_SRR1619438.fastq	30	reads_trimmed	9.2515	9.2515	True
+amplicon16s_SRR1619438.fastq	30	short20	0.3695	0.3695	True
+amplicon16s_SRR1619438.fastq	30	short36	1.106	1.106	True
+amplicon16s_SRR1619438.fastq	30	short50	1.494	1.494	True
+amplicon16s_SRR1619438.fastq	adapter+20	Bases removed with quality 20 (%)	1.27136	1.28086	estimate
+amplicon16s_SRR1619438.fastq	adapter+20	Reads trimmed with quality 20 (%)	25.0015	25.0025	estimate
+amplicon16s_SRR1619438.fastq	adapter+20	Shorter than 36 with quality 20 (%)	0.126	0.1265	estimate
+atac_SRR36625746.fastq	10	bases_removed	3.33333e-06	3.33333e-06	True
+atac_SRR36625746.fastq	10	reads_trimmed	0.0005	0.0005	True
+atac_SRR36625746.fastq	10	short20	0	0	True
+atac_SRR36625746.fastq	10	short36	0	0	True
+atac_SRR36625746.fastq	10	short50	0	0	True
+atac_SRR36625746.fastq	20	bases_removed	1.13773	1.13773	True
+atac_SRR36625746.fastq	20	reads_trimmed	12.5165	12.5165	True
+atac_SRR36625746.fastq	20	short20	0	0	True
+atac_SRR36625746.fastq	20	short36	0.0155	0.0155	True
+atac_SRR36625746.fastq	20	short50	0.052	0.052	True
+atac_SRR36625746.fastq	30	bases_removed	6.5001	6.5001	True
+atac_SRR36625746.fastq	30	reads_trimmed	33.6705	33.6705	True
+atac_SRR36625746.fastq	30	short20	0.0885	0.0885	True
+atac_SRR36625746.fastq	30	short36	0.4425	0.4425	True
+atac_SRR36625746.fastq	30	short50	0.739	0.739	True
+atac_SRR36625746.fastq	adapter+20	Bases removed with quality 20 (%)	41.919	41.9545	estimate
+atac_SRR36625746.fastq	adapter+20	Reads trimmed with quality 20 (%)	74.689	74.735	estimate
+atac_SRR36625746.fastq	adapter+20	Shorter than 36 with quality 20 (%)	2.229	2.261	estimate
+chipseq_SRR40896959.fastq	10	bases_removed	0.211853	0.211853	True
+chipseq_SRR40896959.fastq	10	reads_trimmed	10.692	10.692	True
+chipseq_SRR40896959.fastq	10	short20	0	0	True
+chipseq_SRR40896959.fastq	10	short36	0	0	True
+chipseq_SRR40896959.fastq	10	short50	0	0	True
+chipseq_SRR40896959.fastq	20	bases_removed	1.05978	1.05978	True
+chipseq_SRR40896959.fastq	20	reads_trimmed	10.692	10.692	True
+chipseq_SRR40896959.fastq	20	short20	0.006	0.006	True
+chipseq_SRR40896959.fastq	20	short36	0.024	0.024	True
+chipseq_SRR40896959.fastq	20	short50	0.0455	0.0455	True
+chipseq_SRR40896959.fastq	30	bases_removed	6.50991	6.50991	True
+chipseq_SRR40896959.fastq	30	reads_trimmed	34.7665	34.7665	True
+chipseq_SRR40896959.fastq	30	short20	0.27	0.27	True
+chipseq_SRR40896959.fastq	30	short36	0.492	0.492	True
+chipseq_SRR40896959.fastq	30	short50	0.6665	0.6665	True
+chipseq_SRR40896959.fastq	adapter+20	Bases removed with quality 20 (%)	34.2578	34.2877	estimate
+chipseq_SRR40896959.fastq	adapter+20	Reads trimmed with quality 20 (%)	68.6345	68.675	estimate
+chipseq_SRR40896959.fastq	adapter+20	Shorter than 36 with quality 20 (%)	1.2615	1.2865	estimate
+emseq_SRR13076814.fastq	10	bases_removed	0	0	True
+emseq_SRR13076814.fastq	10	reads_trimmed	0	0	True
+emseq_SRR13076814.fastq	10	short20	0	0	True
+emseq_SRR13076814.fastq	10	short36	0.295	0.295	True
+emseq_SRR13076814.fastq	10	short50	0.7865	0.7865	True
+emseq_SRR13076814.fastq	20	bases_removed	0.0849283	0.0849283	True
+emseq_SRR13076814.fastq	20	reads_trimmed	3.3335	3.3335	True
+emseq_SRR13076814.fastq	20	short20	0	0	True
+emseq_SRR13076814.fastq	20	short36	0.3065	0.3065	True
+emseq_SRR13076814.fastq	20	short50	0.808	0.808	True
+emseq_SRR13076814.fastq	30	bases_removed	0.681859	0.681859	True
+emseq_SRR13076814.fastq	30	reads_trimmed	9.054	9.054	True
+emseq_SRR13076814.fastq	30	short20	0.081	0.081	True
+emseq_SRR13076814.fastq	30	short36	0.6265	0.6265	True
+emseq_SRR13076814.fastq	30	short50	1.308	1.308	True
+emseq_SRR13076814.fastq	adapter+20	Bases removed with quality 20 (%)	0.216223	0.225815	estimate
+emseq_SRR13076814.fastq	adapter+20	Reads trimmed with quality 20 (%)	7.021	7.0375	estimate
+emseq_SRR13076814.fastq	adapter+20	Shorter than 36 with quality 20 (%)	0.318	0.323	estimate
+exome_SRR41127230.fastq	10	bases_removed	0	0	True
+exome_SRR41127230.fastq	10	reads_trimmed	0	0	True
+exome_SRR41127230.fastq	10	short20	0	0	True
+exome_SRR41127230.fastq	10	short36	0	0	True
+exome_SRR41127230.fastq	10	short50	0	0	True
+exome_SRR41127230.fastq	20	bases_removed	0.151483	0.151483	True
+exome_SRR41127230.fastq	20	reads_trimmed	4.185	4.185	True
+exome_SRR41127230.fastq	20	short20	0.0005	0.0005	True
+exome_SRR41127230.fastq	20	short36	0.0095	0.0095	True
+exome_SRR41127230.fastq	20	short50	0.0295	0.0295	True
+exome_SRR41127230.fastq	30	bases_removed	0.944841	0.944841	True
+exome_SRR41127230.fastq	30	reads_trimmed	9.709	9.709	True
+exome_SRR41127230.fastq	30	short20	0.1325	0.1325	True
+exome_SRR41127230.fastq	30	short36	0.345	0.345	True
+exome_SRR41127230.fastq	30	short50	0.5285	0.5285	True
+exome_SRR41127230.fastq	adapter+20	Bases removed with quality 20 (%)	5.06993	5.09635	estimate
+exome_SRR41127230.fastq	adapter+20	Reads trimmed with quality 20 (%)	25.1225	25.191	estimate
+exome_SRR41127230.fastq	adapter+20	Shorter than 36 with quality 20 (%)	0.027	0.0335	estimate
+pe_SRR12898355_R1.fastq	10	bases_removed	1.85519	1.85519	True
+pe_SRR12898355_R1.fastq	10	reads_trimmed	31.6715	31.6715	True
+pe_SRR12898355_R1.fastq	10	short20	0.051	0.051	True
+pe_SRR12898355_R1.fastq	10	short36	0.325	0.325	True
+pe_SRR12898355_R1.fastq	10	short50	0.607	0.607	True
+pe_SRR12898355_R1.fastq	20	bases_removed	1.85527	1.85527	True
+pe_SRR12898355_R1.fastq	20	reads_trimmed	31.6715	31.6715	True
+pe_SRR12898355_R1.fastq	20	short20	0.051	0.051	True
+pe_SRR12898355_R1.fastq	20	short36	0.325	0.325	True
+pe_SRR12898355_R1.fastq	20	short50	0.607	0.607	True
+pe_SRR12898355_R1.fastq	30	bases_removed	5.17327	5.17327	True
+pe_SRR12898355_R1.fastq	30	reads_trimmed	45.805	45.805	True
+pe_SRR12898355_R1.fastq	30	short20	1.1525	1.1525	True
+pe_SRR12898355_R1.fastq	30	short36	2.139	2.139	True
+pe_SRR12898355_R1.fastq	30	short50	2.9975	2.9975	True
+pe_SRR12898355_R1.fastq	adapter+20	Bases removed with quality 20 (%)	2.04765	2.06704	estimate
+pe_SRR12898355_R1.fastq	adapter+20	Reads trimmed with quality 20 (%)	33.867	33.8775	estimate
+pe_SRR12898355_R1.fastq	adapter+20	Shorter than 36 with quality 20 (%)	0.34	0.3525	estimate
+rnaseq_SRR41451237.fastq	10	bases_removed	0	0	True
+rnaseq_SRR41451237.fastq	10	reads_trimmed	0	0	True
+rnaseq_SRR41451237.fastq	10	short20	0	0	True
+rnaseq_SRR41451237.fastq	10	short36	0	0	True
+rnaseq_SRR41451237.fastq	10	short50	0	0	True
+rnaseq_SRR41451237.fastq	20	bases_removed	0.259077	0.259077	True
+rnaseq_SRR41451237.fastq	20	reads_trimmed	5.101	5.101	True
+rnaseq_SRR41451237.fastq	20	short20	0	0	True
+rnaseq_SRR41451237.fastq	20	short36	0.0285	0.0285	True
+rnaseq_SRR41451237.fastq	20	short50	0.072	0.072	True
+rnaseq_SRR41451237.fastq	30	bases_removed	1.55605	1.55605	True
+rnaseq_SRR41451237.fastq	30	reads_trimmed	13.6635	13.6635	True
+rnaseq_SRR41451237.fastq	30	short20	0.122	0.122	True
+rnaseq_SRR41451237.fastq	30	short36	0.6015	0.6015	True
+rnaseq_SRR41451237.fastq	30	short50	0.8785	0.8785	True
+rnaseq_SRR41451237.fastq	adapter+20	Bases removed with quality 20 (%)	0.571253	0.594967	estimate
+rnaseq_SRR41451237.fastq	adapter+20	Reads trimmed with quality 20 (%)	8.823	8.865	estimate
+rnaseq_SRR41451237.fastq	adapter+20	Shorter than 36 with quality 20 (%)	0.035	0.047	estimate
+rrbs_SRR41080386.fastq	10	bases_removed	1e-05	1e-05	True
+rrbs_SRR41080386.fastq	10	reads_trimmed	0.0015	0.0015	True
+rrbs_SRR41080386.fastq	10	short20	0	0	True
+rrbs_SRR41080386.fastq	10	short36	0	0	True
+rrbs_SRR41080386.fastq	10	short50	0	0	True
+rrbs_SRR41080386.fastq	20	bases_removed	0.648163	0.648163	True
+rrbs_SRR41080386.fastq	20	reads_trimmed	21.1275	21.1275	True
+rrbs_SRR41080386.fastq	20	short20	0	0	True
+rrbs_SRR41080386.fastq	20	short36	0	0	True
+rrbs_SRR41080386.fastq	20	short50	0.001	0.001	True
+rrbs_SRR41080386.fastq	30	bases_removed	2.72364	2.72364	True
+rrbs_SRR41080386.fastq	30	reads_trimmed	31.765	31.765	True
+rrbs_SRR41080386.fastq	30	short20	0.1275	0.1275	True
+rrbs_SRR41080386.fastq	30	short36	0.196	0.196	True
+rrbs_SRR41080386.fastq	30	short50	0.284	0.284	True
+rrbs_SRR41080386.fastq	adapter+20	Bases removed with quality 20 (%)	29.2611	29.3945	estimate
+rrbs_SRR41080386.fastq	adapter+20	Reads trimmed with quality 20 (%)	75.5205	75.7975	estimate
+rrbs_SRR41080386.fastq	adapter+20	Shorter than 36 with quality 20 (%)	0.0875	0.0935	estimate
+smallrna_SRR41413611.fastq	10	bases_removed	0	0	True
+smallrna_SRR41413611.fastq	10	reads_trimmed	0	0	True
+smallrna_SRR41413611.fastq	10	short20	0	0	True
+smallrna_SRR41413611.fastq	10	short36	0	0	True
+smallrna_SRR41413611.fastq	10	short50	0	0	True
+smallrna_SRR41413611.fastq	20	bases_removed	0.289098	0.289098	True
+smallrna_SRR41413611.fastq	20	reads_trimmed	6.744	6.744	True
+smallrna_SRR41413611.fastq	20	short20	0.0005	0.0005	True
+smallrna_SRR41413611.fastq	20	short36	0.0265	0.0265	True
+smallrna_SRR41413611.fastq	20	short50	0.1645	0.1645	True
+smallrna_SRR41413611.fastq	30	bases_removed	1.33225	1.33225	True
+smallrna_SRR41413611.fastq	30	reads_trimmed	10.494	10.494	True
+smallrna_SRR41413611.fastq	30	short20	0.584	0.584	True
+smallrna_SRR41413611.fastq	30	short36	0.9715	0.9715	True
+smallrna_SRR41413611.fastq	30	short50	1.5575	1.5575	True
+smallrna_SRR41413611.fastq	adapter+20	Bases removed with quality 20 (%)	53.3746	53.5944	estimate
+smallrna_SRR41413611.fastq	adapter+20	Reads trimmed with quality 20 (%)	96.8515	97.2265	estimate
+smallrna_SRR41413611.fastq	adapter+20	Shorter than 36 with quality 20 (%)	78.483	78.809	estimate
+wgbs_SRR39134064.fastq	10	bases_removed	0.33449	0.33449	True
+wgbs_SRR39134064.fastq	10	reads_trimmed	13.0975	13.0975	True
+wgbs_SRR39134064.fastq	10	short20	0	0	True
+wgbs_SRR39134064.fastq	10	short36	0	0	True
+wgbs_SRR39134064.fastq	10	short50	0	0	True
+wgbs_SRR39134064.fastq	20	bases_removed	1.134	1.134	True
+wgbs_SRR39134064.fastq	20	reads_trimmed	13.0975	13.0975	True
+wgbs_SRR39134064.fastq	20	short20	0.0065	0.0065	True
+wgbs_SRR39134064.fastq	20	short36	0.0185	0.0185	True
+wgbs_SRR39134064.fastq	20	short50	0.0535	0.0535	True
+wgbs_SRR39134064.fastq	30	bases_removed	4.41306	4.41306	True
+wgbs_SRR39134064.fastq	30	reads_trimmed	26.8775	26.8775	True
+wgbs_SRR39134064.fastq	30	short20	0.169	0.169	True
+wgbs_SRR39134064.fastq	30	short36	0.374	0.374	True
+wgbs_SRR39134064.fastq	30	short50	0.674	0.674	True
+wgbs_SRR39134064.fastq	adapter+20	Bases removed with quality 20 (%)	16.9827	16.9962	estimate
+wgbs_SRR39134064.fastq	adapter+20	Reads trimmed with quality 20 (%)	55.4795	55.5145	estimate
+wgbs_SRR39134064.fastq	adapter+20	Shorter than 36 with quality 20 (%)	0.332	0.337	estimate
+wgs_SRR14777166.fastq	10	bases_removed	0.0444772	0.0444772	True
+wgs_SRR14777166.fastq	10	reads_trimmed	0.0445	0.0445	True
+wgs_SRR14777166.fastq	10	short20	0.0445	0.0445	True
+wgs_SRR14777166.fastq	10	short36	0.079	0.079	True
+wgs_SRR14777166.fastq	10	short50	0.1335	0.1335	True
+wgs_SRR14777166.fastq	20	bases_removed	0.0444772	0.0444772	True
+wgs_SRR14777166.fastq	20	reads_trimmed	0.0445	0.0445	True
+wgs_SRR14777166.fastq	20	short20	0.0445	0.0445	True
+wgs_SRR14777166.fastq	20	short36	0.079	0.079	True
+wgs_SRR14777166.fastq	20	short50	0.1335	0.1335	True
+wgs_SRR14777166.fastq	30	bases_removed	0.0444772	0.0444772	True
+wgs_SRR14777166.fastq	30	reads_trimmed	0.0445	0.0445	True
+wgs_SRR14777166.fastq	30	short20	0.0445	0.0445	True
+wgs_SRR14777166.fastq	30	short36	0.079	0.079	True
+wgs_SRR14777166.fastq	30	short50	0.1335	0.1335	True
+wgs_SRR14777166.fastq	adapter+20	Bases removed with quality 20 (%)	0.0473221	0.0473751	estimate
+wgs_SRR14777166.fastq	adapter+20	Reads trimmed with quality 20 (%)	0.0635	0.0635	estimate
+wgs_SRR14777166.fastq	adapter+20	Shorter than 36 with quality 20 (%)	0.079	0.079	estimate

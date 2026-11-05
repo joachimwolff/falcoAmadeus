@@ -16,11 +16,17 @@
 #include "Module.hpp"
 
 #include <algorithm>
+#include <array>
+#if defined(__x86_64__)
+#include <immintrin.h>
+#endif
+#include <cstdint>
 #include <cassert>
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <iomanip>
+#include <mutex>
 #include <sstream>
 
 /******************* AUX FUNCTIONS *******************************************/
@@ -197,6 +203,154 @@ get_corrected_count(std::size_t count_at_limit, std::size_t num_reads,
   // proportion
   return num_obs /
          std::max(std::numeric_limits<double>::min(), 1.0 - p_not_seeing);
+}
+
+// [FalcoAmadeus] get_corrected_count for up to 8 duplication levels at once.
+// Every lane executes exactly the scalar operation sequence (same integer
+// operands converted to double, quotient then product, same early exit), and
+// IEEE division and multiplication are correctly rounded in every instruction
+// set, so each result is bit-identical to get_corrected_count. The lanes only
+// hide the latency of the dependent product chain.
+static void
+corrected_count_lanes(std::size_t count_at_limit, std::size_t num_reads,
+                      const std::size_t *dup_level, const double *lim,
+                      double *p_not_seeing, std::size_t nlanes) {
+  constexpr std::size_t L = 8;
+  std::size_t d[L];
+  double lm[L], p[L];
+  std::uint64_t act[L];
+  for (std::size_t l = 0; l < L; ++l) {
+    const bool used = l < nlanes;
+    d[l] = used ? dup_level[l] : 0;
+    lm[l] = used ? lim[l] : 0.0;
+    p[l] = 1.0;
+    act[l] = used ? ~std::uint64_t(0) : 0;
+  }
+  for (std::size_t i = 0; i < count_at_limit;) {
+    const std::size_t stop = std::min(count_at_limit, i + 64);
+    for (; i < stop; ++i) {
+      const std::size_t rem = num_reads - i;
+      const double den = static_cast<double>(rem);
+      for (std::size_t l = 0; l < L; ++l) {
+        const double np = p[l] * (static_cast<double>(rem - d[l]) / den);
+        const std::uint64_t done = (np < lm[l]) ? ~std::uint64_t(0) : 0;
+        const double nv = done ? 0.0 : np;
+        p[l] = act[l] ? nv : p[l];
+        act[l] &= ~done;
+      }
+    }
+    std::uint64_t any = 0;
+    for (std::size_t l = 0; l < L; ++l)
+      any |= act[l];
+    if (!any)
+      break;
+  }
+  for (std::size_t l = 0; l < nlanes; ++l)
+    p_not_seeing[l] = p[l];
+}
+
+#if defined(__x86_64__)
+// AVX2 form of corrected_count_lanes, 8 lanes in two registers. Integer
+// operands below 2^52 convert exactly through the 2^52 bias trick, which is
+// the value static_cast<double> produces; the caller guarantees that range.
+__attribute__((target("avx2"))) static void
+corrected_count_lanes_avx2(std::size_t count_at_limit, std::size_t num_reads,
+                           const std::size_t *dup_level, const double *lim,
+                           double *p_not_seeing, std::size_t nlanes) {
+  alignas(32) std::int64_t d[8];
+  alignas(32) double lm[8], pout[8];
+  alignas(32) std::int64_t am[8];
+  for (std::size_t l = 0; l < 8; ++l) {
+    const bool used = l < nlanes;
+    d[l] = used ? static_cast<std::int64_t>(dup_level[l]) : 0;
+    lm[l] = used ? lim[l] : 0.0;
+    am[l] = used ? -1 : 0;
+  }
+  const __m256i bias_i = _mm256_set1_epi64x(0x4330000000000000LL);
+  const __m256d bias_d = _mm256_set1_pd(4503599627370496.0);  // 2^52
+#define FA_TO_D(x)                                                         \
+  _mm256_sub_pd(_mm256_castsi256_pd(_mm256_or_si256((x), bias_i)), bias_d)
+  const __m256i d0 = _mm256_load_si256(reinterpret_cast<const __m256i *>(d));
+  const __m256i d1 =
+    _mm256_load_si256(reinterpret_cast<const __m256i *>(d + 4));
+  const __m256d lm0 = _mm256_load_pd(lm), lm1 = _mm256_load_pd(lm + 4);
+  __m256d a0 = _mm256_castsi256_pd(
+    _mm256_load_si256(reinterpret_cast<const __m256i *>(am)));
+  __m256d a1 = _mm256_castsi256_pd(
+    _mm256_load_si256(reinterpret_cast<const __m256i *>(am + 4)));
+  __m256d p0 = _mm256_set1_pd(1.0), p1 = p0;
+  const __m256d zero = _mm256_setzero_pd();
+  for (std::size_t i = 0; i < count_at_limit;) {
+    const std::size_t stop = std::min(count_at_limit, i + 64);
+    for (; i < stop; ++i) {
+      const std::int64_t rem = static_cast<std::int64_t>(num_reads - i);
+      const __m256i r = _mm256_set1_epi64x(rem);
+      const __m256d den = _mm256_set1_pd(static_cast<double>(rem));
+      const __m256d q0 = _mm256_div_pd(FA_TO_D(_mm256_sub_epi64(r, d0)), den);
+      const __m256d q1 = _mm256_div_pd(FA_TO_D(_mm256_sub_epi64(r, d1)), den);
+      const __m256d n0 = _mm256_mul_pd(p0, q0), n1 = _mm256_mul_pd(p1, q1);
+      const __m256d x0 = _mm256_cmp_pd(n0, lm0, _CMP_LT_OQ);
+      const __m256d x1 = _mm256_cmp_pd(n1, lm1, _CMP_LT_OQ);
+      p0 = _mm256_blendv_pd(p0, _mm256_blendv_pd(n0, zero, x0), a0);
+      p1 = _mm256_blendv_pd(p1, _mm256_blendv_pd(n1, zero, x1), a1);
+      a0 = _mm256_andnot_pd(x0, a0);
+      a1 = _mm256_andnot_pd(x1, a1);
+    }
+    if (_mm256_movemask_pd(_mm256_or_pd(a0, a1)) == 0)
+      break;
+  }
+#undef FA_TO_D
+  _mm256_store_pd(pout, p0);
+  _mm256_store_pd(pout + 4, p1);
+  for (std::size_t l = 0; l < nlanes; ++l)
+    p_not_seeing[l] = pout[l];
+}
+#endif
+
+void
+get_corrected_counts(std::size_t count_at_limit, std::size_t num_reads,
+                     const std::size_t *dup_level, const std::size_t *num_obs,
+                     double *out, std::size_t n) {
+  std::size_t lv[8], idx[8];
+  double lim[8], pns[8];
+  std::size_t k = 0;
+#if defined(__x86_64__)
+  static const bool have_avx2 = __builtin_cpu_supports("avx2");
+#endif
+  auto flush = [&] {
+    bool done = false;
+#if defined(__x86_64__)
+    // exact conversion needs every operand below 2^52 and no wrap-around
+    const std::size_t min_rem = num_reads - count_at_limit + 1;
+    bool fits = have_avx2 && num_reads < (std::size_t(1) << 52);
+    for (std::size_t j = 0; j < k; ++j)
+      fits = fits && lv[j] <= min_rem;
+    if (fits) {
+      corrected_count_lanes_avx2(count_at_limit, num_reads, lv, lim, pns, k);
+      done = true;
+    }
+#endif
+    if (!done)
+      corrected_count_lanes(count_at_limit, num_reads, lv, lim, pns, k);
+    for (std::size_t j = 0; j < k; ++j)
+      out[idx[j]] = num_obs[idx[j]] /
+        std::max(std::numeric_limits<double>::min(), 1.0 - pns[j]);
+    k = 0;
+  };
+  for (std::size_t i = 0; i < n; ++i) {
+    if (count_at_limit == num_reads ||
+        num_reads - num_obs[i] < count_at_limit) {
+      out[i] = num_obs[i];
+      continue;
+    }
+    lv[k] = dup_level[i];
+    lim[k] = 1.0 - (num_obs[i] / (num_obs[i] + 0.01));
+    idx[k] = i;
+    if (++k == 8)
+      flush();
+  }
+  if (k)
+    flush();
 }
 
 // Function to calculate the deviation of a histogram with 100 bins from a
@@ -1063,6 +1217,16 @@ ModulePerSequenceQualityScores::make_html_data() {
   return data.str();
 }
 
+// [FalcoAmadeus] With FA_GRADE_METRICS set, each graded module writes the
+// value its grade is based on to stderr ("FA_METRIC<TAB>module<TAB>value"),
+// for calibrating the assay limits.
+static void
+report_grade_metric(const std::string &module, const double value) {
+  static const bool on = std::getenv("FA_GRADE_METRICS") != nullptr;
+  if (on)
+    std::fprintf(stderr, "FA_METRIC\t%s\t%.4f\n", module.c_str(), value);
+}
+
 /******************* PER BASE SEQUENCE CONTENT **********************/
 // [FalcoAmadeus] "#Assay(<type>): " prefix for grade-explanation comment lines.
 static inline std::string
@@ -1140,7 +1304,37 @@ ModulePerBaseSequenceContent::summarize_module(FastqStats &stats) {
     // more-depleted base => that strand's converted base
     is_reverse_complement = (mean_g_frac < mean_c_frac);  // G-depleted => OB/R2
     methyl_depleted_base = is_reverse_complement ? 'G' : 'C';
-    methyl_residual = is_reverse_complement ? mean_g_frac : mean_c_frac;
+    // unconverted share outside CpG (methylated CpGs keep their C), over the
+    // reads of both conversion strands: C among C+T followed by a non-G in
+    // C->T reads, G among G+A preceded by a non-C in G->A reads; see
+    // count_conversion_context
+    const auto &cx = stats.conv_ctx;
+    const double all =
+      static_cast<double>(cx[0] + cx[1] + cx[2] + cx[3]);
+    methyl_residual =
+      all > 0 ? static_cast<double>(cx[0] + cx[2]) / all
+              : (is_reverse_complement ? mean_g_frac : mean_c_frac);
+
+    // the library's mean composition (percent, N included in the total, as
+    // for the per-position values) over the graded positions
+    double g_tot[5] = {};
+    for (std::size_t i = assay.mask_per_base; i + assay.mask_3p < num_bases;
+         ++i) {
+      for (std::size_t b = 0; b < 4; ++b)
+        g_tot[b] +=
+          (i < FastqStats::SHORT_READ_THRESHOLD)
+            ? stats.base_count[(i << FastqStats::kBitShiftNucleotide) | b]
+            : stats.long_base_count[((i - FastqStats::SHORT_READ_THRESHOLD)
+                                     << FastqStats::kBitShiftNucleotide) | b];
+      g_tot[4] += (i < FastqStats::SHORT_READ_THRESHOLD)
+                    ? stats.n_base_count[i]
+                    : stats.long_n_base_count[i - FastqStats::SHORT_READ_THRESHOLD];
+    }
+    const double g_all = std::max(std::numeric_limits<double>::min(),
+                                  g_tot[0] + g_tot[1] + g_tot[2] + g_tot[3] +
+                                    g_tot[4]);
+    for (std::size_t b = 0; b < 4; ++b)
+      methyl_mean_pct[b] = 100.0 * g_tot[b] / g_all;
   }
 
   if (do_group) {
@@ -1204,8 +1398,18 @@ ModulePerBaseSequenceContent::summarize_module(FastqStats &stats) {
       // reported data table is unchanged; only max_diff (the grade input) is.
       // mask_per_base == 0 (generic) leaves this branch always taken, so the
       // default result is byte-identical.
-      if (i >= assay.mask_per_base) {
-        if (is_bisulfite) {
+      if (i >= assay.mask_per_base && i + assay.mask_3p < num_bases) {
+        if (assay.methylation) {
+          // deviation from the library's own mean composition; positions no
+          // read reaches carry no composition
+          if (total_pos > 0)
+            max_diff = std::max(
+              max_diff, std::max(std::max(std::fabs(a_pos - methyl_mean_pct[0]),
+                                          std::fabs(c_pos - methyl_mean_pct[1])),
+                                 std::max(std::fabs(t_pos - methyl_mean_pct[2]),
+                                          std::fabs(g_pos - methyl_mean_pct[3]))));
+        }
+        else if (is_bisulfite) {
           // for WGBS, we only test non-bisulfite treated bases
           max_diff =
             std::max(max_diff, is_reverse_complement ? std::fabs(c_pos - t_pos)
@@ -1234,6 +1438,7 @@ ModulePerBaseSequenceContent::summarize_module(FastqStats &stats) {
 
 void
 ModulePerBaseSequenceContent::make_grade() {
+  report_grade_metric(module_name, max_diff);
   if (max_diff > sequence_error) {
     grade = "fail";
   }
@@ -1248,20 +1453,29 @@ ModulePerBaseSequenceContent::make_grade() {
   const std::string tag = assay_tag(assay);
 
   if (assay.methylation) {
-    // The bisulfite-aware max_diff above already EXCLUDES the expected C->T (or
-    // G->A) depletion (it compares only non-converted bases), so a proper
-    // library grades PASS naturally. Annotate the expected depletion, then
-    // apply the incomplete-conversion heuristic.
+    // max_diff above measures each position against the library's own mean
+    // composition, so the expected C->T (or G->A) depletion does not count
+    // and a library of even composition grades PASS. Annotate the expected
+    // depletion, then apply the incomplete-conversion heuristic.
     const std::string role =
       is_reverse_complement ? "G->A Read2" : "C->T Read1";
     assay_annotations.push_back(
       tag + "bisulfite/EM library: " + role + " depletion expected");
-
-    if (methyl_residual > incomplete_conversion_residual) {
-      const std::string base(1, methyl_depleted_base);
+    if (assay.suppress_per_base && grade != "pass") {
+      grade = "pass";
       assay_annotations.push_back(
-        tag + "possible incomplete bisulfite conversion (residual " + base +
-        " " + fmt_pct(100.0 * methyl_residual) + "% > " +
+        tag + "per-base composition follows the selected fragments for this "
+              "assay; not graded");
+    }
+
+    assay_annotations.push_back(
+      tag + "conversion estimate: unconverted C outside CpG " +
+      fmt_pct(100.0 * methyl_residual) + "% (limit " +
+      fmt_pct(100.0 * incomplete_conversion_residual) + "%)");
+    if (methyl_residual > incomplete_conversion_residual) {
+      assay_annotations.push_back(
+        tag + "possible incomplete bisulfite conversion (unconverted C "
+              "outside CpG " + fmt_pct(100.0 * methyl_residual) + "% > " +
         fmt_pct(100.0 * incomplete_conversion_residual) +
         "%); verify with CHH/spike-in conversion rate downstream");
       // soft-flag only; NEVER hard-FAIL on a raw-read conversion estimate.
@@ -1440,6 +1654,7 @@ ModulePerSequenceGCContent::summarize_module(FastqStats &stats) {
 
 void
 ModulePerSequenceGCContent::make_grade() {
+  report_grade_metric(module_name, gc_deviation);
   if (gc_deviation >= gc_error) {
     grade = "fail";
   }
@@ -1454,8 +1669,16 @@ ModulePerSequenceGCContent::make_grade() {
   if (assay.name == "generic")
     return;
   if (assay.relax_gc && grade == "fail") {
-    grade = "warn";
     const std::string tag = assay_tag(assay);
+    if (assay.gc_fail > 0 && gc_deviation >= assay.gc_fail) {
+      // beyond what the assay's own shift explains (e.g. a contaminant)
+      assay_annotations.push_back(
+        tag + "GC deviation " + fmt_pct(gc_deviation) + "% exceeds the " +
+        fmt_pct(assay.gc_fail) +
+        "% expected for this assay at most; graded FAIL");
+      return;
+    }
+    grade = "warn";
     if (assay.methylation)
       assay_annotations.push_back(
         tag + "bisulfite/EM conversion shifts the GC distribution down; "
@@ -1524,6 +1747,7 @@ ModulePerBaseNContent::ModulePerBaseNContent(const FalcoConfig &config) :
   grade_n_warn = grade_n.find("warn")->second;
   grade_n_error = grade_n.find("error")->second;
   do_group = !config.nogroup;
+  legacy_grade = config.legacy_n_content_grade;
 }
 
 void
@@ -1572,12 +1796,20 @@ ModulePerBaseNContent::summarize_module(FastqStats &stats) {
 
 void
 ModulePerBaseNContent::make_grade() {
+  // The reported percentages per position (or group), as in FastQC; the
+  // legacy grade compares the largest per-base fraction instead.
+  double worst = max_n_pct;
+  if (!legacy_grade) {
+    worst = 0.0;
+    for (const double p : n_pct)
+      worst = std::max(worst, p);
+  }
   if (grade != "fail") {
-    if (max_n_pct > grade_n_error) {
+    if (worst > grade_n_error) {
       grade = "fail";
     }
 
-    else if (max_n_pct > grade_n_warn) {
+    else if (worst > grade_n_warn) {
       grade = "warn";
     }
   }
@@ -1782,13 +2014,22 @@ ModuleSequenceDuplicationLevels::summarize_module(FastqStats &stats) {
       freqs.emplace_back(v.first, v.second);
     std::vector<double> corrected(freqs.size());
     const std::size_t nf = freqs.size();
+    std::vector<std::size_t> lvl(nf), obs(nf);
+    for (std::size_t i = 0; i < nf; ++i) {
+      lvl[i] = freqs[i].first;
+      obs[i] = freqs[i].second;
+    }
+    // batches of 8 consecutive levels (similar loop lengths share a batch)
+    const std::size_t nb = (nf + 7) / 8;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic) num_threads(nthreads) \
-  if (nthreads > 1 && nf > 32)
+  if (nthreads > 1 && nb > 4)
 #endif
-    for (std::size_t i = 0; i < nf; ++i)
-      corrected[i] = get_corrected_count(stats.count_at_limit, stats.num_reads,
-                                         freqs[i].first, freqs[i].second);
+    for (std::size_t b = 0; b < nb; ++b) {
+      const std::size_t a = b * 8, e = std::min(nf, a + 8);
+      get_corrected_counts(stats.count_at_limit, stats.num_reads, &lvl[a],
+                           &obs[a], &corrected[a], e - a);
+    }
     for (std::size_t i = 0; i < nf; ++i)
       counts_by_freq[freqs[i].first] = corrected[i];
   }
@@ -1833,6 +2074,7 @@ ModuleSequenceDuplicationLevels::summarize_module(FastqStats &stats) {
 
 void
 ModuleSequenceDuplicationLevels::make_grade() {
+  report_grade_metric(module_name, total_deduplicated_pct);
   // pass warn fail criteria : unique reads must be >80%
   // (otherwise warn) or >50% (otherwisefail)
   if (total_deduplicated_pct <= grade_dup_error) {
@@ -1851,6 +2093,14 @@ ModuleSequenceDuplicationLevels::make_grade() {
   if (assay.name == "generic")
     return;
   if (assay.downgrade_dup && grade == "fail") {
+    if (assay.dup_fail > 0 && total_deduplicated_pct <= assay.dup_fail) {
+      assay_annotations.push_back(
+        assay_tag(assay) + "only " + fmt_pct(total_deduplicated_pct) +
+        "% of reads would remain after deduplication, below the " +
+        fmt_pct(assay.dup_fail) +
+        "% expected for this assay at least; graded FAIL");
+      return;
+    }
     grade = "warn";
     assay_annotations.push_back(
       assay_tag(assay) +
@@ -1934,41 +2184,178 @@ ModuleOverrepresentedSequences::ModuleOverrepresentedSequences(
   assay = config.assay_profile;
 }
 
-// gets the largest suffix of left which is a prefix of right
-// returns 0 if none exist
+// gets the largest suffix of left which is a prefix of right, or the length
+// of right when right occurs inside left; returns 0 if none exist.
+// [FalcoAmadeus] One Knuth-Morris-Pratt pass of left against right instead of
+// a comparison from every start of left: a full match of right is the longest
+// possible answer, and otherwise the matcher's final state is the longest
+// suffix of left that is a prefix of right. With every overrepresented
+// sequence compared with every contaminant in both directions, the start-by-
+// start search took more time per small file than its parse.
 std::size_t
 get_overlap(const std::string &left, const std::string &right) {
-  const auto left_st(begin(left));
-  const auto left_end(end(left));
-
-  const auto right_st(begin(right));
-  const auto right_end(end(right));
-
-  std::size_t best = 0;
-  const auto sz = std::size(left);
-  for (std::size_t start = 0; start < sz; ++start) {
-    std::size_t cur = 0;
-    auto left_it(left_st + start);
-    auto right_it(right_st);
-    for (; (left_it != left_end) && (right_it != right_end) &&
-           (*left_it == *right_it);
-         ++left_it, ++right_it, ++cur)
-      ;
-
-    // does not accept if overlap does not cover a suffix or the
-    // entirety of right
-    cur = (left_it == left_end || right_it == right_end) ? (cur) : 0;
-    best = std::max(best, cur);
+  const std::size_t m = std::size(right);
+  if (m == 0 || left.empty())
+    return 0;
+  std::array<std::uint8_t, 256> pi_small;
+  std::vector<std::size_t> pi_large;
+  const bool small = m <= pi_small.size();
+  if (!small)
+    pi_large.assign(m, 0);
+  auto pi = [&](std::size_t i) -> std::size_t {
+    return small ? pi_small[i] : pi_large[i];
+  };
+  auto set_pi = [&](std::size_t i, std::size_t v) {
+    if (small)
+      pi_small[i] = static_cast<std::uint8_t>(v);
+    else
+      pi_large[i] = v;
+  };
+  set_pi(0, 0);
+  for (std::size_t i = 1, k = 0; i < m; ++i) {
+    while (k > 0 && right[i] != right[k])
+      k = pi(k - 1);
+    if (right[i] == right[k])
+      ++k;
+    set_pi(i, k);
   }
-  return best;
+  std::size_t q = 0;
+  for (const char c : left) {
+    while (q > 0 && c != right[q])
+      q = pi(q - 1);
+    if (c == right[q])
+      ++q;
+    if (q == m)
+      return m;
+  }
+  return q;
+}
+
+// [FalcoAmadeus] Contaminant pre-filter. A contaminant is reported only when
+// its overlap with the sequence reaches min(name length, sequence length) / 2
+// (the FastQC rule below). Where that threshold is at least kContamK, such an
+// overlap contains a common substring of kContamK bases, so a contaminant that
+// shares no kContamK-mer with the sequence cannot be reported. When none of
+// the remaining candidates reaches its threshold and some contaminant
+// overlaps the sequence by at least one base (one ends with the sequence's
+// first base or starts with its last), the answer is "No Hit" without
+// comparing the sequence with every contaminant (with no overlap at all the
+// rule returns an empty source). Otherwise the full comparison below decides
+// (the best overlap may belong to another contaminant). Contaminants with a
+// base other than ACGT are always candidates.
+namespace {
+constexpr std::size_t kContamK = 10;
+constexpr std::size_t kContamIndexMin = 32;
+
+int
+acgt_code(const char c) {
+  switch (c) {
+    case 'A': return 0;
+    case 'C': return 1;
+    case 'G': return 2;
+    case 'T': return 3;
+    default: return -1;
+  }
+}
+
+// calls f(code) for every window of kContamK ACGT bases of s
+template <class F>
+void
+for_each_kmer(const std::string &s, F f) {
+  std::uint32_t k = 0;
+  std::size_t run = 0;
+  for (const char ch : s) {
+    const int c = acgt_code(ch);
+    if (c < 0) {
+      run = 0;
+      continue;
+    }
+    k = ((k << 2) | static_cast<std::uint32_t>(c)) &
+        ((1u << (2 * kContamK)) - 1);
+    if (++run >= kContamK)
+      f(k);
+  }
+}
+
+struct ContamIndex {
+  std::vector<std::pair<std::string, std::string>> list;
+  // (k-mer << 32) | contaminant, sorted: a compact table (8 bytes per k-mer
+  // of the list) instead of a node per k-mer
+  std::vector<std::uint64_t> kmers;
+  std::vector<bool> non_acgt;  // a base other than ACGT
+  // some contaminant starts / ends with this character
+  std::array<bool, 256> first{}, last{};
+
+  void build(const std::vector<std::pair<std::string, std::string>> &l) {
+    list = l;
+    kmers.clear();
+    std::size_t n = 0;
+    for (const auto &c : l)
+      n += c.second.size() >= kContamK ? c.second.size() - kContamK + 1 : 0;
+    kmers.reserve(n);
+    non_acgt.assign(l.size(), false);
+    first.fill(false);
+    last.fill(false);
+    for (std::uint32_t i = 0; i < l.size(); ++i) {
+      if (!l[i].second.empty()) {
+        first[static_cast<unsigned char>(l[i].second.front())] = true;
+        last[static_cast<unsigned char>(l[i].second.back())] = true;
+      }
+      for (const char ch : l[i].second)
+        if (acgt_code(ch) < 0)
+          non_acgt[i] = true;
+      for_each_kmer(l[i].second, [&](std::uint32_t k) {
+        kmers.push_back((static_cast<std::uint64_t>(k) << 32) | i);
+      });
+    }
+    std::sort(kmers.begin(), kmers.end());
+    kmers.erase(std::unique(kmers.begin(), kmers.end()), kmers.end());
+  }
+};
+}  // namespace
+
+bool
+ModuleOverrepresentedSequences::surely_no_hit(const std::string &seq) {
+  static std::mutex m;
+  static ContamIndex ix;
+  std::lock_guard<std::mutex> lk(m);
+  if (ix.list != contaminants)
+    ix.build(contaminants);
+  if (seq.empty() || !(ix.last[static_cast<unsigned char>(seq.front())] ||
+                       ix.first[static_cast<unsigned char>(seq.back())]))
+    return false;  // possibly no overlap at all: the full comparison decides
+  std::vector<bool> cand(contaminants.size(), false);
+  for (std::size_t i = 0; i < contaminants.size(); ++i)
+    cand[i] = ix.non_acgt[i] ||
+              std::min(std::size(contaminants[i].first), std::size(seq)) / 2 <
+                kContamK;
+  for_each_kmer(seq, [&](std::uint32_t k) {
+    const std::uint64_t lo = static_cast<std::uint64_t>(k) << 32;
+    for (auto it = std::lower_bound(ix.kmers.begin(), ix.kmers.end(), lo);
+         it != ix.kmers.end() && (*it >> 32) == k; ++it)
+      cand[static_cast<std::uint32_t>(*it)] = true;
+  });
+  for (std::size_t i = 0; i < contaminants.size(); ++i) {
+    if (!cand[i])
+      continue;
+    const auto &v = contaminants[i];
+    const std::size_t ov =
+      std::max(get_overlap(v.second, seq), get_overlap(seq, v.second));
+    if (ov >= std::min(std::size(v.first), std::size(seq)) / 2)
+      return false;
+  }
+  return true;
 }
 
 std::string
 ModuleOverrepresentedSequences::get_matching_contaminant(
   const std::string &seq) {
+  // the index pays off once a file has a few dozen such sequences
+  if (overrep_sequences.size() >= kContamIndexMin && surely_no_hit(seq))
+    return "No Hit";
   std::size_t best = 0;
   std::string ret;
-  for (auto v : contaminants) {
+  for (const auto &v : contaminants) {
     const std::size_t cand =
       std::max(get_overlap(v.second, seq), get_overlap(seq, v.second));
     if (cand > best) {
@@ -1990,7 +2377,8 @@ ModuleOverrepresentedSequences::summarize_module(FastqStats &stats) {
   for (auto it = std::cbegin(stats.sequence_count);
        it != std::cend(stats.sequence_count); ++it) {
     if (it->second > num_reads * min_fraction_to_overrepresented) {
-      overrep_sequences.push_back(*it);
+      overrep_sequences.emplace_back(stats.sequence_count.key_of(it),
+                                     it->second);
     }
   }
   // Sort by frequency, breaking ties by the sequence itself. This is a
@@ -2039,14 +2427,24 @@ ModuleOverrepresentedSequences::make_grade() {
   }
 }
 
+const std::string &
+ModuleOverrepresentedSequences::source_of(const std::size_t i) {
+  if (overrep_sources.size() != overrep_sequences.size())
+    overrep_sources.assign(overrep_sequences.size(), std::string());
+  if (overrep_sources[i].empty())
+    overrep_sources[i] = get_matching_contaminant(overrep_sequences[i].first);
+  return overrep_sources[i];
+}
+
 void
 ModuleOverrepresentedSequences::write_module(std::ostream &os) {
   if (std::size(overrep_sequences) > 0)
     os << "#Sequence\tCount\tPercentage\tPossible Source\n";
-  for (auto seq : overrep_sequences) {
+  for (std::size_t i = 0; i < overrep_sequences.size(); ++i) {
+    const auto &seq = overrep_sequences[i];
     os << seq.first << "\t" << seq.second << "\t"
        << 100.0 * seq.second / std::max(static_cast<std::size_t>(1), num_reads)
-       << "\t" << get_matching_contaminant(seq.first) << "\n";
+       << "\t" << source_of(i) << "\n";
   }
 }
 
@@ -2065,13 +2463,14 @@ ModuleOverrepresentedSequences::make_html_data() {
   data << "</tr></thead><tbody>";
 
   // All overrep sequences
-  for (auto v : overrep_sequences) {
+  for (std::size_t i = 0; i < overrep_sequences.size(); ++i) {
+    const auto &v = overrep_sequences[i];
     data << "<tr><td>" << v.first << "</td>";
     data << "<td>" << v.second << "</td>";
     data << "<td>"
          << 100.0 * v.second / std::max(static_cast<std::size_t>(1), num_reads)
          << "</td>";
-    data << "<td>" << get_matching_contaminant(v.first) << "</td>";
+    data << "<td>" << source_of(i) << "</td>";
     data << "</tr>";
   }
   data << "</tbody></table>";
@@ -2104,6 +2503,7 @@ ModuleAdapterContent::ModuleAdapterContent(const FalcoConfig &config) :
   grade_error = grade_adapter.find("error")->second;
 
   adapter_size = config.adapter_size;
+  assay = config.assay_profile;
 }
 
 void
@@ -2150,6 +2550,13 @@ ModuleAdapterContent::summarize_module(FastqStats &stats) {
 
 void
 ModuleAdapterContent::make_grade() {
+  {
+    double mx = 0;
+    for (const auto &v : adapter_pos_pct)
+      for (const double x : v)
+        mx = std::max(mx, x);
+    report_grade_metric(module_name, mx);
+  }
   for (std::size_t i = 0; i < std::size(adapter_pos_pct); ++i) {
     for (std::size_t j = 0; j < std::size(adapter_pos_pct[0]); ++j) {
       if (grade != "fail") {
@@ -2161,6 +2568,16 @@ ModuleAdapterContent::make_grade() {
         }
       }
     }
+  }
+  // [FalcoAmadeus] small RNA: the molecules are shorter than the reads, so
+  // raw reads end in the 3' adapter. Kept visible (it must be trimmed) but
+  // not a library failure. generic == stock behavior.
+  if (assay.expect_adapter && grade == "fail") {
+    grade = "warn";
+    assay_annotations.push_back(
+      assay_tag(assay) +
+      "3' adapter read-through is expected in raw reads of molecules "
+      "shorter than the read; trim it before alignment (FAIL->WARN)");
   }
 }
 

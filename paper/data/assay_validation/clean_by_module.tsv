@@ -1,0 +1,111 @@
+assay	profile	module	runs	generic_flagged	profile_flagged	generic_failed	profile_failed
+amplicon16s	16s	Basic Statistics	12	0	0	0	0
+amplicon16s	16s	Per base sequence quality	12	5	5	5	5
+amplicon16s	16s	Per tile sequence quality	12	10	10	6	6
+amplicon16s	16s	Per sequence quality scores	12	0	0	0	0
+amplicon16s	16s	Per base sequence content	12	12	0	12	0
+amplicon16s	16s	Per sequence GC content	12	12	12	12	0
+amplicon16s	16s	Per base N content	12	0	0	0	0
+amplicon16s	16s	Sequence Length Distribution	12	2	2	0	0
+amplicon16s	16s	Sequence Duplication Levels	12	11	11	11	0
+amplicon16s	16s	Overrepresented sequences	12	12	12	12	0
+amplicon16s	16s	Adapter Content	12	4	4	3	3
+atac	atac	Basic Statistics	12	0	0	0	0
+atac	atac	Per base sequence quality	12	0	0	0	0
+atac	atac	Per tile sequence quality	12	1	1	0	0
+atac	atac	Per sequence quality scores	12	0	0	0	0
+atac	atac	Per base sequence content	12	12	7	11	7
+atac	atac	Per sequence GC content	12	3	3	1	1
+atac	atac	Per base N content	12	0	0	0	0
+atac	atac	Sequence Length Distribution	12	1	1	0	0
+atac	atac	Sequence Duplication Levels	12	4	4	2	0
+atac	atac	Overrepresented sequences	12	1	1	0	0
+atac	atac	Adapter Content	12	8	8	8	8
+chipseq	chipseq	Basic Statistics	12	0	0	0	0
+chipseq	chipseq	Per base sequence quality	12	1	1	0	0
+chipseq	chipseq	Per tile sequence quality	12	0	0	0	0
+chipseq	chipseq	Per sequence quality scores	12	0	0	0	0
+chipseq	chipseq	Per base sequence content	12	6	6	3	3
+chipseq	chipseq	Per sequence GC content	12	9	9	3	3
+chipseq	chipseq	Per base N content	12	0	0	0	0
+chipseq	chipseq	Sequence Length Distribution	12	2	2	0	0
+chipseq	chipseq	Sequence Duplication Levels	12	0	0	0	0
+chipseq	chipseq	Overrepresented sequences	12	6	6	1	1
+chipseq	chipseq	Adapter Content	12	2	2	2	2
+emseq	emseq	Basic Statistics	12	0	0	0	0
+emseq	emseq	Per base sequence quality	12	0	0	0	0
+emseq	emseq	Per tile sequence quality	12	2	2	2	2
+emseq	emseq	Per sequence quality scores	12	0	0	0	0
+emseq	emseq	Per base sequence content	12	12	0	8	0
+emseq	emseq	Per sequence GC content	12	9	9	2	2
+emseq	emseq	Per base N content	12	0	0	0	0
+emseq	emseq	Sequence Length Distribution	12	1	1	0	0
+emseq	emseq	Sequence Duplication Levels	12	0	0	0	0
+emseq	emseq	Overrepresented sequences	12	0	0	0	0
+emseq	emseq	Adapter Content	12	7	7	6	6
+exome	exome	Basic Statistics	12	0	0	0	0
+exome	exome	Per base sequence quality	12	6	6	6	6
+exome	exome	Per tile sequence quality	12	1	1	0	0
+exome	exome	Per sequence quality scores	12	3	3	3	3
+exome	exome	Per base sequence content	12	3	3	1	1
+exome	exome	Per sequence GC content	12	12	12	3	0
+exome	exome	Per base N content	12	0	0	0	0
+exome	exome	Sequence Length Distribution	12	1	1	0	0
+exome	exome	Sequence Duplication Levels	12	0	0	0	0
+exome	exome	Overrepresented sequences	12	3	3	3	3
+exome	exome	Adapter Content	12	3	3	3	3
+rnaseq	rnaseq	Basic Statistics	12	0	0	0	0
+rnaseq	rnaseq	Per base sequence quality	12	1	1	0	0
+rnaseq	rnaseq	Per tile sequence quality	12	1	1	1	1
+rnaseq	rnaseq	Per sequence quality scores	12	0	0	0	0
+rnaseq	rnaseq	Per base sequence content	12	12	1	9	1
+rnaseq	rnaseq	Per sequence GC content	12	6	6	0	0
+rnaseq	rnaseq	Per base N content	12	0	0	0	0
+rnaseq	rnaseq	Sequence Length Distribution	12	2	2	0	0
+rnaseq	rnaseq	Sequence Duplication Levels	12	6	6	1	0
+rnaseq	rnaseq	Overrepresented sequences	12	8	8	0	0
+rnaseq	rnaseq	Adapter Content	12	5	5	3	3
+rrbs	rrbs	Basic Statistics	12	0	0	0	0
+rrbs	rrbs	Per base sequence quality	12	0	0	0	0
+rrbs	rrbs	Per tile sequence quality	12	3	3	3	3
+rrbs	rrbs	Per sequence quality scores	12	0	0	0	0
+rrbs	rrbs	Per base sequence content	12	12	2	12	0
+rrbs	rrbs	Per sequence GC content	12	9	9	2	0
+rrbs	rrbs	Per base N content	12	1	1	0	0
+rrbs	rrbs	Sequence Length Distribution	12	2	2	0	0
+rrbs	rrbs	Sequence Duplication Levels	12	9	9	0	0
+rrbs	rrbs	Overrepresented sequences	12	12	12	1	0
+rrbs	rrbs	Adapter Content	12	8	8	8	8
+smallrna	smallrna	Basic Statistics	12	0	0	0	0
+smallrna	smallrna	Per base sequence quality	12	3	3	2	2
+smallrna	smallrna	Per tile sequence quality	12	1	1	1	1
+smallrna	smallrna	Per sequence quality scores	12	0	0	0	0
+smallrna	smallrna	Per base sequence content	12	12	0	12	0
+smallrna	smallrna	Per sequence GC content	12	7	7	6	0
+smallrna	smallrna	Per base N content	12	0	0	0	0
+smallrna	smallrna	Sequence Length Distribution	12	0	0	0	0
+smallrna	smallrna	Sequence Duplication Levels	12	7	7	6	0
+smallrna	smallrna	Overrepresented sequences	12	8	8	8	0
+smallrna	smallrna	Adapter Content	12	12	12	12	0
+wgbs	wgbs	Basic Statistics	12	0	0	0	0
+wgbs	wgbs	Per base sequence quality	12	0	0	0	0
+wgbs	wgbs	Per tile sequence quality	12	1	1	0	0
+wgbs	wgbs	Per sequence quality scores	12	0	0	0	0
+wgbs	wgbs	Per base sequence content	12	12	8	11	4
+wgbs	wgbs	Per sequence GC content	12	9	9	1	1
+wgbs	wgbs	Per base N content	12	0	0	0	0
+wgbs	wgbs	Sequence Length Distribution	12	2	2	0	0
+wgbs	wgbs	Sequence Duplication Levels	12	0	0	0	0
+wgbs	wgbs	Overrepresented sequences	12	4	4	1	1
+wgbs	wgbs	Adapter Content	12	4	4	4	4
+wgs	wgs	Basic Statistics	12	0	0	0	0
+wgs	wgs	Per base sequence quality	12	1	1	1	1
+wgs	wgs	Per tile sequence quality	12	1	1	0	0
+wgs	wgs	Per sequence quality scores	12	1	1	0	0
+wgs	wgs	Per base sequence content	12	5	5	0	0
+wgs	wgs	Per sequence GC content	12	11	11	4	4
+wgs	wgs	Per base N content	12	0	0	0	0
+wgs	wgs	Sequence Length Distribution	12	1	1	0	0
+wgs	wgs	Sequence Duplication Levels	12	0	0	0	0
+wgs	wgs	Overrepresented sequences	12	4	4	0	0
+wgs	wgs	Adapter Content	12	3	3	1	1

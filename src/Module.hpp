@@ -32,6 +32,11 @@
 double
 get_corrected_count(std::size_t count_at_limit, std::size_t num_reads,
                     std::size_t dup_level, std::size_t num_obs);
+// Batch form, bit-identical per element to get_corrected_count.
+void
+get_corrected_counts(std::size_t count_at_limit, std::size_t num_reads,
+                     const std::size_t *dup_level, const std::size_t *num_obs,
+                     double *out, std::size_t n);
 
 /* base groups for longer reads, copied from FastQC*/
 struct BaseGroup {
@@ -236,6 +241,8 @@ struct ModulePerBaseSequenceContent : public Module {
   double mean_c_frac{};
   double mean_g_frac{};
   double methyl_residual{};       // residual fraction of the depleted base
+  // methylation assays: mean A, C, T, G percent over the graded positions
+  double methyl_mean_pct[4]{};
   char methyl_depleted_base{'C'}; // 'C' for Read1/OT, 'G' for Read2/OB
 
   double sequence_error{};  // for grade
@@ -283,6 +290,7 @@ struct ModulePerBaseNContent : public Module {
   std::size_t grade_n_warn{};   // for grade
   std::size_t grade_n_error{};  // for grade
   double max_n_pct{};
+  bool legacy_grade{};  // FalcoConfig::legacy_n_content_grade
   std::array<std::size_t, 101> gc_count;
   std::array<std::size_t, 101> theoretical_gc_count;
   std::vector<double> n_pct;
@@ -363,6 +371,10 @@ struct ModuleOverrepresentedSequences : public Module {
 
   std::size_t num_reads{};
   std::vector<std::pair<std::string, std::size_t>> overrep_sequences;
+  // [FalcoAmadeus] possible source of each overrepresented sequence, looked
+  // up once for the text and the HTML report
+  std::vector<std::string> overrep_sources;
+  const std::string &source_of(std::size_t i);
   double grade_warn{};
   double grade_error{};
   std::vector<std::pair<std::string, std::string>> contaminants;
@@ -372,6 +384,9 @@ struct ModuleOverrepresentedSequences : public Module {
   // Function to find the matching contaminant within the list
   std::string
   get_matching_contaminant(const std::string &seq);
+  // true when no contaminant can match seq (see Module.cpp)
+  bool
+  surely_no_hit(const std::string &seq);
 
   ModuleOverrepresentedSequences(const FalcoConfig &config);
   ~ModuleOverrepresentedSequences() {}
@@ -403,6 +418,7 @@ struct ModuleAdapterContent : public Module {
   // min minimum cutoffs for warn/fail (percentages)
   double grade_warn{};
   double grade_error{};
+  AssayProfile assay;  // [FalcoAmadeus] assay-aware grading
 
   // Aux function to count adapter in a position
   double

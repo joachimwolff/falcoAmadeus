@@ -62,6 +62,8 @@ class RapidgzipSource {
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+#include <deque>
+#include <type_traits>
 #include <unordered_map>
 #ifdef _OPENMP
 #include <omp.h>
@@ -77,6 +79,43 @@ inline T
 min8(const T a, const T b) {
   return (a < b) ? a : b;
 }
+
+// [FalcoAmadeus] Bases of a read (its first n, within the buffer) by CpG
+// context, for the bisulfite/EM conversion estimate. Each read is taken as
+// converted on the strand its composition shows: with fewer C than G it is a
+// C->T read, and its C and T followed by a base other than G are counted;
+// otherwise a G->A read, and its G and A preceded by a base other than C.
+// Cytosines outside CpG are rarely methylated, so the C (or G) share in these
+// contexts approximates the unconverted fraction; methylated CpGs, which keep
+// their C, do not enter it. Deciding per read also covers non-directional
+// libraries, whose reads come from both converted strands.
+static void
+count_conversion_context(FastqStats &stats, const char *s,
+                         const std::size_t n) {
+  std::size_t c = 0, t = 0, g = 0, a = 0, nc = 0, ng = 0;
+  for (std::size_t i = 0; i + 1 < n; ++i) {
+    const char x = s[i], y = s[i + 1];
+    nc += (x == 'C');
+    ng += (x == 'G');
+    if (y != 'G' && y != 'N') {
+      c += (x == 'C');
+      t += (x == 'T');
+    }
+    if (x != 'C' && x != 'N') {
+      g += (y == 'G');
+      a += (y == 'A');
+    }
+  }
+  if (nc <= ng) {
+    stats.conv_ctx[0] += c;
+    stats.conv_ctx[1] += t;
+  }
+  else {
+    stats.conv_ctx[2] += g;
+    stats.conv_ctx[3] += a;
+  }
+}
+
 /****************************************************/
 /***************** STREAMREADER *********************/
 /****************************************************/
@@ -198,6 +237,7 @@ StreamReader::StreamReader(FalcoConfig &config, const std::size_t _buffer_size,
   do_sequence(config.do_sequence), do_gc_sequence(config.do_gc_sequence),
   do_quality_sequence(config.do_quality_sequence), do_tile(config.do_tile),
   do_sequence_length(config.do_sequence_length),
+  do_conversion_context(config.assay_profile.methylation),
 
   // Here are the usual stream reader configs
   field_separator(_field_separator), line_separator(_line_separator),
@@ -488,7 +528,16 @@ StreamReader::postprocess_sequence_line(FastqStats &stats) {
         truncated_length = read_pos;
         truncated_gc_count = cur_gc_count;
       }
-      if (parallel_mode) {
+      // The truncation point is captured after the base at index 100, so
+      // the count covers 101 bases while the model has length 100 (inherited
+      // from falco). A count above the length (101 G/C bases) has no model
+      // entry: falco read past the end of the model there and added nothing
+      // in practice; it contributes nothing here, without the stray read.
+      if (truncated_gc_count > truncated_length) {
+        if (parallel_mode)
+          cur_gc_record->kind = 0;
+      }
+      else if (parallel_mode) {
         // defer to the ordered replay (see GCRecord)
         cur_gc_record->kind = 1;
         cur_gc_record->a = truncated_length;
@@ -527,12 +576,13 @@ StreamReader::postprocess_sequence_line(FastqStats &stats) {
 // scan, N detection, buffer copy, GC count, and per-position base composition
 // accumulated CONTIGUOUSLY into SoA counters (stats.soa_base) -- the SoA layout is
 // what makes the otherwise-scatter base_count vectorisable. The k-mer/adapter
-// sliding window stays scalar (a real loop-carried dependency, and cheap); the loop
-// bails to the scalar path on a separator, any N, or before a GC-truncation point,
+// sliding window stays scalar (a real loop-carried dependency, and cheap). On
+// x86 the loop counts N lanes itself (per position, outside composition and GC);
+// the NEON loop bails to the scalar path on any N. Both stop at the separator,
 // so every edge case keeps exact serial semantics. Only used when do_kmer is off.
 // Both back ends are byte-identical by construction (identical integer math).
 #if defined(__x86_64__) || defined(__i386__)
-__attribute__((target("avx512f,avx512bw,avx512vl,bmi2")))
+__attribute__((target("avx512f,avx512bw,avx512vl,bmi2,popcnt")))
 void
 StreamReader::seq_simd_chunks(FastqStats &stats, const char *&c, std::size_t &rp,
     std::size_t bsz, char sep, char *buf, std::size_t &gc, std::size_t &nba,
@@ -541,7 +591,7 @@ StreamReader::seq_simd_chunks(FastqStats &stats, const char *&c, std::size_t &rp
   const __m512i vN = _mm512_set1_epi8('N');
   const __m512i v3 = _mm512_set1_epi8(3);
   const __m512i v1 = _mm512_set1_epi8(1);
-  const __m512i vzero = _mm512_setzero_si512();
+  const __m512i v2 = _mm512_set1_epi8(2);
   // Base composition goes into the 2 KB uint8 tile (same SoA layout as
   // soa_base): one masked byte-add per code per block instead of four uint32
   // sub-vector RMWs per code. Folded into soa_base by flush_tile8() -- see the
@@ -549,6 +599,10 @@ StreamReader::seq_simd_chunks(FastqStats &stats, const char *&c, std::size_t &rp
   std::uint8_t *const t8 = stats.base_tile8.data();
   const std::size_t T = FastqStats::SHORT_READ_THRESHOLD;
   const std::size_t rp0 = rp;  // start of the region this call covers
+  bool any_n = false;          // the region holds an N (window pass below)
+  // N lanes of each 64-base block of the region, for the window pass
+  __mmask64 nblk[(FastqStats::SHORT_READ_THRESHOLD + 63) / 64] = {};
+  std::size_t nblocks = 0;
   while (rp + 64 <= bsz) {
     const __m512i v = _mm512_loadu_si512(c);
     const __mmask64 msep = _mm512_cmpeq_epi8_mask(v, vsep);
@@ -563,27 +617,37 @@ StreamReader::seq_simd_chunks(FastqStats &stats, const char *&c, std::size_t &rp
     const __mmask64 valid =
         (mlen == 64) ? ~static_cast<__mmask64>(0)
                      : ((static_cast<__mmask64>(1) << mlen) - 1);
-    if (mN & valid)
-      break;  // 'N' before the separator: scalar path keeps exact semantics
+    // N lanes count per position and are left out of the base composition
+    // and GC (as two-bit code and G/C bit an 'N' would read as T and G/C)
+    const __mmask64 nl = mN & valid;
+    const __mmask64 bases = valid & ~nl;
+    nblk[nblocks++] = nl;
+    if (nl) {
+      any_n = true;
+      for (__mmask64 b = nl; b; b &= b - 1)
+        ++stats.n_base_count[rp + static_cast<std::size_t>(__builtin_ctzll(b))];
+    }
     _mm512_mask_storeu_epi8(buf + rp, valid, v);
     const __m512i t = _mm512_and_si512(_mm512_srli_epi16(v, 1), v3);
-    const __m512i tgc = _mm512_maskz_mov_epi8(valid, _mm512_and_si512(t, v1));
+    // G/C lanes: the low bit of the two-bit code, i.e. bit 1 of the byte;
+    // counted with a popcount instead of a byte sum and vector reduction
+    const __mmask64 mgc = _mm512_test_epi8_mask(v, v2) & bases;
     // GC truncation point inside this block's lanes (at most one: the step is
     // 100 > 64). The scalar loop captures gc AFTER adding the base at index
     // next_trunc, so the prefix mask is inclusive of that lane.
     if (do_gc_sequence && next_trunc < rp + mlen) {
       const unsigned L = static_cast<unsigned>(next_trunc - rp);  // < mlen <= 64
-      const __mmask64 pm = (static_cast<__mmask64>(1) << (L + 1)) - 1;
+      const __mmask64 pm = (L == 63) ? ~static_cast<__mmask64>(0)
+                                     : ((static_cast<__mmask64>(1) << (L + 1)) - 1);
       truncated_gc_count =
-          gc + _mm512_reduce_add_epi64(
-                   _mm512_sad_epu8(_mm512_maskz_mov_epi8(pm, tgc), vzero));
+          gc + static_cast<std::size_t>(__builtin_popcountll(mgc & pm));
       truncated_length = next_trunc;
       next_trunc += 100;
     }
-    gc += _mm512_reduce_add_epi64(_mm512_sad_epu8(tgc, vzero));
+    gc += static_cast<std::size_t>(__builtin_popcountll(mgc));
     for (int code = 0; code < 4; ++code) {
       const __mmask64 m =
-          _mm512_cmpeq_epi8_mask(t, _mm512_set1_epi8(code)) & valid;
+          _mm512_cmpeq_epi8_mask(t, _mm512_set1_epi8(code)) & bases;
       // rp + 64 <= bsz <= T keeps the 64-byte access inside this code's row
       std::uint8_t *const tp = t8 + static_cast<std::size_t>(code) * T + rp;
       const __m512i cur = _mm512_loadu_si512(tp);
@@ -598,8 +662,8 @@ StreamReader::seq_simd_chunks(FastqStats &stats, const char *&c, std::size_t &rp
   // the vector loop above. Interleaving this 64-iteration scalar FSM with each
   // vector iteration serialized the whole pass (measured ~60% of uncompressed
   // -t8 wall time); as a separate tight pass over the L1-hot buffer copy it
-  // pipelines. The covered region contains no 'N' and no separator (the vector
-  // loop bails on both), so replaying the window here produces the exact kmer /
+  // pipelines. The covered region contains no separator, and its Ns are
+  // replayed by the scalar loop's rule (below), so the window here produces the exact kmer /
   // nba / adapters_found trajectory the interleaved version produced, in the
   // same order -- byte-identical by construction. State (kmer, nba) hands off
   // to the scalar tail exactly as before.
@@ -614,64 +678,221 @@ StreamReader::seq_simd_chunks(FastqStats &stats, const char *&c, std::size_t &rp
     const bool adap = do_adapter_optimized;
     const std::size_t asz = adapter_size;
     std::size_t k = kmer, nb = nba;
-    std::size_t i = rp0;
-    // warm-up: until the window fills (nba saturates), at most adapter_size
-    for (; i < rp && nb != asz; ++i) {
-      k = (k << Constants::bit_shift_base) |
-          (static_cast<std::size_t>(buf[i] >> 1) & 3);
-      nb += (nb != asz);
-    }
-    if (adap && i < rp) {  // empty region must leave k byte-exact (unmasked)
-      // Steady state, chain-free: the serial recurrence k = ((k<<2)|code)&mask
-      // costs ~3 dependent cycles per base. Instead refill 8 codes at once
-      // (bswap orders the newest base lowest, pext pulls bits 1..2 of each
-      // ASCII byte, i.e. (ch>>1)&3) and form the window ending at lane j
-      // directly from the pre-group k and the fresh codes:
-      //   window_j = ((k << 2*(j+1)) | (g >> 2*(7-j))) & amask
-      // The mask cuts every bit where a masked and an unmasked k history
-      // differ, so each window equals the serial loop's masked value, and the
-      // eight probes are independent immediate-shift expressions out-of-order
-      // hardware can overlap. Probes fire on every steady-state base in
-      // ascending position order: byte-identical trajectory.
-      const auto probe = [&](std::size_t kk, std::size_t pos)
-          __attribute__((always_inline)) {
-        const std::size_t bmb = kk & bmask;
-        if (bm[bmb >> 6] & (static_cast<std::uint64_t>(1) << (bmb & 63))) {
-          for (std::size_t a = 0; a != nad; ++a)
-            if (kk == ad[a] && !adapters_found[a]) {
-              ++stats
-                  .pos_adapter_count[(pos << Constants::bit_shift_adapter) | a];
-              adapters_found[a] = true;
-            }
-        }
-      };
-      for (; i + 8 <= rp; i += 8) {
+    // The window runs over spans without N, eight bases at a time; an N
+    // between spans restarts the run counter and leaves the k-mer as it is
+    // (the scalar loop's rule). A span that follows an N and is shorter than
+    // the adapter probes nothing, and its bases leave the masked window
+    // before the next probe, so it is skipped: the probes and the run counter
+    // are the serial ones (only k-mer bits that every probe masks differ).
+    // A short read (at most 32 bases from the read start, no N): its codes
+    // fit one word, so every window is a shift of it, all windows are
+    // compared with every adapter at once, and the probes run in order only
+    // when one matches. k and the run counter end as the serial loop leaves
+    // them.
+    bool done = false;
+    const std::size_t L = rp - rp0;
+    if (!any_n && adap && nad <= kVecAdapters && rp0 == 0 && nb == 1 &&
+        L > 0 && L <= 32 && asz >= 2 && asz <= 32) {
+      std::uint64_t C = 0;
+      std::size_t q = 0;
+      for (; q + 8 <= L; q += 8) {
         std::uint64_t w;
-        std::memcpy(&w, buf + i, 8);
-        const std::uint64_t g =
+        std::memcpy(&w, buf + q, 8);
+        C = (C << 16) |
             _pext_u64(__builtin_bswap64(w), 0x0606060606060606ULL);
-        probe(((k << 2) | (g >> 14)) & amask, i);
-        probe(((k << 4) | (g >> 12)) & amask, i + 1);
-        probe(((k << 6) | (g >> 10)) & amask, i + 2);
-        probe(((k << 8) | (g >> 8)) & amask, i + 3);
-        probe(((k << 10) | (g >> 6)) & amask, i + 4);
-        probe(((k << 12) | (g >> 4)) & amask, i + 5);
-        probe(((k << 14) | (g >> 2)) & amask, i + 6);
-        probe(((k << 16) | g) & amask, i + 7);
-        k = (k << 16) | g;
       }
-      // remaining < 8 bases: original masked chain
-      for (; i < rp; ++i) {
-        k = ((k << Constants::bit_shift_base) |
-             (static_cast<std::size_t>(buf[i] >> 1) & 3)) & amask;
-        probe(k, i);
+      if (q < L) {  // the bytes past the region are in the buffer, unused
+        const std::size_t r = L - q;
+        std::uint64_t w;
+        std::memcpy(&w, buf + q, 8);
+        C = (C << (2 * r)) |
+            (_pext_u64(__builtin_bswap64(w), 0x0606060606060606ULL) >>
+             (2 * (8 - r)));
       }
-      k &= amask;  // the serial loop leaves k masked after its last probe
+      if (L >= asz) {
+        // windows end at asz - 1 .. L - 1; lane l of group v ends at
+        // asz - 1 + 8v + l (lanes past the end shift by a negative, i.e.
+        // huge, count and are masked out)
+        const std::size_t P = L - asz + 1;
+        const __m512i vam = _mm512_set1_epi64(static_cast<long long>(amask));
+        const __m512i vc = _mm512_set1_epi64(static_cast<long long>(C));
+        const __m512i lane2 = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
+        bool hit = false;
+        for (std::size_t v = 0; v * 8 < P && !hit; ++v) {
+          const __m512i sh = _mm512_sub_epi64(
+              _mm512_set1_epi64(static_cast<long long>(2 * (L - asz) - 16 * v)),
+              lane2);
+          const __m512i win = _mm512_and_si512(_mm512_srlv_epi64(vc, sh), vam);
+          const std::size_t left = P - 8 * v;
+          const __mmask8 lanes =
+              left >= 8 ? static_cast<__mmask8>(0xff)
+                        : static_cast<__mmask8>((1u << left) - 1);
+          for (std::size_t a = 0; a != nad && !hit; ++a)
+            hit = _mm512_mask_cmpeq_epi64_mask(
+                      lanes, win,
+                      _mm512_set1_epi64(static_cast<long long>(ad[a]))) != 0;
+        }
+        if (hit)
+          for (std::size_t j = asz - 1; j < L; ++j) {
+            const std::size_t kk = (C >> (2 * (L - 1 - j))) & amask;
+            const std::size_t bmb = kk & bmask;
+            if (bm[bmb >> 6] & (static_cast<std::uint64_t>(1) << (bmb & 63)))
+              for (std::size_t a = 0; a != nad; ++a)
+                if (kk == ad[a] && !adapters_found[a]) {
+                  ++stats.pos_adapter_count[
+                      (j << Constants::bit_shift_adapter) | a];
+                  adapters_found[a] = true;
+                }
+          }
+        k = C & amask;
+        nb = asz;
+      }
+      else {
+        k = (k << (2 * L)) | C;
+        nb = 1 + L;
+      }
+      done = true;
     }
-    else {
-      for (; i < rp; ++i)
-        k = (k << Constants::bit_shift_base) |
-            (static_cast<std::size_t>(buf[i] >> 1) & 3);
+    if (!done) {
+      std::size_t seg = rp0;
+      std::size_t blk = 0;
+      __mmask64 pend_n = any_n ? nblk[0] : 0;
+      for (;;) {
+        std::size_t end = rp;
+        if (any_n) {  // the next N at or after seg
+          while (!pend_n && ++blk < nblocks)
+            pend_n = nblk[blk];
+          if (pend_n) {
+            end = rp0 + 64 * blk +
+                  static_cast<std::size_t>(__builtin_ctzll(pend_n));
+            pend_n &= pend_n - 1;
+          }
+        }
+        if (seg != rp0 && end != rp && end - seg < asz) {
+          seg = end + 1;  // nb stays 1: the N at end
+          continue;
+        }
+        std::size_t i = seg;
+        // warm-up: until the window fills (nba saturates), at most adapter_size.
+        // Eight bases at a time while at least eight remain to fill: eight steps
+        // of the unmasked k = (k << 2) | code are k << 16 | (the eight codes).
+        for (; i + 8 <= end && nb + 8 <= asz; i += 8, nb += 8) {
+          std::uint64_t w;
+          std::memcpy(&w, buf + i, 8);
+          k = (k << 16) | _pext_u64(__builtin_bswap64(w), 0x0606060606060606ULL);
+        }
+        // the last (fewer than eight) warm-up bases at once when eight bytes
+        // can be read: their codes are the top of the word's codes
+        if (i < end && nb != asz && i + 8 <= bsz) {
+          const std::size_t m = std::min(end - i, asz - nb);  // 1..7
+          std::uint64_t w;
+          std::memcpy(&w, buf + i, 8);
+          const std::uint64_t g =
+              _pext_u64(__builtin_bswap64(w), 0x0606060606060606ULL);
+          k = (k << (2 * m)) | (g >> (2 * (8 - m)));
+          i += m;
+          nb += m;
+        }
+        for (; i < end && nb != asz; ++i) {
+          k = (k << Constants::bit_shift_base) |
+              (static_cast<std::size_t>(buf[i] >> 1) & 3);
+          nb += (nb != asz);
+        }
+        if (adap && i < end) {  // empty region must leave k byte-exact (unmasked)
+          // Steady state, chain-free: the serial recurrence k = ((k<<2)|code)&mask
+          // costs ~3 dependent cycles per base. Instead refill 8 codes at once
+          // (bswap orders the newest base lowest, pext pulls bits 1..2 of each
+          // ASCII byte, i.e. (ch>>1)&3) and form the window ending at lane j
+          // directly from the pre-group k and the fresh codes:
+          //   window_j = ((k << 2*(j+1)) | (g >> 2*(7-j))) & amask
+          // The mask cuts every bit where a masked and an unmasked k history
+          // differ, so each window equals the serial loop's masked value, and the
+          // eight probes are independent immediate-shift expressions out-of-order
+          // hardware can overlap. Probes fire on every steady-state base in
+          // ascending position order: byte-identical trajectory.
+          const auto probe = [&](std::size_t kk, std::size_t pos)
+              __attribute__((always_inline)) {
+            const std::size_t bmb = kk & bmask;
+            if (bm[bmb >> 6] & (static_cast<std::uint64_t>(1) << (bmb & 63))) {
+              for (std::size_t a = 0; a != nad; ++a)
+                if (kk == ad[a] && !adapters_found[a]) {
+                  ++stats
+                      .pos_adapter_count[(pos << Constants::bit_shift_adapter) | a];
+                  adapters_found[a] = true;
+                }
+            }
+          };
+          // With a few adapters the eight windows of a group are formed in one
+          // vector and compared with every adapter; only a group holding a match
+          // runs the probes above, in position order, so the counts and
+          // adapters_found evolve exactly as when every base is probed (a probe
+          // changes state only on an exact match).
+          if (nad <= kVecAdapters && i + 8 <= end) {
+            const __m512i shl = _mm512_setr_epi64(2, 4, 6, 8, 10, 12, 14, 16);
+            const __m512i shr = _mm512_setr_epi64(14, 12, 10, 8, 6, 4, 2, 0);
+            const __m512i vam = _mm512_set1_epi64(static_cast<long long>(amask));
+            __m512i vad[kVecAdapters];
+            for (std::size_t a = 0; a != nad; ++a)
+              vad[a] = _mm512_set1_epi64(static_cast<long long>(ad[a]));
+            for (; i + 8 <= end; i += 8) {
+              std::uint64_t w;
+              std::memcpy(&w, buf + i, 8);
+              const std::uint64_t g =
+                  _pext_u64(__builtin_bswap64(w), 0x0606060606060606ULL);
+              const __m512i win = _mm512_and_si512(
+                  _mm512_or_si512(
+                      _mm512_sllv_epi64(_mm512_set1_epi64(static_cast<long long>(k)), shl),
+                      _mm512_srlv_epi64(_mm512_set1_epi64(static_cast<long long>(g)), shr)),
+                  vam);
+              __mmask8 hit = 0;
+              for (std::size_t a = 0; a != nad; ++a)
+                hit |= _mm512_cmpeq_epi64_mask(win, vad[a]);
+              if (hit) {
+                probe(((k << 2) | (g >> 14)) & amask, i);
+                probe(((k << 4) | (g >> 12)) & amask, i + 1);
+                probe(((k << 6) | (g >> 10)) & amask, i + 2);
+                probe(((k << 8) | (g >> 8)) & amask, i + 3);
+                probe(((k << 10) | (g >> 6)) & amask, i + 4);
+                probe(((k << 12) | (g >> 4)) & amask, i + 5);
+                probe(((k << 14) | (g >> 2)) & amask, i + 6);
+                probe(((k << 16) | g) & amask, i + 7);
+              }
+              k = (k << 16) | g;
+            }
+          }
+          for (; i + 8 <= end; i += 8) {
+            std::uint64_t w;
+            std::memcpy(&w, buf + i, 8);
+            const std::uint64_t g =
+                _pext_u64(__builtin_bswap64(w), 0x0606060606060606ULL);
+            probe(((k << 2) | (g >> 14)) & amask, i);
+            probe(((k << 4) | (g >> 12)) & amask, i + 1);
+            probe(((k << 6) | (g >> 10)) & amask, i + 2);
+            probe(((k << 8) | (g >> 8)) & amask, i + 3);
+            probe(((k << 10) | (g >> 6)) & amask, i + 4);
+            probe(((k << 12) | (g >> 4)) & amask, i + 5);
+            probe(((k << 14) | (g >> 2)) & amask, i + 6);
+            probe(((k << 16) | g) & amask, i + 7);
+            k = (k << 16) | g;
+          }
+          // remaining < 8 bases: original masked chain
+          for (; i < end; ++i) {
+            k = ((k << Constants::bit_shift_base) |
+                 (static_cast<std::size_t>(buf[i] >> 1) & 3)) & amask;
+            probe(k, i);
+          }
+          k &= amask;  // the serial loop leaves k masked after its last probe
+        }
+        else {
+          for (; i < end; ++i)
+            k = (k << Constants::bit_shift_base) |
+                (static_cast<std::size_t>(buf[i] >> 1) & 3);
+        }
+        if (end == rp)
+          break;
+        nb = 1;  // the N at end
+        seg = end + 1;
+      }
     }
     kmer = k;
     nba = nb;
@@ -828,11 +1049,18 @@ StreamReader::qual_simd_chunks(FastqStats &stats, const char *&c,
       break;  // *c is now a separator; the caller's loop exits immediately
   }
   cq += bytesum - Constants::quality_zero * nbytes;
-  // fold the vector minimum into the running scalar minimum
-  alignas(64) char mb[64];
-  _mm512_store_si512(mb, vmin);
-  for (int i = 0; i < 64; ++i)
-    lowest = min8(lowest, mb[i]);
+  // fold the vector minimum into the running scalar minimum (a shuffle
+  // reduction: a 64-step scalar loop here cost more than a short read's
+  // whole quality line)
+  const __m256i m256 = _mm256_min_epi8(_mm512_castsi512_si256(vmin),
+                                       _mm512_extracti64x4_epi64(vmin, 1));
+  __m128i m = _mm_min_epi8(_mm256_castsi256_si128(m256),
+                           _mm256_extracti128_si256(m256, 1));
+  m = _mm_min_epi8(m, _mm_srli_si128(m, 8));
+  m = _mm_min_epi8(m, _mm_srli_si128(m, 4));
+  m = _mm_min_epi8(m, _mm_srli_si128(m, 2));
+  m = _mm_min_epi8(m, _mm_srli_si128(m, 1));
+  lowest = min8(lowest, static_cast<char>(_mm_cvtsi128_si32(m)));
 }
 #else
 void
@@ -909,7 +1137,11 @@ StreamReader::read_sequence_line(FastqStats &stats) {
 #else
   static const bool fa_simd = false;
 #endif
-  if (fa_simd && still_in_buffer && !do_kmer)
+  // k-mers of a read sampled for the k-mer module are counted after the
+  // loop (count_kmers below), so every read can take the fast path
+  const bool kmer_pass = do_kmer && do_kmer_read;
+  const std::size_t nba0 = nba, kmer0 = kmer;
+  if (fa_simd && still_in_buffer)
     seq_simd_chunks(stats, c, rp, bsz, sep, buf, gc, nba, kmer, next_trunc);
   for (; rp < bsz; ++c, ++rp) {
     const char ch = *c;
@@ -927,12 +1159,6 @@ StreamReader::read_sequence_line(FastqStats &stats) {
 
       if (do_sliding_window) {
         kmer = (kmer << Constants::bit_shift_base) | two_bit;
-        if (do_kmer && do_kmer_read &&
-            (nba >= Constants::kmer_size)) {
-          ++stats.kmer_count[(rp << Constants::bit_shift_kmer) |
-                             (kmer & Constants::kmer_mask)];
-          ++stats.pos_kmer_count[rp];
-        }
         if (do_adapter_optimized && (nba == adapter_size)) {
           kmer &= adapter_mask;
           const std::size_t bmb = kmer & adapter_bm_mask;
@@ -958,6 +1184,39 @@ StreamReader::read_sequence_line(FastqStats &stats) {
       next_trunc += 100;
     }
   }
+  if (kmer_pass) {
+    // The k-mers of the read's first rp bases, as the per-base loop counts
+    // them: at every position with at least kmer_size bases since the read
+    // start or the last N (the run counter saturates at adapter_size). The
+    // table indices are collected first and the counts incremented with
+    // prefetching, so the cache misses of the large table overlap.
+    if (kmer_idx.size() < bsz)
+      kmer_idx.resize(bsz);
+    std::uint32_t *const idx = kmer_idx.data();
+    std::size_t m = 0, run = nba0, k = kmer0;
+    for (std::size_t p = 0; p < rp; ++p) {
+      const char ch = buf[p];
+      if (ch == 'N') {
+        run = 1;
+        continue;
+      }
+      k = (k << Constants::bit_shift_base) | ((ch >> 1) & 3);
+      if (run >= Constants::kmer_size)
+        idx[m++] = static_cast<std::uint32_t>(
+          (p << Constants::bit_shift_kmer) | (k & Constants::kmer_mask));
+      run += (run != adapter_size);
+    }
+    std::size_t *const kc = stats.kmer_count.data();
+    constexpr std::size_t AHEAD = 8;
+    for (std::size_t j = 0; j < m; ++j) {
+      if (j + AHEAD < m)
+        __builtin_prefetch(kc + idx[j + AHEAD], 1);
+      ++kc[idx[j]];
+      ++stats.pos_kmer_count[idx[j] >> Constants::bit_shift_kmer];
+    }
+  }
+  if (do_conversion_context)
+    count_conversion_context(stats, buf, rp);
   // publish the locals back to the members
   read_pos = rp;
   cur_gc_count = gc;
@@ -969,28 +1228,45 @@ StreamReader::read_sequence_line(FastqStats &stats) {
   // Slow tail: only entered when the read is longer than the static buffer.
   if (*cur_char != field_separator) {
     still_in_buffer = false;
-    leftover_ind = 0;
-    for (; *cur_char != field_separator; ++cur_char, ++read_pos) {
-      // Make sure we have memory space to process new base
-      if (leftover_ind == stats.num_extra_bases) {
-        stats.allocate_new_base(tile_ignore);
+    // [FalcoAmadeus] the bases past the buffer in one pass over locals: the
+    // per-position tables are grown once to the read's length, and each base
+    // is counted as process_sequence_base_from_leftover counts it (no k-mers
+    // past the buffer). The leftover copy of the bases is read only by the
+    // BAM reader, which fills its own, so it is not written here.
+    const char *const c0 = cur_char;
+    std::size_t len = 0;
+    while (c0[len] != field_separator)
+      ++len;
+    while (stats.num_extra_bases < len)
+      stats.allocate_new_base(tile_ignore);
+    std::size_t *const lbc = stats.long_base_count.data();
+    std::size_t *const lnc = stats.long_n_base_count.data();
+    std::size_t g = cur_gc_count, nt = next_truncation, rp0 = read_pos;
+    for (std::size_t i = 0; i < len; ++i) {
+      const char ch = c0[i];
+      if (ch == 'N') {
+        ++lnc[i];
+        num_bases_after_n = 1;  // start over the current kmer
       }
-
-      // puts base either on buffer or leftover
-      put_base_in_buffer();
-
-      process_sequence_base_from_leftover(stats);
-
-      // Increase leftover pos if no longer in buffer
-      ++leftover_ind;
-
+      else {
+        const auto two_bit = actg_to_2bit(ch);
+        g += (two_bit & 1);
+        ++lbc[(i << Constants::bit_shift_base) | two_bit];
+      }
       // Truncate GC counts to multiples of 100
-      if (do_gc_sequence && read_pos == next_truncation) {
-        truncated_gc_count = cur_gc_count;
-        truncated_length = read_pos;
-        next_truncation += 100;
+      if (do_gc_sequence && rp0 + i == nt) {
+        truncated_gc_count = g;
+        truncated_length = rp0 + i;
+        nt += 100;
       }
     }
+    if (len)
+      base_from_buffer = c0[len - 1];
+    cur_gc_count = g;
+    next_truncation = nt;
+    leftover_ind = len;
+    read_pos = rp0 + len;
+    cur_char = const_cast<char *>(c0 + len);
   }
 
   // statistics summarized after the read
@@ -1129,25 +1405,39 @@ StreamReader::read_quality_line(FastqStats &stats) {
       (*cur_char != line_separator)) {
     still_in_buffer = false;
     leftover_ind = 0;
-    for (; (*cur_char != field_separator) && (*cur_char != line_separator);
-         ++cur_char) {
-      // update lowest quality
-      stats.lowest_char = min8(
-        stats.lowest_char,
-        ((*cur_char == 9) ? (std::numeric_limits<char>::max()) : (*cur_char)));
-
-      // Converts quality ascii to zero-based
-      quality_value = *cur_char - Constants::quality_zero;
-
-      process_quality_base_from_leftover(stats);
-      ++leftover_ind;
-
-      // Sums quality value so we can bin the average at the end
-      cur_quality += quality_value;
-
-      // Flag to start reading and writing outside of buffer
-      ++read_pos;
+    // [FalcoAmadeus] the qualities past the buffer over locals, counted as
+    // process_quality_base_from_leftover counts them
+    const char *c = cur_char;
+    std::size_t li = 0, rp = read_pos, cq = cur_quality;
+    char lowest = stats.lowest_char;
+    // counted in the 16-bit long tile (see FastqStats::long_qual_tile); a
+    // read adds at most one to a counter, so flushing every 65535 reads
+    // keeps them in range
+    if (stats.long_qtile_reads == 65535)
+      stats.flush_qtile();
+    ++stats.long_qtile_reads;
+    std::uint16_t *const lpq = stats.long_qual_tile.data();
+    for (; (*c != field_separator) && (*c != line_separator); ++c) {
+      lowest = min8(lowest,
+                    ((*c == 9) ? (std::numeric_limits<char>::max()) : (*c)));
+      const std::size_t qv =
+        static_cast<std::size_t>(*c - Constants::quality_zero);
+      ++lpq[(li << Constants::bit_shift_quality) | qv];
+      if (do_tile_quality) {
+        (*cur_tile_quality)[rp] += qv;
+        ++(*cur_tile_count)[rp];
+      }
+      ++li;
+      cq += qv;
+      ++rp;
     }
+    if (li)
+      quality_value = static_cast<std::size_t>(*(c - 1) - Constants::quality_zero);
+    stats.lowest_char = lowest;
+    leftover_ind = li;
+    read_pos = rp;
+    cur_quality = cq;
+    cur_char = const_cast<char *>(c);
   }
 
   // Average quality approximated to the nearest integer. Used to make a
@@ -1588,6 +1878,69 @@ struct ParRec {
 };
 }  // namespace
 
+// [FalcoAmadeus] The per-worker tile flushes and the long-read quality table
+// reduction, run on all threads: with long reads every worker holds a table of
+// 1 KB per position past the buffer, and summing 32 of them serially took
+// longer than the parse. The workers' 16-bit long tiles are added straight
+// into the master table (no worker's 64-bit table is filled at the end, so
+// none becomes resident). Integer adds commute, so the totals are those of
+// the serial merge. The worker tables are released here; the serial merge
+// that follows finds them empty and the tiles flushed.
+template <class Get>
+static void
+merge_long_tables(FastqStats &master, std::size_t nthreads, Get get) {
+  std::size_t L = master.long_position_quality_count.size();
+  for (std::size_t t = 0; t < nthreads; ++t)
+    L = std::max(L, get(t).long_position_quality_count.size());
+  const long nt = static_cast<long>(nthreads);
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(nthreads) schedule(static)
+#endif
+  for (long t = 0; t < nt; ++t) {
+    get(t).flush_soa();
+    get(t).flush_qtile(/*with_long=*/false);
+  }
+  if (L > 0) {
+    master.long_position_quality_count.resize(L);  // zero pages, not written
+    std::size_t *const m = master.long_position_quality_count.data();
+#ifdef _OPENMP
+#pragma omp parallel num_threads(nthreads)
+#endif
+    {
+#ifdef _OPENMP
+      const std::size_t tid = static_cast<std::size_t>(omp_get_thread_num());
+      const std::size_t nth = static_cast<std::size_t>(omp_get_num_threads());
+#else
+      const std::size_t tid = 0, nth = 1;
+#endif
+      const std::size_t lo = L * tid / nth, hi = L * (tid + 1) / nth;
+      for (std::size_t t = 0; t < nthreads; ++t) {
+        const FastqStats &w = get(t);
+        const auto &wl = w.long_position_quality_count;
+        const std::uint16_t *const wt = w.long_qual_tile.data();
+        // the tile grows with the table, so both have the same length
+        const std::size_t e = std::min(hi, wl.size());
+        for (std::size_t i = lo; i < e; ++i) {
+          // reading a zero page of the 64-bit table keeps it unbacked
+          const std::size_t v = wl[i] + wt[i];
+          if (v != 0)
+            m[i] += v;
+        }
+      }
+    }
+  }
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(nthreads) schedule(static)
+#endif
+  for (long t = 0; t < nt; ++t) {
+    FastqStats &ws = get(t);
+    decltype(ws.long_position_quality_count)().swap(
+      ws.long_position_quality_count);
+    std::vector<std::uint16_t>().swap(ws.long_qual_tile);
+    ws.long_qtile_reads = 0;
+  }
+}
+
 // Shared core for both parallel drivers. `decomp` is any line source exposing
 // getline(dst, maxlen) / eof() -- a GzBlockDecompressor for gzipped input or a
 // PlainBlockReader for uncompressed input. The dispatch / worker / merge logic
@@ -1799,21 +2152,23 @@ read_parallel_impl(FalcoConfig &config, FastqStats &master,
         (dmbegin + s)->second += deltas[t][s];
 
   // ---- merge worker accumulators into master ----
+  // zero counts are skipped: adding them would make every page of the
+  // (lazily zeroed) master tables resident
   auto add_arr = [](auto &dst, const auto &src) {
     for (std::size_t i = 0; i < dst.size(); ++i)
-      dst[i] += src[i];
+      if (src[i] != 0)
+        dst[i] += src[i];
   };
-  auto add_vec = [](std::vector<std::size_t> &dst,
-                    const std::vector<std::size_t> &src) {
+  auto add_vec = [](auto &dst, const auto &src) {
     if (dst.size() < src.size())
       dst.resize(src.size(), 0);
     for (std::size_t i = 0; i < src.size(); ++i)
       dst[i] += src[i];
   };
+  merge_long_tables(master, nthreads,
+                    [&](std::size_t t) -> FastqStats & { return wstats[t]; });
   for (std::size_t t = 0; t < nthreads; ++t) {
     FastqStats &ws = wstats[t];
-    ws.flush_soa();
-    ws.flush_qtile();  // position_quality_count is read (added) just below
     add_arr(master.base_count, ws.base_count);
     add_arr(master.n_base_count, ws.n_base_count);
     add_arr(master.position_quality_count, ws.position_quality_count);
@@ -1821,17 +2176,23 @@ read_parallel_impl(FalcoConfig &config, FastqStats &master,
     add_arr(master.read_length_freq, ws.read_length_freq);
     add_arr(master.pos_kmer_count, ws.pos_kmer_count);
     add_arr(master.pos_adapter_count, ws.pos_adapter_count);
-    for (std::size_t i = 0; i < master.kmer_count.size(); ++i)
-      master.kmer_count[i] += ws.kmer_count[i];
+    {  // rows beyond the worker's longest read hold no counts
+      const std::size_t nk = std::min(
+        master.kmer_count.size(),
+        (ws.max_read_length + 1) << Constants::bit_shift_kmer);
+      for (std::size_t i = 0; i < nk; ++i)
+        master.kmer_count[i] += ws.kmer_count[i];
+    }
     master.total_bases += ws.total_bases;
     master.total_gc += ws.total_gc;
     master.empty_reads += ws.empty_reads;
     master.max_read_length =
       std::max(master.max_read_length, ws.max_read_length);
     master.lowest_char = std::min(master.lowest_char, ws.lowest_char);
+    for (std::size_t k = 0; k < 4; ++k)
+      master.conv_ctx[k] += ws.conv_ctx[k];
     add_vec(master.long_base_count, ws.long_base_count);
     add_vec(master.long_n_base_count, ws.long_n_base_count);
-    add_vec(master.long_position_quality_count, ws.long_position_quality_count);
     add_vec(master.long_read_length_freq, ws.long_read_length_freq);
     master.num_extra_bases = std::max(master.num_extra_bases, ws.num_extra_bases);
   }
@@ -1992,6 +2353,24 @@ parse_record(const char *base, std::size_t size, std::size_t p,
   return q ? static_cast<std::size_t>(q - base) + 1 : size;
 }
 
+// [FalcoAmadeus] The parallel drivers keep a read's tile in 32 bits beside its
+// length. A name whose tile field is not a number gives an arbitrary tile
+// number (as in falco), possibly above 32 bits; such a tile goes to a side
+// table and its index is kept, marked by the top bit, so the tile-length
+// reconstruction keys it as the per-thread statistics do.
+constexpr std::uint32_t TILE_BIG = 0x80000000u;
+static inline std::uint32_t
+encode_tile(const std::size_t tile, std::vector<std::size_t> &big) {
+  if (tile < TILE_BIG)
+    return static_cast<std::uint32_t>(tile);
+  big.push_back(tile);
+  return TILE_BIG | static_cast<std::uint32_t>(big.size() - 1);
+}
+static inline std::size_t
+decode_tile(const std::uint32_t code, const std::vector<std::size_t> &big) {
+  return (code & TILE_BIG) ? big[code & ~TILE_BIG] : code;
+}
+
 // [FalcoAmadeus] Combine per-thread worker state into `master`, reproducing the
 // exact single-threaded result. Shared by every parallel driver (FASTQ chunked
 // and BAM chunked) since they all produce the same per-thread structures:
@@ -2068,21 +2447,23 @@ merge_worker_stats(
       }
     }
   }
+  // zero counts are skipped: adding them would make every page of the
+  // (lazily zeroed) master tables resident
   auto add_arr = [](auto &dst, const auto &src) {
     for (std::size_t i = 0; i < dst.size(); ++i)
-      dst[i] += src[i];
+      if (src[i] != 0)
+        dst[i] += src[i];
   };
-  auto add_vec = [](std::vector<std::size_t> &dst,
-                    const std::vector<std::size_t> &src) {
+  auto add_vec = [](auto &dst, const auto &src) {
     if (dst.size() < src.size())
       dst.resize(src.size(), 0);
     for (std::size_t i = 0; i < src.size(); ++i)
       dst[i] += src[i];
   };
+  merge_long_tables(master, nthreads,
+                    [&](std::size_t t) -> FastqStats & { return *wstats[t]; });
   for (std::size_t t = 0; t < nthreads; ++t) {
     FastqStats &ws = *wstats[t];
-    ws.flush_soa();
-    ws.flush_qtile();  // position_quality_count is read (added) just below
     add_arr(master.base_count, ws.base_count);
     add_arr(master.n_base_count, ws.n_base_count);
     add_arr(master.position_quality_count, ws.position_quality_count);
@@ -2096,9 +2477,10 @@ merge_worker_stats(
     master.max_read_length =
       std::max(master.max_read_length, ws.max_read_length);
     master.lowest_char = std::min(master.lowest_char, ws.lowest_char);
+    for (std::size_t k = 0; k < 4; ++k)
+      master.conv_ctx[k] += ws.conv_ctx[k];
     add_vec(master.long_base_count, ws.long_base_count);
     add_vec(master.long_n_base_count, ws.long_n_base_count);
-    add_vec(master.long_position_quality_count, ws.long_position_quality_count);
     add_vec(master.long_read_length_freq, ws.long_read_length_freq);
     master.num_extra_bases = std::max(master.num_extra_bases, ws.num_extra_bases);
   }
@@ -2113,7 +2495,8 @@ merge_worker_stats(
         tilerecs[t];
       for (std::size_t j = 0; j < recs.size(); ++j) {
         const std::size_t seqlen = recs[j].first;
-        const std::size_t tile_cur = recs[j].second;
+        const std::size_t tile_cur =
+          decode_tile(recs[j].second, wstats[t]->big_tiles);
         const bool do_tile_read =
           (g0 + j) % StreamReader::num_reads_for_tile == 0;
         if (do_tile_read) {
@@ -2178,9 +2561,9 @@ dup_prefix_scan(FastqStats &master, std::size_t start, NextKey next_key,
   std::size_t seen = 0, p = start, next = 0, klen = 0;
   const char *key = nullptr;
   while (continue_storing && next_key(p, key, klen, next)) {
-    const auto it = master.sequence_count.find(key, klen);
-    if (it == master.sequence_count.end()) {
-      master.sequence_count.emplace(key, klen, 1);
+    const auto fe = master.sequence_count.find_or_emplace(key, klen, 1);
+    const auto it = fe.first;
+    if (fe.second) {
       master.count_at_limit = seen;
       ++master.num_unique_seen;
       if (master.num_unique_seen == Constants::unique_reads_stop_counting) {
@@ -2206,6 +2589,24 @@ dup_prefix_scan(FastqStats &master, std::size_t start, NextKey next_key,
 // a range, pull the dup key, decode one record's stats. Everything else (chunking,
 // global read indexing, dup cap, GC replay, tile, merge) lives once in the driver.
 // BAM cannot use this (no delimiter to split on) and keeps its own walk driver.
+// The first '\n' in [p, end) (end when there is none): a header line is
+// short, and an inline 16-byte scan costs less than a memchr call per read.
+static inline const char *
+find_newline(const char *p, const char *const end) {
+#if defined(__SSE2__)
+  const __m128i nl = _mm_set1_epi8('\n');
+  while (end - p >= 16) {
+    const int m = _mm_movemask_epi8(_mm_cmpeq_epi8(
+        _mm_loadu_si128(reinterpret_cast<const __m128i *>(p)), nl));
+    if (m)
+      return p + __builtin_ctz(static_cast<unsigned>(m));
+    p += 16;
+  }
+#endif
+  const void *q = memchr(p, '\n', static_cast<std::size_t>(end - p));
+  return q ? static_cast<const char *>(q) : end;
+}
+
 struct FastqPolicy {
   using Worker = ParallelWorker;
   static std::size_t find_start(const char *base, std::size_t size,
@@ -2239,7 +2640,7 @@ struct FastqPolicy {
                                GCRecord *gc, bool tile_ignore, bool can_be_last,
                                std::size_t &seqlen_out, std::size_t &tile_out,
                                const char *&key_out) {
-    const char *h = static_cast<const char *>(memchr(base + p, '\n', size - p));
+    const char *h = find_newline(base + p, base + size);
     const std::size_t seq_off = static_cast<std::size_t>(h - base) + 1;
     std::size_t tile_cur = 0;
     if (!tile_ignore) {
@@ -2255,8 +2656,10 @@ struct FastqPolicy {
     const std::size_t seqlen = w.read_pos;
     const char *seq_nl = w.cur_char;
     const std::size_t plus_off = static_cast<std::size_t>(seq_nl - base) + 1;
-    const char *pl = static_cast<const char *>(
-      memchr(base + plus_off, '\n', size - plus_off));
+    // the separator line is almost always a lone '+'
+    const char *pl = (plus_off + 1 < size && base[plus_off + 1] == '\n')
+                       ? base + plus_off + 1
+                       : find_newline(base + plus_off, base + size);
     const std::size_t qual_off = static_cast<std::size_t>(pl - base) + 1;
     bool qual_no_nl = false;
     if (can_be_last)
@@ -2457,7 +2860,10 @@ read_bytesplit_core(FalcoConfig &config, FastqStats &master,
     std::vector<std::size_t> &d = deltas[t];
     if (count_dup)
       d.assign(nent, 0);
-    std::vector<std::pair<std::uint32_t, std::uint32_t>> &tr = tilerecs[t];
+    // appended on this thread's stack, moved back below: the per-thread
+    // vectors are adjacent objects (see LocalGCBuf)
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> tr;
+    tr.swap(tilerecs[t]);
     if (!tile_ignore)
       tr.reserve(n);
     const std::size_t g0 = gstart[t];
@@ -2491,7 +2897,7 @@ read_bytesplit_core(FalcoConfig &config, FastqStats &master,
       }
       if (!tile_ignore)
         tr.push_back({static_cast<std::uint32_t>(seqlen),
-                      static_cast<std::uint32_t>(tile_cur)});
+                      encode_tile(tile_cur, ws.big_tiles)});
       // release parsed pages; keeps the resident window ~DROP_WINDOW.
       if (can_drop && p - dropped >= DROP_WINDOW) {
         drop_range(dropped, p);
@@ -2503,6 +2909,7 @@ read_bytesplit_core(FalcoConfig &config, FastqStats &master,
       if (it != master.sequence_count.end())
         ++d[static_cast<std::size_t>(it - mbegin)];
     }
+    tilerecs[t].swap(tr);
   }
 
   // Phase 2 is done, so the input bytes (mmap / decompressed buffer) are no
@@ -2536,6 +2943,103 @@ read_bytesplit_core(FalcoConfig &config, FastqStats &master,
 // worker stats, the read-only duplication map and the deltas; the dup-prefix
 // continuation touches master.sequence_count/num_unique_seen/count_at_limit
 // -- all disjoint from gc_count).
+// [FalcoAmadeus] Per-thread post-cap duplication counts in 32-bit cells
+// (half the memory of size_t: 100k cells per thread). Before a slice/chunk is
+// parsed, reserve() is given an upper bound on its record count (its length
+// in bytes: records start at distinct bytes); whenever the counts since the
+// last fold could exceed 2^32 - 1, all cells are first folded into the map.
+// Integer adds commute, so the final counts are those of size_t cells.
+class DupDeltas32 {
+ public:
+  explicit DupDeltas32(std::size_t nthreads) : d_(nthreads) {}
+  void init(std::size_t nent) {
+    for (auto &v : d_)
+      v.assign(nent, 0);
+  }
+  std::uint32_t *row(std::size_t tid) { return d_[tid].data(); }
+  void reserve(std::size_t max_records, DupHashMap::iterator mbegin) {
+    if (since_ + max_records > UINT32_MAX) {
+      fold(mbegin);
+      since_ = 0;
+    }
+    since_ += max_records;
+  }
+  // Fold into sink[i] instead of the map entries (counts kept apart from the
+  // map they index; paired mode's combined view).
+  void set_sink(std::vector<std::size_t> *sink) { sink_ = sink; }
+  void fold(DupHashMap::iterator mbegin) {
+    for (auto &v : d_)
+      for (std::size_t i = 0; i < v.size(); ++i) {
+        if (sink_)
+          (*sink_)[i] += v[i];
+        else
+          (mbegin + i)->second += v[i];
+        v[i] = 0;
+      }
+  }
+
+ private:
+  std::vector<std::vector<std::uint32_t>> d_;
+  std::vector<std::size_t> *sink_ = nullptr;
+  std::size_t since_ = 0;
+};
+
+// [FalcoAmadeus] Native paired mode, per read: the name and key
+// fingerprints (see PairedHooks), and for the second mate the occurrence of
+// its duplication key in the first mate's map (the combined view).
+// Returns the duplication-map hash of the read's key (hash_of over
+// get_truncate_point(seqlen) bytes), which the caller reuses for its own
+// duplication count and for the combined view's lookup.
+inline std::uint64_t
+pair_fingerprints(const char *rec, const char *end, const char *key,
+                  std::size_t seqlen, std::uint64_t &key_out,
+                  std::uint32_t &name_out) {
+  const std::uint64_t nf = pair_name_fp(rec, end);
+  name_out = static_cast<std::uint32_t>(nf ^ (nf >> 32));
+  std::size_t sl = seqlen;
+  if (sl && key[sl - 1] == '\r')
+    --sl;
+  const std::size_t kl = get_truncate_point(sl);
+  std::uint64_t kfp, h;
+  DupHashMap::fp_and_hash(key, kl, kfp, h);
+  key_out = kfp;
+  const std::size_t klen = get_truncate_point(seqlen);
+  return (klen == kl) ? h : DupHashMap::hash_of(key, klen);
+}
+
+// [FalcoAmadeus] A range's GC record vector, moved onto the parsing
+// thread's stack for the duration of the range. The vectors of neighbouring
+// ranges are adjacent 24-byte objects, so appending through the shared array
+// wrote a cache line that the threads parsing the next and previous ranges
+// were writing too, once per read. The buffer (and its capacity) moves back
+// when the range ends, so the replayer sees exactly the same records.
+struct LocalGCBuf {
+  explicit LocalGCBuf(std::vector<GCRecord> &shared) : shared_(shared) {
+    v.swap(shared_);
+    v.clear();
+  }
+  ~LocalGCBuf() { shared_.swap(v); }
+  LocalGCBuf(const LocalGCBuf &) = delete;
+  LocalGCBuf &operator=(const LocalGCBuf &) = delete;
+  std::vector<GCRecord> v;
+
+ private:
+  std::vector<GCRecord> &shared_;
+};
+
+void
+replay_gc_records(const std::vector<GCRecord> &recs, double *gc) {
+  for (const GCRecord &gr : recs) {
+    if (gr.kind == 1) {
+      for (const auto &v : FastqStats::gc_models[gr.a].models[gr.b])
+        gc[v.percent] += v.increment;
+    }
+    else if (gr.kind == 2) {
+      ++gc[gr.a];
+    }
+  }
+}
+
 class GCReplayer {
 public:
   GCReplayer(FastqStats &master, std::size_t nbufs) : master_(master) {
@@ -2546,6 +3050,11 @@ public:
   // The buffer set the NEXT parse phase may write: never the in-flight one
   // (submit() below only returns once the other set has fully replayed).
   std::vector<std::vector<GCRecord>> &parse_bufs() { return bufs_[cur_]; }
+  // Also append every replayed record, in replay order, to sink (paired
+  // mode's combined view). Set before the first submit().
+  void set_record_sink(std::vector<GCRecord> *sink) { sink_ = sink; }
+  // Also add every contribution to gc2, in the same order.
+  void set_gc2(double *gc2) { gc2_ = gc2; }
   // Hand the first `nused` vectors of the just-parsed set to the replay
   // thread (vectors past nused may hold a previous slice's records -- they
   // are NOT replayed). Blocks until the PREVIOUS submission finished
@@ -2555,7 +3064,17 @@ public:
   // `after` (optional) runs on the replay thread once the replay is done --
   // used to push the slice's madvise(DONTNEED) off the serial path. It must
   // not touch master.gc_count readers' state or the parse buffers.
-  void submit(std::size_t nused, std::function<void()> after = {}) {
+  // `last`: no parse follows this submission, so when no replay thread was
+  // started (an input of one slice) the set is replayed here instead of
+  // starting one (its stack and malloc arena are memory a small input
+  // would otherwise pay for).
+  void submit(std::size_t nused, std::function<void()> after = {},
+              bool last = false) {
+    if (last && !th_.joinable()) {
+      replay_job(cur_, nused, after);
+      cur_ ^= 1;
+      return;
+    }
     std::unique_lock<std::mutex> lk(m_);
     cv_.wait(lk, [&] { return inflight_ < 0; });
     inflight_ = cur_;
@@ -2587,6 +3106,59 @@ public:
   }
 
 private:
+  // the replay of one parsed set, then its `after` hook
+  void replay_job(int slot, std::size_t nused,
+                  const std::function<void()> &after) {
+    // exact serial replay order: range 0's records in parse order, then
+    // range 1's, ... Each bin receives the same additions in the same order
+    // as with the per-read model loops; the bins live in locals for the job
+    // (bin 101 takes the flat models' padding, see flat()).
+    std::array<double, 102> acc, acc2;
+    std::copy(master_.gc_count.begin(), master_.gc_count.end(), acc.begin());
+    acc[101] = 0.0;
+    if (gc2_)
+      std::copy(gc2_, gc2_ + 101, acc2.begin());
+    acc2[101] = 0.0;
+    for (std::size_t r = 0; r < nused; ++r) {
+      const std::vector<GCRecord> &gc = bufs_[slot][r];
+      if (gc2_) {  // both targets in one pass, each in read order
+        for (const GCRecord &gr : gc) {
+          if (gr.kind == 1) {
+            const Flat &f = flat(gr.a);
+            const std::size_t o = static_cast<std::size_t>(gr.b) * f.k;
+            for (std::size_t j = 0; j < f.k; ++j) {
+              acc[f.pct[o + j]] += f.inc[o + j];
+              acc2[f.pct[o + j]] += f.inc[o + j];
+            }
+          }
+          else if (gr.kind == 2) {
+            acc[gr.a] += 1.0;
+            acc2[gr.a] += 1.0;
+          }
+        }
+      }
+      else {
+        for (const GCRecord &gr : gc) {
+          if (gr.kind == 1) {
+            const Flat &f = flat(gr.a);
+            const std::size_t o = static_cast<std::size_t>(gr.b) * f.k;
+            for (std::size_t j = 0; j < f.k; ++j)
+              acc[f.pct[o + j]] += f.inc[o + j];
+          }
+          else if (gr.kind == 2) {
+            acc[gr.a] += 1.0;
+          }
+        }
+      }
+      if (sink_)
+        sink_->insert(sink_->end(), gc.begin(), gc.end());
+    }
+    std::copy(acc.begin(), acc.begin() + 101, master_.gc_count.begin());
+    if (gc2_)
+      std::copy(acc2.begin(), acc2.begin() + 101, gc2_);
+    if (after)
+      after();  // e.g. drop the slice's pages, off the serial path
+  }
   void run() {
     for (;;) {
       int slot;
@@ -2601,22 +3173,7 @@ private:
         nused = inflight_n_;
         after = std::move(after_);
       }
-      // exact serial replay order: range 0's records in parse order, then
-      // range 1's, ... (same statements as the previous inline replay)
-      for (std::size_t r = 0; r < nused; ++r) {
-        const std::vector<GCRecord> &gc = bufs_[slot][r];
-        for (const GCRecord &gr : gc) {
-          if (gr.kind == 1) {
-            for (const auto &v : FastqStats::gc_models[gr.a].models[gr.b])
-              master_.gc_count[v.percent] += v.increment;
-          }
-          else if (gr.kind == 2) {
-            ++master_.gc_count[gr.a];
-          }
-        }
-      }
-      if (after)
-        after();  // e.g. drop the slice's pages, off the serial path
+      replay_job(slot, nused, after);
       {
         std::lock_guard<std::mutex> lk(m_);
         inflight_ = -1;
@@ -2624,7 +3181,37 @@ private:
       }
     }
   }
+  // The GC models of one read length with every GC count padded to the same
+  // number of entries (the padding adds 0.0 to the scratch bin 101): the
+  // replay's inner loop then has a fixed trip count per read length instead
+  // of one that changes from read to read (a branch miss per read).
+  struct Flat {
+    std::size_t k = 0;
+    std::vector<std::uint8_t> pct;  // [gc count * k + j]
+    std::vector<double> inc;
+    bool built = false;
+  };
+  const Flat &flat(std::size_t len) {
+    Flat &f = flat_[len];
+    if (!f.built) {
+      const auto &models = FastqStats::gc_models[len].models;
+      for (const auto &m : models)
+        f.k = std::max(f.k, m.size());
+      f.pct.assign(models.size() * f.k, 101);
+      f.inc.assign(models.size() * f.k, 0.0);
+      for (std::size_t b = 0; b < models.size(); ++b)
+        for (std::size_t j = 0; j < models[b].size(); ++j) {
+          f.pct[b * f.k + j] = static_cast<std::uint8_t>(models[b][j].percent);
+          f.inc[b * f.k + j] = models[b][j].increment;
+        }
+      f.built = true;
+    }
+    return f;
+  }
+  std::array<Flat, FastqStats::SHORT_READ_THRESHOLD> flat_;
   FastqStats &master_;
+  std::vector<GCRecord> *sink_ = nullptr;
+  double *gc2_ = nullptr;
   std::array<std::vector<std::vector<GCRecord>>, 2> bufs_;  // [set][range]
   int cur_ = 0;        // set the next parse phase writes
   int inflight_ = -1;  // set queued/being replayed, -1 = none
@@ -2634,6 +3221,275 @@ private:
   std::mutex m_;
   std::condition_variable cv_;
   std::thread th_;
+};
+
+// [FalcoAmadeus] Per-tile quality in the chunked drivers. Every
+// num_reads_for_tile-th read in file order is a tile read, and a tile's
+// vectors get the longest read seen before the tile's first tile read,
+// extended by the tile's own tile reads (the whole-buffer driver's
+// reconstruction). Per range: the tile reads with the longest read before
+// them in the range, and the range's longest read (record, end_range); the
+// ranges are folded in order when their chunk closes (fold), and finish
+// builds the tile vectors and adds the workers' sums.
+class TileFold {
+ public:
+  explicit TileFold(std::size_t max_ranges)
+      : rtile_(max_ranges), rbig_(max_ranges), rmax_(max_ranges, 0) {}
+  struct Range {
+    std::vector<std::uint32_t> recs;  // seqlen, tile, before (3 per read)
+    std::vector<std::size_t> big;     // tiles above 32 bits (encode_tile)
+    std::size_t lpmax = 0;            // longest read so far in the range
+    void record(std::size_t g, std::size_t seqlen, std::size_t tile) {
+      if (g % StreamReader::num_reads_for_tile == 0) {
+        recs.push_back(static_cast<std::uint32_t>(seqlen));
+        recs.push_back(encode_tile(tile, big));
+        recs.push_back(static_cast<std::uint32_t>(lpmax));
+      }
+      lpmax = std::max(lpmax, seqlen);
+    }
+  };
+  void end_range(std::size_t r, Range &tr) {
+    rtile_[r].swap(tr.recs);
+    rbig_[r].swap(tr.big);
+    rmax_[r] = tr.lpmax;
+  }
+  // continue another reconstruction (the combined view of paired mates)
+  void seed(const std::unordered_map<std::size_t, std::size_t> &len,
+            std::size_t maxlen) {
+    len_ = len;
+    maxlen_ = maxlen;
+  }
+  const std::unordered_map<std::size_t, std::size_t> &len() const {
+    return len_;
+  }
+  std::size_t maxlen() const { return maxlen_; }
+  void fold(std::size_t nranges) {
+    for (std::size_t r = 0; r < nranges; ++r) {
+      const std::vector<std::uint32_t> &v = rtile_[r];
+      for (std::size_t k = 0; k + 2 < v.size(); k += 3) {
+        const std::size_t seqlen = v[k],
+                          tile = decode_tile(v[k + 1], rbig_[r]);
+        const std::size_t before = std::max<std::size_t>(maxlen_, v[k + 2]);
+        if (len_.find(tile) == len_.end())
+          len_[tile] = before;  // length at first sight
+        if (tile != 0)
+          len_[tile] = std::max<std::size_t>(len_[tile], seqlen);
+      }
+      maxlen_ = std::max(maxlen_, rmax_[r]);
+      rtile_[r].clear();
+      rbig_[r].clear();
+    }
+  }
+  void finish(FalcoConfig &config, FastqStats &master,
+              std::vector<std::unique_ptr<FastqStats>> &wstats) {
+    config.do_tile = true;  // the merge assumed tile-less input
+    for (const auto &kv : len_) {
+      master.tile_position_quality[kv.first] =
+        std::vector<double>(kv.second, 0.0);
+      master.tile_position_count[kv.first] =
+        std::vector<std::size_t>(kv.second, 0);
+    }
+    for (auto &ws : wstats) {
+      for (const auto &kv : ws->tile_position_quality) {
+        auto &dst = master.tile_position_quality[kv.first];
+        const std::size_t lim = std::min(kv.second.size(), dst.size());
+        for (std::size_t i = 0; i < lim; ++i)
+          dst[i] += kv.second[i];
+      }
+      for (const auto &kv : ws->tile_position_count) {
+        auto &dst = master.tile_position_count[kv.first];
+        const std::size_t lim = std::min(kv.second.size(), dst.size());
+        for (std::size_t i = 0; i < lim; ++i)
+          dst[i] += kv.second[i];
+      }
+    }
+  }
+
+ private:
+  std::vector<std::vector<std::uint32_t>> rtile_;
+  std::vector<std::vector<std::size_t>> rbig_;
+  std::vector<std::size_t> rmax_;
+  std::unordered_map<std::size_t, std::size_t> len_;
+  std::size_t maxlen_ = 0;
+};
+
+// [FalcoAmadeus] Per-tile quality sums of the combined view's tile reads of a
+// second mate (see PairedHooks): per thread, merged into the hooks at the end.
+struct CombTileSums {
+  std::unordered_map<std::size_t, std::vector<double>> q;
+  std::unordered_map<std::size_t, std::vector<std::size_t>> c;
+  // the quality line of the FASTQ record at rec (as the quality loop adds
+  // each base's quality to its tile and position)
+  void add(std::size_t tile, const char *rec, const char *end) {
+    const char *l = static_cast<const char *>(std::memchr(rec, '\n', end - rec));
+    for (int k = 0; k < 2 && l; ++k)
+      l = static_cast<const char *>(std::memchr(l + 1, '\n', end - l - 1));
+    if (!l)
+      return;
+    const char *qs = l + 1;
+    const char *qe = static_cast<const char *>(std::memchr(qs, '\n', end - qs));
+    if (!qe)
+      qe = end;
+    const std::size_t n = static_cast<std::size_t>(qe - qs);
+    std::vector<double> &vq = q[tile];
+    std::vector<std::size_t> &vc = c[tile];
+    if (vq.size() < n) {
+      vq.resize(n, 0.0);
+      vc.resize(n, 0);
+    }
+    for (std::size_t i = 0; i < n; ++i) {
+      vq[i] += static_cast<double>(qs[i] - Constants::quality_zero);
+      ++vc[i];
+    }
+  }
+  static void merge_into(std::vector<CombTileSums> &parts, PairedHooks &h) {
+    for (CombTileSums &p : parts) {
+      for (auto &kv : p.q) {
+        auto &d = h.comb_tile_quality[kv.first];
+        if (d.size() < kv.second.size())
+          d.resize(kv.second.size(), 0.0);
+        for (std::size_t i = 0; i < kv.second.size(); ++i)
+          d[i] += kv.second[i];
+      }
+      for (auto &kv : p.c) {
+        auto &d = h.comb_tile_count[kv.first];
+        if (d.size() < kv.second.size())
+          d.resize(kv.second.size(), 0);
+        for (std::size_t i = 0; i < kv.second.size(); ++i)
+          d[i] += kv.second[i];
+      }
+    }
+  }
+};
+
+// [FalcoAmadeus] The duplication prefix (the reads up to the one that fills
+// the tracker with its 100,000th distinct key, in file order) of a parsed
+// buffer, computed in parallel: every range collects its distinct keys in
+// first-occurrence order with their counts (collect, one call per range on
+// any thread), then merge adds the ranges to the tracker in order. A range in
+// which the tracker would fill is replayed read by read, so the cap-filling
+// read, the first unconsumed byte and all counts are those of the serial walk.
+template <class P>
+class ParallelDupPrefix {
+ public:
+  void prepare(std::size_t nranges) {
+    if (ranges_.size() < nranges)
+      ranges_.resize(nranges);
+  }
+  void collect(std::size_t r, const char *base, std::size_t plimit,
+               std::size_t lo, std::size_t hi) {
+    Range &pr = ranges_[r];
+    pr.ents.clear();
+    pr.nreads = 0;
+    if (pr.slots.empty())
+      pr.slots.assign(std::size_t(1) << 12, 0);
+    else
+      std::fill(pr.slots.begin(), pr.slots.end(), 0u);
+    std::size_t mask = pr.slots.size() - 1;
+    std::size_t p = lo;
+    while (p < hi) {
+      const char *key;
+      std::size_t klen;
+      const std::size_t next = P::dup_key(base, plimit, p, key, klen);
+      const std::uint64_t h = DupHashMap::hash_of(key, klen);
+      std::size_t s = static_cast<std::size_t>(h) & mask;
+      for (;;) {
+        const std::uint32_t e = pr.slots[s];
+        if (e == 0) {
+          pr.ents.push_back(Ent{h, key, static_cast<std::uint32_t>(klen), 1});
+          pr.slots[s] = static_cast<std::uint32_t>(pr.ents.size());
+          break;
+        }
+        Ent &pe = pr.ents[e - 1];
+        if (pe.h == h && pe.klen == klen &&
+            std::memcmp(pe.key, key, klen) == 0) {
+          ++pe.count;
+          break;
+        }
+        s = (s + 1) & mask;
+      }
+      if (2 * pr.ents.size() > pr.slots.size()) {  // grow and rehash
+        pr.slots.assign(2 * pr.slots.size(), 0);
+        mask = pr.slots.size() - 1;
+        for (std::size_t k = 0; k < pr.ents.size(); ++k) {
+          std::size_t t = static_cast<std::size_t>(pr.ents[k].h) & mask;
+          while (pr.slots[t] != 0)
+            t = (t + 1) & mask;
+          pr.slots[t] = static_cast<std::uint32_t>(k + 1);
+        }
+      }
+      ++pr.nreads;
+      p = next;
+    }
+  }
+  // Merges ranges 0..nranges-1 (bounds from bound(r)); returns the first
+  // byte the prefix did not consume (plimit when the tracker did not fill).
+  template <class Bound>
+  std::size_t merge(std::size_t nranges, Bound bound, const char *base,
+                    std::size_t plimit, FastqStats &master, bool &dup_cont,
+                    std::size_t &dup_seen) {
+    DupHashMap &map = master.sequence_count;
+    for (std::size_t r = 0; r < nranges && dup_cont; ++r) {
+      Range &pr = ranges_[r];
+      std::size_t fresh = 0;
+      for (const Ent &pe : pr.ents)
+        fresh += (map.find_hashed(pe.h, pe.key, pe.klen) == map.end());
+      if (master.num_unique_seen + fresh >=
+          Constants::unique_reads_stop_counting) {
+        // the tracker fills in this range: replay it read by read
+        std::size_t p = bound(r);
+        const std::size_t dup_end = bound(r + 1);
+        while (dup_cont && p < dup_end) {
+          const char *key;
+          std::size_t klen;
+          const std::size_t next = P::dup_key(base, plimit, p, key, klen);
+          const auto fe = map.find_or_emplace(key, klen, 1);
+          if (fe.second) {
+            master.count_at_limit = dup_seen;
+            ++master.num_unique_seen;
+            if (master.num_unique_seen == Constants::unique_reads_stop_counting)
+              dup_cont = false;
+          }
+          else {
+            ++fe.first->second;
+            master.count_at_limit += dup_cont;
+          }
+          ++dup_seen;
+          p = next;
+        }
+        return p;
+      }
+      for (const Ent &pe : pr.ents) {
+        const auto it = map.find_hashed(pe.h, pe.key, pe.klen);
+        if (it != map.end()) {
+          it->second += pe.count;
+        }
+        else {
+          map.emplace(pe.key, pe.klen, pe.count);
+          ++master.num_unique_seen;
+        }
+      }
+      // the serial walk leaves count_at_limit one below the reads seen (it
+      // is reset to the read count before each new key)
+      dup_seen += pr.nreads;
+      if (pr.nreads)
+        master.count_at_limit = dup_seen - 1;
+    }
+    return plimit;
+  }
+
+ private:
+  struct Ent {
+    std::uint64_t h;
+    const char *key;
+    std::uint32_t klen, count;
+  };
+  struct Range {
+    std::vector<Ent> ents;
+    std::vector<std::uint32_t> slots;  // entry index + 1, 0 = empty
+    std::size_t nreads = 0;
+  };
+  std::vector<Range> ranges_;
 };
 
 // [FalcoAmadeus] Chunked (zero-copy) variant of the byte-split driver for
@@ -2659,22 +3515,28 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
   typename P::Worker cfg(config, BUF);
   const bool tile_ignore = cfg.tile_ignore;
   const bool do_hash = cfg.do_sequence_hash;
-  if (!tile_ignore || size == 0) {
+  // Tiled input in native paired mode keeps the whole-buffer driver (the
+  // combined view would need the tile reconstruction across both mates).
+  if (size == 0 ||
+      (!tile_ignore && config.paired_hooks && !config.paired_hooks->tiles_ok)) {
     read_bytesplit_core<P>(config, master, nthreads, base, size,
                            std::move(release_input), can_drop);
     return;
   }
-  config.do_tile = false;  // mirror the whole-buffer driver's tile-less path
+  if (tile_ignore)
+    config.do_tile = false;  // mirror the whole-buffer driver's tile-less path
 
   // Slice size scales with the thread count: parsed pages stay resident until
   // the slice's deferred drop, so the slice is the driver's RSS window. 16 MB
-  // per thread keeps -t1 near the serial readers' footprint while -t8+ keeps
-  // the full 128 MB slices. Slicing CANNOT affect output: the dup prefix,
+  // per thread keeps -t1 near the serial readers' footprint; slices are
+  // capped at 64 MB (from -t4), where two resident slices cost no more than
+  // falco2's mapped window and larger slices measured no faster. Slicing
+  // CANNOT affect output: the dup prefix,
   // range decomposition and GC replay all preserve the global record order
   // whatever the slice boundaries (and the t1..tN identity gate covers the
   // different slicings empirically).
   const std::size_t CHUNK =
-    std::min(std::size_t(128) << 20,
+    std::min(std::size_t(64) << 20,
              std::max(std::size_t(16) << 20, nthreads * (std::size_t(16) << 20)));
   const std::size_t PGSZ = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
   auto drop_range = [&](std::size_t a, std::size_t b) {
@@ -2700,7 +3562,8 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
 
   std::vector<std::unique_ptr<typename P::Worker>> workers(nthreads);
   std::vector<std::unique_ptr<FastqStats>> wstats(nthreads);
-  std::vector<std::vector<std::size_t>> deltas(nthreads);
+  std::vector<std::vector<std::size_t>> deltas(nthreads);  // stays empty
+  DupDeltas32 dd(nthreads);
 
   // [FalcoAmadeus] The global read index g is consumed only by k-mer
   // subsampling (g % num_reads_for_kmer; read_step == 1 here), tile sampling
@@ -2711,7 +3574,7 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
   // (the default) nothing needs g before parsing: the per-slice record-count
   // pass -- a full extra sweep over every input byte -- is skipped and the
   // per-thread counts fall out of the parse itself.
-  const bool need_g = config.do_kmer;
+  const bool need_g = config.do_kmer || !tile_ignore;
 
   // [FalcoAmadeus] Work-stealing sub-ranges. A slice is cut into ~1 MB
   // record-aligned ranges handed out `schedule(dynamic)`: a straggling thread
@@ -2735,10 +3598,118 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
   // shared per-slice state written inside `omp single` blocks; the implicit
   // barrier ending each single/for publishes the writes to all threads.
   GCReplayer replayer(master, R_MAX);
+  TileFold tiles(tile_ignore ? 0 : R_MAX);  // per-tile quality (tiled input)
+  // parallel duplication prefix when a slice has several ranges
+  ParallelDupPrefix<P> pfx;
+  bool par_pfx = false;
+  std::size_t cur_sbytes = 0;
+  // native paired mode (FASTQ only): per-read fingerprints and the combined
+  // view's continuation, see PairedHooks
+  PairedHooks *H = nullptr;
+  DupHashMap *cm = nullptr;
+  DupDeltas32 dd2(nthreads);
+  DupHashMap::iterator cmbegin{};
+  if constexpr (std::is_same<P, FastqPolicy>::value) {
+    H = config.paired_hooks;
+    if (H) {
+      H->used = true;
+      H->init_hist(nthreads);
+      H->ends_with_newline = (size == 0 || base[size - 1] == '\n');
+      if (H->keep_gc_records)
+        replayer.set_record_sink(&H->gc_records);
+      replayer.set_gc2(H->gc2);
+      if (do_hash && H->comb_map) {
+        cm = H->comb_map;
+        cmbegin = cm->begin();
+        dd2.init(cm->size());
+        H->comb_counts.assign(cm->size(), 0);
+        dd2.set_sink(&H->comb_counts);  // the map stays R1's own
+      }
+      else if (do_hash && H->wait_comb_map) {
+        cm = H->wait_comb_map();
+        if (cm) {
+          cmbegin = cm->begin();
+          dd2.init(cm->size());
+          H->comb_counts.assign(cm->size(), 0);
+          dd2.set_sink(&H->comb_counts);
+        }
+      }
+    }
+  }
+  std::vector<FpSpan> rspan(H ? R_MAX : 0);  // fingerprints per range
+  std::vector<FpSlab> slabs(nthreads);        // per-thread arena position
+  // aware-duplication records per range (opt-in, see PairedHooks)
+  std::vector<MateSeqs> raware(H && H->aware ? R_MAX : 0);
+  // second mate of tiled pairs: the combined view's tile reconstruction and
+  // quality sums (see PairedHooks)
+  const bool comb_tiles = H && !tile_ignore && H->comb_tiles;
+  TileFold ctiles(comb_tiles ? R_MAX : 0);
+  if (comb_tiles)
+    ctiles.seed(H->comb_seed_len, H->comb_seed_maxlen);
+  std::vector<CombTileSums> csums(comb_tiles ? nthreads : 0);
+  const std::size_t coff = comb_tiles ? H->comb_tile_off : 0;
+  bool comb_notified = false;
+  std::size_t pre_stop = 0;  // end of an adopted duplication prefix
+  if constexpr (std::is_same<P, FastqPolicy>::value) {
+    if (H && do_hash && H->prefix && H->prefix->full && nthreads >= 2 &&
+        master.sequence_count.size() == 0) {
+      PairedHooks::DupPrefix &dp = *H->prefix;
+      master.sequence_count = std::move(dp.map);
+      master.count_at_limit = dp.count_at_limit;
+      master.num_unique_seen = dp.num_unique_seen;
+      dup_seen = dp.reads;
+      dup_cont = false;
+      pre_stop = dp.stop;
+      mbegin = master.sequence_count.begin();
+    }
+    if (H)
+      H->prefix.reset();
+  }
   std::size_t off = P::find_start(base, size, 0);
   std::size_t dropped = 0;
   std::size_t plimit = 0, dup_stop = 0, nranges = 0;
   bool count_dup = false, s_done = false, slice_open = false;
+  // [FalcoAmadeus] Single-thread slices end lazily: instead of probing for the
+  // last record boundary before the slice end (a page touch up to a slice
+  // ahead of the parser, which defeats the kernel's sequential readahead on a
+  // file that is not in the page cache), the slice consists of the records
+  // that START before `lazy_end`, and the parse itself discovers where the
+  // last of them ends. The duplication prefix applies the same rule, so both
+  // see the same records.
+  bool lazy = false;
+  std::size_t lazy_end = 0;
+  std::size_t rstep = 0;  // range stride within the current slice
+  auto bound = [&](std::size_t r) -> std::size_t {
+    if (r == 0) return off;
+    if (r >= nranges) return lazy ? lazy_end : plimit;
+    return P::find_start(base, plimit, off + r * rstep);
+  };
+  // after the prefix of a slice: which reads are counted against the
+  // tracked keys, and the counting tables
+  auto post_prefix = [&] {
+    count_dup = do_hash && !dup_cont;
+    if (count_dup && nent == 0) {
+      nent = master.sequence_count.size();
+      mbegin = master.sequence_count.begin();
+      dd.init(nent);
+      if (H && H->on_comb_map) {
+        H->on_comb_map(&master.sequence_count);
+        comb_notified = true;
+      }
+    }
+    if (count_dup)
+      dd.reserve(cur_sbytes, mbegin);
+    if (cm)
+      dd2.reserve(cur_sbytes, cmbegin);
+  };
+  // FA_TIMES=1: per-phase wall times on stderr (diagnostics only)
+  static const bool fa_times = std::getenv("FA_TIMES") != nullptr;
+  auto now = [] {
+    return std::chrono::duration<double>(
+             std::chrono::steady_clock::now().time_since_epoch()).count();
+  };
+  double t_single = 0, t_parse = 0, t_mark = now(), t_begin = t_mark;
+  std::size_t n_slices = 0;
 
   // [FalcoAmadeus] One persistent parallel region spans worker construction
   // and the whole slice loop, with only TWO barriers per slice: all serial
@@ -2769,17 +3740,45 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
 #pragma omp single
 #endif
       {
+        const double ts0 = fa_times ? now() : 0;
+        if (fa_times) t_parse += ts0 - t_mark;
         // ---- close out the previous slice (no-op before the first) ----
         if (slice_open) {
           for (std::size_t r = 0; r < nranges; ++r)
             total += counts[r];
+          if (H)
+            for (std::size_t r = 0; r < nranges; ++r)
+              H->take_range(rspan[r]);
+          for (std::size_t r = 0; r < raware.size() && r < nranges; ++r)
+            H->aware_parts.push_back(std::move(raware[r]));
+          if (!tile_ignore)
+            tiles.fold(nranges);
+          if (comb_tiles)
+            ctiles.fold(nranges);
           // Replay + page drop both run on the replay thread while the next
           // slice parses: the replay reads only its GCRecords, and the pages
           // dropped are the fully parsed previous slice (nothing reads them
           // again), so neither touches state the parse phase uses.
           const std::size_t d_lo = dropped, d_hi = plimit;
-          replayer.submit(nranges,
-                          [&drop_range, d_lo, d_hi] { drop_range(d_lo, d_hi); });
+          const bool last = (plimit == size);
+          if (nranges > 1 && can_drop) {
+            // the parse threads dropped their ranges' whole pages; what is
+            // left are the pages that straddle a range boundary
+            std::vector<std::size_t> edges(sync.begin() + 1,
+                                           sync.begin() + nranges);
+            replayer.submit(nranges, [&drop_range, PGSZ,
+                                      e = std::move(edges)] {
+              for (const std::size_t b : e) {
+                const std::size_t pg = b & ~(PGSZ - 1);
+                if (pg != b)
+                  drop_range(pg, pg + PGSZ);
+              }
+            }, last);
+          }
+          else
+            replayer.submit(nranges, [&drop_range, d_lo, d_hi] {
+              drop_range(d_lo, d_hi);
+            }, last);
           dropped = plimit;
           off = plimit;
           slice_open = false;
@@ -2788,8 +3787,14 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
         if (!s_done) {
           const std::size_t end = std::min(off + CHUNK, size);
           // -- slice limit: last record boundary <= end (whole tail at EOF) --
+          lazy = false;
           if (end == size) {
             plimit = size;
+          }
+          else if (nthreads == 1) {
+            lazy = true;
+            lazy_end = end;
+            plimit = size;  // parse bound; the slice end is set by the parse
           }
           else {
             // Probe backward for a record boundary close to `end`, widening
@@ -2820,73 +3825,109 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
             plimit = (q > off) ? q : end;  // degenerate giant record: take it
           }
           // -- record-aligned sub-range boundaries (serial: ~1 us per probe) --
-          const std::size_t sbytes = plimit - off;
-          nranges = std::min(
-            R_MAX, std::max<std::size_t>(
-                     1, (sbytes + RANGE_BYTES - 1) / RANGE_BYTES));
+          // A single thread parses the slice front to back as one range: the
+          // boundary probes would touch pages ahead of the parse cursor, which
+          // turns sequential file reads into scattered ones and disables the
+          // kernel's readahead on a file that is not yet in the page cache.
+          const std::size_t sbytes = (lazy ? lazy_end : plimit) - off;
+          nranges = (nthreads == 1)
+            ? 1
+            : std::min(R_MAX, std::max<std::size_t>(
+                                1, (sbytes + RANGE_BYTES - 1) / RANGE_BYTES));
+          // Range boundaries are computed by the threads that parse them
+          // (bound() below), not serially here: find_start is monotone in its
+          // offset (a later offset never yields an earlier record start), so
+          // each boundary is a pure function of r, identical to the serial
+          // computation, and the 2 threads sharing a boundary agree on it.
           sync[0] = off;
           sync[nranges] = plimit;
-          for (std::size_t r = 1; r < nranges; ++r)
-            sync[r] = P::find_start(base, plimit, off + r * (sbytes / nranges));
-          for (std::size_t r = 1; r <= nranges; ++r)
-            if (sync[r] < sync[r - 1])
-              sync[r] = sync[r - 1];
+          rstep = sbytes / nranges;
           // prime the readahead pipeline: the first ranges (which also cover
           // the dup prefix's bytes) start faulting before any thread parses
-          warm_range(sync[0], sync[std::min(nranges, 2 * nthreads)]);
+          if (!lazy)
+            warm_range(off, bound(std::min(nranges, 2 * nthreads)));
 
           // -- duplication prefix continues across slices (global read order) -
-          dup_stop = off;  // cap filled earlier: every record here is post-cap
-          if (do_hash && dup_cont) {
-            std::size_t p = off;
-            while (dup_cont && p < plimit) {
-              const char *key;
-              std::size_t klen;
-              const std::size_t next = P::dup_key(base, plimit, p, key, klen);
-              const auto it = master.sequence_count.find(key, klen);
-              if (it == master.sequence_count.end()) {
-                master.sequence_count.emplace(key, klen, 1);
-                master.count_at_limit = dup_seen;
-                ++master.num_unique_seen;
-                if (master.num_unique_seen ==
-                    Constants::unique_reads_stop_counting)
-                  dup_cont = false;  // the cap-filling record IS consumed
+          // cap filled earlier: every record here past the prefix is post-cap
+          dup_stop = std::max(off, pre_stop);
+          cur_sbytes = sbytes;
+          // several ranges: the prefix runs in parallel after this block
+          par_pfx = do_hash && dup_cont && !lazy && nranges > 1;
+          if (!par_pfx) {
+            if (do_hash && dup_cont) {
+              std::size_t p = off;
+              const std::size_t dup_end = lazy ? lazy_end : plimit;
+              while (dup_cont && p < dup_end) {
+                const char *key;
+                std::size_t klen;
+                const std::size_t next = P::dup_key(base, plimit, p, key, klen);
+                const auto fe = master.sequence_count.find_or_emplace(key, klen, 1);
+                const auto it = fe.first;
+                if (fe.second) {
+                  master.count_at_limit = dup_seen;
+                  ++master.num_unique_seen;
+                  if (master.num_unique_seen ==
+                      Constants::unique_reads_stop_counting)
+                    dup_cont = false;  // the cap-filling record IS consumed
+                }
+                else {
+                  ++it->second;
+                  master.count_at_limit += dup_cont;
+                }
+                ++dup_seen;
+                p = next;  // always step past the consumed record
               }
-              else {
-                ++it->second;
-                master.count_at_limit += dup_cont;
-              }
-              ++dup_seen;
-              p = next;  // always step past the consumed record
+              // First byte the prefix did NOT consume. The prefix eats records
+              // in file order, so "start offset >= dup_stop" holds exactly for
+              // the reads with global index >= dup_seen -- the same set the old
+              // `g >= fill_boundary` gate selected, with no need to know g.
+              dup_stop = p;
             }
-            // First byte the prefix did NOT consume. The prefix eats records
-            // in file order, so "start offset >= dup_stop" holds exactly for
-            // the reads with global index >= dup_seen -- the same set the old
-            // `g >= fill_boundary` gate selected, with no need to know g.
-            dup_stop = p;
-          }
-          count_dup = do_hash && !dup_cont;
-          if (count_dup && nent == 0) {
-            nent = master.sequence_count.size();
-            mbegin = master.sequence_count.begin();
-            for (std::size_t t = 0; t < nthreads; ++t)
-              deltas[t].assign(nent, 0);
+            post_prefix();
           }
           slice_open = true;
+          ++n_slices;
         }
+        if (fa_times) { t_mark = now(); t_single += t_mark - ts0; }
       }  // barrier publishes s_done / plimit / sync / dup_stop / count_dup
       if (s_done)
         break;
 
-      // -- Phase 1, k-mer runs only: count records to know each range's g0 ----
-      if (need_g) {
+      // -- parallel duplication prefix (see ParallelDupPrefix) --------------
+      if (par_pfx) {
+#ifdef _OPENMP
+#pragma omp single
+#endif
+        pfx.prepare(nranges);
 #ifdef _OPENMP
 #pragma omp for schedule(dynamic)
 #endif
         for (std::size_t r = 0; r < nranges; ++r)
-          counts[r] = (sync[r] < sync[r + 1])
-            ? P::count_chunk(base, sync[r], sync[r + 1], plimit, nodrop)
+          pfx.collect(r, base, plimit, bound(r), bound(r + 1));
+#ifdef _OPENMP
+#pragma omp single
+#endif
+        {
+          const double tm0 = fa_times ? now() : 0;
+          dup_stop =
+            pfx.merge(nranges, bound, base, plimit, master, dup_cont, dup_seen);
+          post_prefix();
+          if (fa_times) t_single += now() - tm0;
+        }
+      }
+
+      // -- Phase 1, k-mer runs only: count records to know each range's g0 ----
+      // (a single range starts at the running total: no count pass)
+      if (need_g && nranges > 1) {
+#ifdef _OPENMP
+#pragma omp for schedule(dynamic)
+#endif
+        for (std::size_t r = 0; r < nranges; ++r) {
+          const std::size_t lo = bound(r), hi = bound(r + 1);
+          counts[r] = (lo < hi)
+            ? P::count_chunk(base, lo, hi, plimit, nodrop)
             : 0;
+        }
 #ifdef _OPENMP
 #pragma omp single
 #endif
@@ -2910,19 +3951,23 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
         // keep the readahead pipeline ~2*nthreads ranges deep: each consumed
         // range asynchronously warms the one that will be parsed soon
         if (r + 2 * nthreads < nranges)
-          warm_range(sync[r + 2 * nthreads], sync[r + 2 * nthreads + 1]);
-        std::vector<GCRecord> &gc = replayer.parse_bufs()[r];
-        gc.clear();  // capacity persists across slices
+          warm_range(bound(r + 2 * nthreads), bound(r + 2 * nthreads + 1));
+        LocalGCBuf gcl(replayer.parse_bufs()[r]);  // capacity persists
+        std::vector<GCRecord> &gc = gcl.v;
         typename P::Worker &w = *workers[tid];
         FastqStats &ws = *wstats[tid];
         // can_be_last for EVERY record of the tail range is equivalent to the
         // old per-record `tail && (j + 1 == n)`: for any record that is not
         // the file's last, the quality line's own newline makes parse_one's
         // qual_no_nl probe false -- exactly as if can_be_last were false.
-        const bool tail = (plimit == size) && (sync[r + 1] == plimit);
-        std::size_t p = sync[r];
-        const std::size_t pend = sync[r + 1];
-        std::size_t g = need_g ? gstart[r] : 0;  // g meaningful only for k-mer
+        std::size_t p = bound(r);
+        const std::size_t pend = bound(r + 1);
+        sync[r] = p;  // the range's start, for the slice's boundary pages
+        const bool tail = !lazy && (plimit == size) && (pend == plimit);
+        // g meaningful only for k-mer and tile sampling
+        std::size_t g = need_g ? (nranges > 1 ? gstart[r] : total) : 0;
+        TileFold::Range trec;  // this range's tile reads
+        TileFold::Range ctrec;  // ... of the combined view (tiled pairs)
         std::size_t n = 0;
         std::size_t tdrop = p;
         const std::size_t DW = std::size_t(1) << 20;
@@ -2930,6 +3975,16 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
         const char *pp = nullptr;
         std::size_t pn = 0;
         bool pv = false;
+        // this range's fingerprints, written into the thread's arena slab
+        // (a FASTQ record has at least 6 bytes, which bounds the count)
+        const std::size_t fp0 =
+          H ? slabs[tid].reserve(*H, (pend - p) / 6 + 2) : 0;
+        std::uint32_t *const khist = H ? H->key_hist[tid].data() : nullptr;
+        LocalAwareBuf abuf(H, raware, r);
+        std::uint64_t chh = 0;
+        const char *cpp = nullptr;
+        std::size_t cpn = 0;
+        bool cv = false;
         while (p < pend) {
           const std::size_t rec_start = p;
           std::size_t seqlen = 0, tile_cur = 0;
@@ -2937,16 +3992,44 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
           gc.emplace_back(GCRecord{0, 0, 0});
           p = P::parse_one(w, ws, base, plimit, p, g, &gc.back(), tile_ignore,
                            tail, seqlen, tile_cur, key);
+          if (!tile_ignore)
+            trec.record(g, seqlen, tile_cur);
+          if (comb_tiles) {
+            ctrec.record(g + coff, seqlen, tile_cur);
+            if ((g + coff) % StreamReader::num_reads_for_tile == 0 &&
+                tile_cur != 0)
+              csums[tid].add(tile_cur, base + rec_start, base + plimit);
+          }
           ++g;
           ++n;
+          std::uint64_t hk = 0;
+          if (H) {
+            hk = pair_fingerprints(base + rec_start, base + plimit, key,
+                                   seqlen, slabs[tid].key[fp0 + n - 1],
+                                   slabs[tid].name[fp0 + n - 1]);
+            if (abuf.on)
+              abuf.add(base + rec_start, key, seqlen);
+            ++khist[slabs[tid].key[fp0 + n - 1] >> (64 - FP_BUCKET_BITS)];
+            if (cm) {  // combined view, deferred by one read like the
+                       // mate's own count below
+              const std::size_t klen = get_truncate_point(seqlen);
+              cm->prefetch(hk);
+              if (cv) {
+                const auto f = cm->find_hashed(chh, cpp, cpn);
+                if (f != cm->end())
+                  ++dd2.row(tid)[static_cast<std::size_t>(f - cmbegin)];
+              }
+              chh = hk; cpp = key; cpn = klen; cv = true;
+            }
+          }
           if (count_dup && rec_start >= dup_stop) {
             const std::size_t klen = get_truncate_point(seqlen);
-            const std::uint64_t h = DupHashMap::hash_of(key, klen);
+            const std::uint64_t h = H ? hk : DupHashMap::hash_of(key, klen);
             master.sequence_count.prefetch(h);
             if (pv) {
               const auto it = master.sequence_count.find_hashed(ph, pp, pn);
               if (it != master.sequence_count.end())
-                ++deltas[tid][static_cast<std::size_t>(it - mbegin)];
+                ++dd.row(tid)[static_cast<std::size_t>(it - mbegin)];
             }
             ph = h; pp = key; pn = klen; pv = true;
           }
@@ -2958,13 +4041,38 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
         if (pv) {
           const auto it = master.sequence_count.find_hashed(ph, pp, pn);
           if (it != master.sequence_count.end())
-            ++deltas[tid][static_cast<std::size_t>(it - mbegin)];
+            ++dd.row(tid)[static_cast<std::size_t>(it - mbegin)];
         }
+        if (cv) {
+          const auto f = cm->find_hashed(chh, cpp, cpn);
+          if (f != cm->end())
+            ++dd2.row(tid)[static_cast<std::size_t>(f - cmbegin)];
+        }
+        if (H) {
+          rspan[r] = FpSpan{slabs[tid].key + fp0, slabs[tid].name + fp0, n,
+                            static_cast<std::uint32_t>(tid)};
+          slabs[tid].used += n;
+        }
+        // [FalcoAmadeus] Drop the range's parsed pages here, on all threads:
+        // dropping each slice on the replay thread took as long as the GC
+        // replay itself and made that thread the bottleneck for short reads.
+        // Nothing reads them again (a neighbour's boundary probe that does
+        // faults them back in from the page cache).
+        if (nranges > 1)
+          drop_range(tdrop, pend);
+        if (!tile_ignore)
+          tiles.end_range(r, trec);
+        if (comb_tiles)
+          ctiles.end_range(r, ctrec);
         counts[r] = n;  // == the count pass's value on well-formed input
+        if (lazy)
+          plimit = p;  // one thread, one range: the slice ends here
       }  // barrier: counts[] complete -> next iteration's single closes out
     }
   }
+  const double t_fin0 = fa_times ? now() : 0;
   replayer.finish();  // every slice replayed, in exact slice order
+  const double t_fin1 = fa_times ? now() : 0;
 
   std::thread releaser;
   if (release_input)
@@ -2973,9 +4081,31 @@ read_bytes_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
   std::vector<std::vector<std::pair<std::uint32_t, std::uint32_t>>> tilerecs(
     nthreads);
   const bool count_dup_final = do_hash && !dup_cont;
+  if (count_dup_final)
+    dd.fold(mbegin);
+  if (cm)
+    dd2.fold(cmbegin);
+  if (H && H->on_comb_map && !comb_notified)
+    H->on_comb_map(nullptr);
   merge_worker_stats(config, master, nthreads, total, wstats, empty_gc, deltas,
                      tilerecs, gstart, count_dup_final,
                      /*tile_ignore=*/true, /*skip_gc=*/true);
+  if (!tile_ignore)
+    tiles.finish(config, master, wstats);
+  if (H && !tile_ignore) {
+    H->tile_len = tiles.len();
+    H->tile_maxlen = tiles.maxlen();
+  }
+  if (comb_tiles) {
+    H->comb_tile_len = ctiles.len();
+    CombTileSums::merge_into(csums, *H);
+  }
+  if (fa_times)
+    std::fprintf(stderr,
+                 "[FA_TIMES bytes] slices %zu  serial %.3f  parse %.3f  "
+                 "replay-wait %.3f  merge %.3f  total %.3f\n",
+                 n_slices, t_single, t_parse, t_fin1 - t_fin0, now() - t_fin1,
+                 now() - t_begin);
   if (releaser.joinable())
     releaser.join();
 }
@@ -2992,7 +4122,38 @@ read_chunked_core(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
                                 std::move(release_input), can_drop);
 }
 
-#if defined(USE_ISAL) || defined(USE_RAPIDGZIP)
+// [FalcoAmadeus] generic streaming parse, built without any gzip library too
+// [FalcoAmadeus] Adapts a sequential byte source (anything with
+// fill(out, cap) returning bytes written, 0 at end) to the chunk-source
+// interface of read_stream_fused: producing a chunk is a single work item.
+template <class S>
+class SerialChunkSource {
+ public:
+  explicit SerialChunkSource(S &s) : s_(s) {}
+  size_t plan(size_t cap) {
+    cap_ = cap;
+    got_ = 0;
+    return eof_ ? 0 : 1;
+  }
+  void run(size_t, char *dst) {
+    while (got_ < cap_) {
+      const size_t g = s_.fill(dst + got_, cap_ - got_);
+      if (g == 0) {
+        eof_ = true;
+        break;
+      }
+      got_ += g;
+    }
+  }
+  size_t produced() const { return got_; }
+  bool at_eof() const { return eof_; }
+
+ private:
+  S &s_;
+  size_t cap_ = 0, got_ = 0;
+  bool eof_ = false;
+};
+
 // [FalcoAmadeus] Fused streaming gz driver. Profiling showed plain-gz throughput
 // is bounded not by ISA-L inflate (fast) but by the single-threaded dispatcher,
 // which touches every byte to split lines. This inflates a bounded chunk with
@@ -3003,68 +4164,170 @@ read_chunked_core(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
 // per chunk, with the "first 100k unique" cap discovered mid-stream exactly as
 // read_bytesplit_core does. Tile-less only; tiled input falls back to the
 // dispatcher (per-tile needs a pre-scan a stream cannot provide).
+// Chunk size of read_stream_fused (see the comment there).
+static std::size_t
+stream_chunk_size(std::size_t nthreads,
+                  std::size_t chunk_cap = std::size_t(64) << 20) {
+  return std::min<std::size_t>(
+    chunk_cap, std::max<std::size_t>(std::size_t(16) << 20,
+                                     nthreads * (std::size_t(8) << 20)));
+}
+
 template <class Source>
 static void
 read_stream_fused(FalcoConfig &config, FastqStats &master,
-                  std::size_t nthreads, Source &src) {
+                  std::size_t nthreads, Source &src,
+                  std::size_t chunk_cap = std::size_t(64) << 20) {
   const std::size_t BUF = FastqStats::SHORT_READ_THRESHOLD;
   ParallelWorker cfg(config, BUF);
   const bool tile_ignore = cfg.tile_ignore;
   const bool do_hash = cfg.do_sequence_hash;
-  if (!tile_ignore) {  // tiled: cannot pre-scan a stream -> dispatcher
+  // Tiled input in native paired mode keeps the dispatcher (the combined
+  // view would need the tile reconstruction across both mates).
+  if (!tile_ignore && config.paired_hooks && !config.paired_hooks->tiles_ok) {
     read_gz_parallel(config, master, nthreads);
     return;
   }
 
-  const std::size_t CHUNK = std::size_t(64) << 20;
-  const std::size_t SLACK = std::size_t(16) << 20;  // headroom for small leftovers
-  std::vector<char> bufv(CHUNK + SLACK);
-  char *buf = bufv.data();
+  // [FalcoAmadeus] Double-buffered chunks with inflation folded into the parse
+  // phase. While the team parses chunk k from one buffer, the next chunk is
+  // produced into the other buffer by work items scheduled in the SAME dynamic
+  // loop as the parse ranges (listed first, so they start immediately): one
+  // item for a serial source (ISA-L, rapidgzip, chained files), one item per
+  // block group for BGZF. Inflation and parsing therefore overlap without any
+  // thread beyond the -t team, and a straggler of either kind is absorbed by
+  // dynamic scheduling. Each buffer reserves FRONT bytes in which the record
+  // straddling the previous chunk's end is copied, so the chunk switch moves
+  // only that one partial record. The bytes parsed, and their order, are
+  // exactly those of the sequential version.
+  // Chunk size scales with the team (8 MB per thread, 16 MB to chunk_cap):
+  // two chunks are resident at a time, so this bounds memory at low thread
+  // counts while keeping large chunks for wide teams.
+  const std::size_t CHUNK = stream_chunk_size(nthreads, chunk_cap);
+  const std::size_t FRONT = std::size_t(4) << 20;
+  std::vector<char> bufs[2];
+  bufs[0].resize(FRONT + CHUNK);
+  bufs[1].resize(FRONT + CHUNK);
+  int cur = 0;
+  char *buf = nullptr;
 
   std::vector<std::unique_ptr<ParallelWorker>> workers(nthreads);
   std::vector<std::unique_ptr<FastqStats>> wstats(nthreads);
-  std::vector<std::vector<std::size_t>> deltas(nthreads);
+  std::vector<std::vector<std::size_t>> deltas(nthreads);  // stays empty
+  DupDeltas32 dd(nthreads);
   for (std::size_t t = 0; t < nthreads; ++t) {
     workers[t].reset(new ParallelWorker(config, BUF));
     wstats[t].reset(new FastqStats(config.do_kmer));
   }
 
-  // [FalcoAmadeus] Same three driver-overhead cuts as read_bytes_fused (see the
-  // comments there for the full arguments): (1) when the K-mer module is off,
-  // no phase needs the global read index g, so the per-chunk record-count pass
-  // over every byte is skipped and counts fall out of the parse; the dup gate
-  // compares record start offsets against the byte where the serial dup prefix
-  // stopped (the prefix consumes records in order, so that byte boundary
-  // selects exactly the old `g >= fill_boundary` read set); (2) the ordered GC
-  // replay of chunk s runs on a background thread while chunk s+1 inflates and
-  // parses (double-buffered records, strict submission order -> identical FP
-  // accumulation order); (3) one persistent parallel region replaces the 3-4
-  // team fork/joins per chunk, with the serial inflate in a `single`.
-  const bool need_g = config.do_kmer;
-
-  // Work-stealing sub-ranges, exactly as in read_bytes_fused (see the comment
-  // there for the byte-identity argument).
+  // [FalcoAmadeus] Same driver-overhead cuts as read_bytes_fused (see the
+  // comments there): no count pass unless the K-mer module needs the global
+  // read index, a byte-offset duplication gate, the ordered GC replay on a
+  // background thread, and one persistent parallel region.
+  const bool need_g = config.do_kmer || !tile_ignore;
   const std::size_t RANGE_BYTES = std::size_t(1) << 19;
   const std::size_t R_MAX = std::max<std::size_t>(
-    nthreads, (CHUNK + SLACK + RANGE_BYTES - 1) / RANGE_BYTES);
+    nthreads, (FRONT + CHUNK + RANGE_BYTES - 1) / RANGE_BYTES);
 
   bool dup_cont = true;
-  std::size_t dup_seen = 0, nent = 0, total = 0, leftover_len = 0;
+  std::size_t dup_seen = 0, nent = 0, total = 0;
   auto mbegin = master.sequence_count.begin();
   std::vector<std::size_t> sync(R_MAX + 1), counts(R_MAX), gstart(R_MAX + 1);
   auto nodrop = [](std::size_t, std::size_t) {};
 
   GCReplayer replayer(master, R_MAX);
-  bool eof = false;
+  TileFold tiles(tile_ignore ? 0 : R_MAX);  // per-tile quality (tiled input)
+  // native paired mode: per-read fingerprints and the combined view's
+  // continuation, see PairedHooks
+  PairedHooks *const H = config.paired_hooks;
+  DupHashMap *cm = nullptr;
+  DupDeltas32 dd2(nthreads);
+  DupHashMap::iterator cmbegin{};
+  char last_byte = '\n';
+  if (H) {
+    H->used = true;
+    H->init_hist(nthreads);
+    if (H->keep_gc_records)
+      replayer.set_record_sink(&H->gc_records);
+    replayer.set_gc2(H->gc2);
+    if (do_hash && H->comb_map) {
+      cm = H->comb_map;
+      cmbegin = cm->begin();
+      dd2.init(cm->size());
+      H->comb_counts.assign(cm->size(), 0);
+      dd2.set_sink(&H->comb_counts);  // the map stays R1's own
+    }
+    else if (do_hash && H->wait_comb_map) {
+      cm = H->wait_comb_map();
+      if (cm) {
+        cmbegin = cm->begin();
+        dd2.init(cm->size());
+        H->comb_counts.assign(cm->size(), 0);
+        dd2.set_sink(&H->comb_counts);
+      }
+    }
+  }
+  std::vector<FpSpan> rspan(H ? R_MAX : 0);  // fingerprints per range
+  std::vector<FpSlab> slabs(nthreads);        // per-thread arena position
+  // aware-duplication records per range (opt-in, see PairedHooks)
+  std::vector<MateSeqs> raware(H && H->aware ? R_MAX : 0);
+  // second mate of tiled pairs: the combined view's tile reconstruction and
+  // quality sums (see PairedHooks)
+  const bool comb_tiles = H && !tile_ignore && H->comb_tiles;
+  TileFold ctiles(comb_tiles ? R_MAX : 0);
+  if (comb_tiles)
+    ctiles.seed(H->comb_seed_len, H->comb_seed_maxlen);
+  std::vector<CombTileSums> csums(comb_tiles ? nthreads : 0);
+  const std::size_t coff = comb_tiles ? H->comb_tile_off : 0;
+  bool comb_notified = false;
   // shared per-chunk state, written in `single` blocks (barriers publish it)
   std::size_t filled_end = 0, plimit = 0, dup_stop = 0, nranges = 0;
-  bool count_dup = false, s_done = false, s_skip = false, slice_open = false;
+  std::size_t ntasks = 0;          // production items for the NEXT chunk
+  std::size_t carry = 0;           // bytes of the current chunk to carry over
+  bool eof = false, s_done = false, slice_open = false, first = true;
+  bool no_more = false;  // the chunk just parsed was the last one
+  std::size_t sstep = 0;  // range stride within the current chunk
+  auto sbound = [&](std::size_t r) -> std::size_t {
+    if (r == 0) return 0;
+    if (r >= nranges) return plimit;
+    return find_record_start(buf, plimit, r * sstep);
+  };
+  bool count_dup = false;
+  // parallel duplication prefix when a chunk has several ranges
+  ParallelDupPrefix<FastqPolicy> pfx;
+  bool par_pfx = false;
+  // after the prefix of a chunk: which reads are counted against the
+  // tracked keys, and the counting tables
+  auto post_prefix = [&] {
+    count_dup = do_hash && !dup_cont;
+    if (count_dup && nent == 0) {  // freeze the map, size deltas
+      nent = master.sequence_count.size();
+      mbegin = master.sequence_count.begin();
+      dd.init(nent);
+      if (H && H->on_comb_map) {
+        H->on_comb_map(&master.sequence_count);
+        comb_notified = true;
+      }
+    }
+    if (count_dup)
+      dd.reserve(plimit, mbegin);
+    if (cm)
+      dd2.reserve(plimit, cmbegin);
+  };
 
-  // Two barriers per chunk: ONE `single` closes out the previous chunk
-  // (counts fold + GC submit + straddle memmove), inflates the next, finds
-  // the parse limit and the range sync points and runs the dup prefix; then
-  // ONE `for` parses. The other threads sleep/spin through the serial inflate
-  // exactly once per chunk instead of once per phase.
+  // produce the first chunk up front (nothing to overlap it with; a
+  // multi-item source still produces it in parallel)
+  {
+    const std::size_t n = src.plan(CHUNK);
+    char *const dst0 = bufs[0].data() + FRONT;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic) num_threads(nthreads) \
+  if (nthreads > 1 && n > 1)
+#endif
+    for (std::size_t i = 0; i < n; ++i)
+      src.run(i, dst0);
+  }
+
 #ifdef _OPENMP
 #pragma omp parallel num_threads(nthreads)
 #endif
@@ -3075,84 +4338,106 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
 #endif
       {
         // ---- close out the previous chunk (no-op before the first) ----
-        if (slice_open) {
-          for (std::size_t r = 0; r < nranges; ++r)
-            total += counts[r];
-          replayer.submit(nranges);  // replays while the next chunk inflates
-          leftover_len = filled_end - plimit;
-          if (leftover_len) std::memmove(buf, buf + plimit, leftover_len);
-          slice_open = false;
+        const char *prev = buf;
+        std::size_t left = 0;
+        if (!first) {
+          if (slice_open) {
+            for (std::size_t r = 0; r < nranges; ++r)
+              total += counts[r];
+            if (H)
+              for (std::size_t r = 0; r < nranges; ++r)
+                H->take_range(rspan[r]);
+            for (std::size_t r = 0; r < raware.size() && r < nranges; ++r)
+              H->aware_parts.push_back(std::move(raware[r]));
+            if (!tile_ignore)
+              tiles.fold(nranges);
+            if (comb_tiles)
+              ctiles.fold(nranges);
+            replayer.submit(nranges);  // replays while this chunk parses
+          }
+          left = carry;
+          cur ^= 1;
         }
-        s_done = eof;
-        s_skip = false;
-        if (!s_done) {
-          // ---- inflate one chunk after the carried leftover (serial) ----
-          if (bufv.size() < leftover_len + CHUNK) {
-            bufv.resize(leftover_len + CHUNK);  // huge single record: grow
-            buf = bufv.data();
-          }
-          const std::size_t target = leftover_len + CHUNK;
-          std::size_t filled = leftover_len;
-          while (filled < target) {
-            const std::size_t got = src.fill(buf + filled, target - filled);
-            if (got == 0) { eof = true; break; }
-            filled += got;
-          }
-          filled_end = filled;
-          if (filled_end == 0) {
-            s_done = true;
+        first = false;
+        slice_open = false;
+        if (no_more) {
+          s_done = true;  // the EOF chunk has been parsed and closed out
+        }
+        else {
+        // ---- the chunk in bufs[cur] was produced during the last parse ----
+        const std::size_t got = src.produced();
+        eof = src.at_eof();
+        std::vector<char> &B = bufs[cur];
+        if (left > FRONT) {
+          // a carried partial record larger than the reserve (giant reads):
+          // shift the fresh data right to make room
+          B.resize(left + got);
+          std::memmove(B.data() + left, B.data() + FRONT, got);
+          buf = B.data();
+        }
+        else {
+          buf = B.data() + (FRONT - left);
+        }
+        if (left)
+          std::memcpy(buf, prev + (filled_end - left), left);
+        filled_end = left + got;
+        if (filled_end > 0)
+          last_byte = buf[filled_end - 1];
+
+        // ---- queue production of the next chunk into the other buffer ----
+        ntasks = 0;
+        if (!eof) {
+          std::vector<char> &N = bufs[cur ^ 1];
+          if (N.size() < FRONT + CHUNK)
+            N.resize(FRONT + CHUNK);
+          ntasks = src.plan(CHUNK);
+        }
+
+        nranges = 0;
+        carry = 0;
+        s_done = (filled_end == 0 && eof);
+        if (filled_end > 0) {
+          // ---- parse limit: on the last chunk parse to the end, else carry
+          // the straddling tail record (see read_bytes_fused). ----
+          if (eof) {
+            plimit = filled_end;
           }
           else {
-            // ---- parse limit: on the last chunk parse to the end, else carry
-            // the straddling tail record. A record whose 4 lines do not all
-            // fit before `filled_end` makes parse_record return `filled_end`,
-            // so walk complete records forward from a small backward probe and
-            // cut at the first that straddles. ----
-            if (eof) {
-              plimit = filled_end;
+            std::size_t q = SIZE_MAX;
+            for (std::size_t BACK = std::size_t(128) << 10;; BACK <<= 3) {
+              const std::size_t probe =
+                filled_end > BACK ? filled_end - BACK : 0;
+              q = find_record_start(buf, filled_end, probe);
+              if (q < filled_end || probe == 0)
+                break;
             }
-            else {
-              // Backward probe with a widening window (see read_bytes_fused:
-              // any true boundary converges on the same cut).
-              std::size_t q = SIZE_MAX;
-              for (std::size_t BACK = std::size_t(128) << 10;; BACK <<= 3) {
-                const std::size_t probe =
-                  filled_end > BACK ? filled_end - BACK : 0;
-                q = find_record_start(buf, filled_end, probe);
-                if (q < filled_end || probe == 0)
-                  break;
-              }
-              for (;;) {
-                std::size_t so, sl;
-                const std::size_t r = parse_record(buf, filled_end, q, so, sl);
-                if (r >= filled_end)
-                  break;  // record at q straddles the end -> carry from here
-                q = r;
-              }
-              plimit = q;
+            for (;;) {
+              std::size_t so, sl;
+              const std::size_t r = parse_record(buf, filled_end, q, so, sl);
+              if (r >= filled_end)
+                break;  // record at q straddles the end -> carry from here
+              q = r;
             }
-            if (plimit == 0) {  // no complete record yet (spans whole buffer)
-              leftover_len = filled_end;
-              if (eof)
-                s_done = true;
-              else
-                s_skip = true;  // read more input, then retry
-            }
-            else {
-              // -- record-aligned sub-range boundaries (serial, ~1 us each) --
-              nranges = std::min(
-                R_MAX, std::max<std::size_t>(
-                         1, (plimit + RANGE_BYTES - 1) / RANGE_BYTES));
-              sync[0] = 0;
-              sync[nranges] = plimit;
-              for (std::size_t r = 1; r < nranges; ++r)
-                sync[r] = find_record_start(buf, plimit,
-                                            r * (plimit / nranges));
-              for (std::size_t r = 1; r <= nranges; ++r)
-                if (sync[r] < sync[r - 1]) sync[r] = sync[r - 1];
+            plimit = q;
+          }
+          carry = filled_end - plimit;
+          if (plimit > 0) {
+            // -- record-aligned sub-range boundaries (serial, ~1 us each) --
+            nranges = std::min(
+              R_MAX, std::max<std::size_t>(
+                       1, (plimit + RANGE_BYTES - 1) / RANGE_BYTES));
+            // boundaries are found by the parsing threads (sbound below);
+            // find_record_start is monotone in its offset, so this equals the
+            // serial computation (see read_bytes_fused)
+            sync[0] = 0;
+            sync[nranges] = plimit;
+            sstep = plimit / nranges;
 
-              // -- duplication prefix (serial, global order) below the cap --
-              dup_stop = 0;  // cap filled earlier: everything is post-cap
+            // -- duplication prefix (global order) below the cap: serially
+            // here, or in parallel after this block for several ranges --
+            dup_stop = 0;  // cap filled earlier: everything is post-cap
+            par_pfx = do_hash && dup_cont && nranges > 1;
+            if (!par_pfx) {
               if (do_hash && dup_cont) {
                 std::size_t p = 0;
                 while (dup_cont && p < plimit) {
@@ -3160,9 +4445,9 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
                   std::size_t klen;
                   const std::size_t next =
                     FastqPolicy::dup_key(buf, plimit, p, key, klen);
-                  const auto it = master.sequence_count.find(key, klen);
-                  if (it == master.sequence_count.end()) {
-                    master.sequence_count.emplace(key, klen, 1);
+                  const auto fe = master.sequence_count.find_or_emplace(key, klen, 1);
+                  const auto it = fe.first;
+                  if (fe.second) {
                     master.count_at_limit = dup_seen;
                     ++master.num_unique_seen;
                     if (master.num_unique_seen ==
@@ -3178,33 +4463,53 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
                 }
                 dup_stop = p;  // first unconsumed byte == old g-based gate
               }
-              count_dup = do_hash && !dup_cont;
-              if (count_dup && nent == 0) {  // freeze the map, size deltas
-                nent = master.sequence_count.size();
-                mbegin = master.sequence_count.begin();
-                for (std::size_t t = 0; t < nthreads; ++t)
-                  deltas[t].assign(nent, 0);
-              }
-              slice_open = true;
+              post_prefix();
             }
+            slice_open = true;
+          }
+          else if (eof) {
+            s_done = true;  // trailing bytes that form no complete record
           }
         }
-      }  // barrier publishes s_done / s_skip / plimit / buf / filled_end
+        no_more = eof;
+        }
+      }  // barrier publishes buf / filled_end / plimit / ranges / ntasks
       if (s_done)
         break;
-      if (s_skip)
-        continue;
 
-      // ---- Phase 1, k-mer runs only: count records for each range's g0 ------
-      if (need_g) {
+      // ---- parallel duplication prefix (see ParallelDupPrefix) -----------
+      if (par_pfx) {
+#ifdef _OPENMP
+#pragma omp single
+#endif
+        pfx.prepare(nranges);
 #ifdef _OPENMP
 #pragma omp for schedule(dynamic)
 #endif
         for (std::size_t r = 0; r < nranges; ++r)
-          counts[r] = (sync[r] < sync[r + 1])
-            ? FastqPolicy::count_chunk(buf, sync[r], sync[r + 1], plimit,
-                                       nodrop)
+          pfx.collect(r, buf, plimit, sbound(r), sbound(r + 1));
+#ifdef _OPENMP
+#pragma omp single
+#endif
+        {
+          dup_stop =
+            pfx.merge(nranges, sbound, buf, plimit, master, dup_cont, dup_seen);
+          post_prefix();
+        }
+      }
+
+      // ---- Phase 1, k-mer runs only: count records for each range's g0 ------
+      // (a single range starts at the running total: no count pass)
+      if (need_g && nranges > 1) {
+#ifdef _OPENMP
+#pragma omp for schedule(dynamic)
+#endif
+        for (std::size_t r = 0; r < nranges; ++r) {
+          const std::size_t lo = sbound(r), hi = sbound(r + 1);
+          counts[r] = (lo < hi)
+            ? FastqPolicy::count_chunk(buf, lo, hi, plimit, nodrop)
             : 0;
+        }
 #ifdef _OPENMP
 #pragma omp single
 #endif
@@ -3215,35 +4520,70 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
         }
       }
 
-      // ---- Phase 2: parallel parse + per-base stats + deferred dup counting -
+      // ---- Phase 2: production of the next chunk + parallel parse of this
+      // chunk + per-base stats + deferred dup counting. Production items are
+      // spread evenly among the parse ranges (one first, so I/O starts at
+      // once), so producing and parsing overlap instead of running as two
+      // back-to-back stages. ----
+      char *const next_dst = bufs[cur ^ 1].data() + FRONT;
+      const std::size_t nitems = ntasks + nranges;
 #ifdef _OPENMP
 #pragma omp for schedule(dynamic)
 #endif
-      for (std::size_t r = 0; r < nranges; ++r) {
+      for (std::size_t it = 0; it < nitems; ++it) {
+        // item `it` is production item k when it == floor(k * nitems / ntasks)
+        std::size_t k = SIZE_MAX, r = it;
+        if (ntasks && nthreads == 1) {
+          // one thread: parse first, then produce, so asynchronous readahead
+          // of the next chunk runs while this one is parsed
+          if (it >= nranges)
+            k = it - nranges;
+        }
+        else if (ntasks) {
+          const std::size_t kk = (it * ntasks + ntasks - 1) / nitems;  // ceil
+          if (kk < ntasks && (kk * nitems) / ntasks == it)
+            k = kk;
+          // parse ranges before `it` = it - (production items before it)
+          r = it - (it * ntasks + nitems - 1) / nitems;
+        }
+        if (k != SIZE_MAX) {
+          src.run(k, next_dst);
+          continue;
+        }
 #ifdef _OPENMP
         const std::size_t tid = static_cast<std::size_t>(omp_get_thread_num());
 #else
         const std::size_t tid = 0;
 #endif
-        std::vector<GCRecord> &gc = replayer.parse_bufs()[r];
-        gc.clear();  // capacity persists across chunks
+        LocalGCBuf gcl(replayer.parse_bufs()[r]);  // capacity persists
+        std::vector<GCRecord> &gc = gcl.v;
         ParallelWorker &w = *workers[tid];
         w.hard_end = buf + filled_end;  // bounds SIMD quality loads (buf moves)
         FastqStats &ws = *wstats[tid];
         // can_be_last for every record of the tail range: equivalent to the
         // old per-record form (see read_bytes_fused).
-        const bool tail = eof && (sync[r + 1] == plimit);
-        std::size_t p = sync[r];
-        const std::size_t pend = sync[r + 1];
-        std::size_t g = need_g ? gstart[r] : 0;  // g meaningful only for k-mer
+        std::size_t p = sbound(r);
+        const std::size_t pend = sbound(r + 1);
+        const bool tail = eof && (pend == plimit);
+        // g meaningful only for k-mer
+        std::size_t g = need_g ? (nranges > 1 ? gstart[r] : total) : 0;
+        TileFold::Range trec;  // this range's tile reads
+        TileFold::Range ctrec;  // ... of the combined view (tiled pairs)
         std::size_t n = 0;
-        // Deferred-by-one dup lookup (see read_bytesplit_core): overlap the
-        // slot load with the next record's parse. Keys point into `buf`, which
-        // is stable until after this parallel phase (the straddle memmove runs
-        // later, in a `single`), and the pending probe is flushed before this
-        // thread finishes the range.
+        // Deferred-by-one dup lookup (see read_bytesplit_core). Keys point
+        // into `buf`, which stays valid until the next chunk switch, and the
+        // pending probe is flushed before this range ends.
         std::uint64_t ph = 0; const char *pp = nullptr; std::size_t pn = 0;
         bool pv = false;
+        // fingerprints into the thread's arena slab (see read_bytes_fused)
+        const std::size_t fp0 =
+          H ? slabs[tid].reserve(*H, (pend - p) / 6 + 2) : 0;
+        std::uint32_t *const khist = H ? H->key_hist[tid].data() : nullptr;
+        LocalAwareBuf abuf(H, raware, r);
+        std::uint64_t chh = 0;
+        const char *cpp = nullptr;
+        std::size_t cpn = 0;
+        bool cv = false;
         while (p < pend) {
           const std::size_t rec_start = p;
           std::size_t seqlen = 0, tile_cur = 0;
@@ -3251,27 +4591,69 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
           gc.emplace_back(GCRecord{0, 0, 0});
           p = FastqPolicy::parse_one(w, ws, buf, plimit, p, g, &gc.back(),
                                      tile_ignore, tail, seqlen, tile_cur, key);
+          if (!tile_ignore)
+            trec.record(g, seqlen, tile_cur);
+          if (comb_tiles) {
+            ctrec.record(g + coff, seqlen, tile_cur);
+            if ((g + coff) % StreamReader::num_reads_for_tile == 0 &&
+                tile_cur != 0)
+              csums[tid].add(tile_cur, buf + rec_start, buf + plimit);
+          }
           ++g;
           ++n;
+          std::uint64_t hk = 0;
+          if (H) {
+            hk = pair_fingerprints(buf + rec_start, buf + plimit, key,
+                                   seqlen, slabs[tid].key[fp0 + n - 1],
+                                   slabs[tid].name[fp0 + n - 1]);
+            if (abuf.on)
+              abuf.add(buf + rec_start, key, seqlen);
+            ++khist[slabs[tid].key[fp0 + n - 1] >> (64 - FP_BUCKET_BITS)];
+            if (cm) {  // combined view, deferred by one read like the
+                       // mate's own count below
+              const std::size_t klen = get_truncate_point(seqlen);
+              cm->prefetch(hk);
+              if (cv) {
+                const auto f = cm->find_hashed(chh, cpp, cpn);
+                if (f != cm->end())
+                  ++dd2.row(tid)[static_cast<std::size_t>(f - cmbegin)];
+              }
+              chh = hk; cpp = key; cpn = klen; cv = true;
+            }
+          }
           if (count_dup && rec_start >= dup_stop) {
             const std::size_t klen = get_truncate_point(seqlen);
-            const std::uint64_t h = DupHashMap::hash_of(key, klen);
+            const std::uint64_t h = H ? hk : DupHashMap::hash_of(key, klen);
             master.sequence_count.prefetch(h);
             if (pv) {
-              const auto it = master.sequence_count.find_hashed(ph, pp, pn);
-              if (it != master.sequence_count.end())
-                ++deltas[tid][static_cast<std::size_t>(it - mbegin)];
+              const auto f = master.sequence_count.find_hashed(ph, pp, pn);
+              if (f != master.sequence_count.end())
+                ++dd.row(tid)[static_cast<std::size_t>(f - mbegin)];
             }
             ph = h; pp = key; pn = klen; pv = true;
           }
         }
         if (pv) {
-          const auto it = master.sequence_count.find_hashed(ph, pp, pn);
-          if (it != master.sequence_count.end())
-            ++deltas[tid][static_cast<std::size_t>(it - mbegin)];
+          const auto f = master.sequence_count.find_hashed(ph, pp, pn);
+          if (f != master.sequence_count.end())
+            ++dd.row(tid)[static_cast<std::size_t>(f - mbegin)];
         }
+        if (cv) {
+          const auto f = cm->find_hashed(chh, cpp, cpn);
+          if (f != cm->end())
+            ++dd2.row(tid)[static_cast<std::size_t>(f - cmbegin)];
+        }
+        if (H) {
+          rspan[r] = FpSpan{slabs[tid].key + fp0, slabs[tid].name + fp0, n,
+                            static_cast<std::uint32_t>(tid)};
+          slabs[tid].used += n;
+        }
+        if (!tile_ignore)
+          tiles.end_range(r, trec);
+        if (comb_tiles)
+          ctiles.end_range(r, ctrec);
         counts[r] = n;  // == the count pass's value on well-formed input
-      }  // barrier: counts[] complete -> next iteration's single closes out
+      }  // barrier: counts[] complete, next chunk produced
     }
   }
   replayer.finish();  // every chunk replayed, in exact chunk order
@@ -3280,11 +4662,29 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
   std::vector<std::vector<std::pair<std::uint32_t, std::uint32_t>>> tilerecs(
     nthreads);
   const bool count_dup_final = do_hash && !dup_cont;
+  if (count_dup_final)
+    dd.fold(mbegin);
+  if (cm)
+    dd2.fold(cmbegin);
+  if (H && H->on_comb_map && !comb_notified)
+    H->on_comb_map(nullptr);
+  if (H)
+    H->ends_with_newline = (last_byte == '\n');
   merge_worker_stats(config, master, nthreads, total, wstats, empty_gc, deltas,
                      tilerecs, gstart, count_dup_final,
                      /*tile_ignore=*/true, /*skip_gc=*/true);
+  if (!tile_ignore)
+    tiles.finish(config, master, wstats);
+  if (H && !tile_ignore) {
+    H->tile_len = tiles.len();
+    H->tile_maxlen = tiles.maxlen();
+  }
+  if (comb_tiles) {
+    H->comb_tile_len = ctiles.len();
+    CombTileSums::merge_into(csums, *H);
+  }
 }
-#endif  // USE_ISAL || USE_RAPIDGZIP
+// end of the generic streaming parse
 
 // [FalcoAmadeus] SAM worker: tab-delimited fields, newline records. Same per-base
 // machinery as the FASTQ worker, only the separators differ.
@@ -3405,9 +4805,176 @@ read_sam_chunked(FalcoConfig &config, FastqStats &master, std::size_t nthreads) 
                               [src]() { delete src; }, /*can_drop=*/true);
 }
 
+#if defined(USE_ISAL) || defined(USE_RAPIDGZIP)
+// [FalcoAmadeus] Fraction of a file's pages currently in the page cache,
+// estimated from up to 1024 evenly spaced pages (mincore over a read-only
+// mapping; no data is touched). Used to pick the zero-copy mmap parse for
+// cached files and streamed reads otherwise; the choice affects speed only.
+// A full mincore walk of a 4 GB file costs ~70 ms, the sample well under 1 ms.
+static double
+file_cache_resident_fraction(const std::string &path) {
+  const int fd = ::open(path.c_str(), O_RDONLY);
+  if (fd < 0)
+    return 0.0;
+  struct stat st;
+  if (fstat(fd, &st) != 0 || st.st_size == 0) {
+    ::close(fd);
+    return 0.0;
+  }
+  const size_t len = static_cast<size_t>(st.st_size);
+  void *m = mmap(nullptr, len, PROT_READ, MAP_SHARED, fd, 0);
+  ::close(fd);
+  if (m == MAP_FAILED)
+    return 0.0;
+  const size_t pg = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+  const size_t npages = (len + pg - 1) / pg;
+  const size_t nsample = std::min<size_t>(npages, 1024);
+  size_t resident = 0, probed = 0;
+  for (size_t k = 0; k < nsample; ++k) {
+    const size_t idx = k * npages / nsample;
+#if defined(__APPLE__)
+    char v = 0;
+#else
+    unsigned char v = 0;
+#endif
+    if (mincore(static_cast<char *>(m) + idx * pg, 1, &v) == 0) {
+      resident += (v & 1);
+      ++probed;
+    }
+  }
+  munmap(m, len);
+  return probed ? static_cast<double>(resident) / static_cast<double>(probed)
+                : 0.0;
+}
+
+#endif
+#if defined(USE_ISAL) || defined(USE_RAPIDGZIP)
+// [FalcoAmadeus] Chunk source for uncompressed FASTQ: each chunk is read with
+// several pread() calls issued as parallel work items into the spare buffer
+// of read_stream_fused, overlapping I/O with the parse of the previous chunk.
+// Explicit sequential reads keep the kernel's readahead effective and avoid
+// one page fault per 4 KB page; on a file that is not yet in the page cache
+// the memory-mapped path was 2-2.5x slower than read()-based tools.
+class PlainFileChunkSource {
+ public:
+  explicit PlainFileChunkSource(const std::string &path) {
+    fd_ = ::open(path.c_str(), O_RDONLY);
+    if (fd_ < 0)
+      throw std::runtime_error("Cannot open FASTQ file : " + path);
+    struct stat st;
+    if (fstat(fd_, &st) != 0) {
+      ::close(fd_);
+      throw std::runtime_error("Cannot stat FASTQ file : " + path);
+    }
+    size_ = static_cast<size_t>(st.st_size);
+#ifdef POSIX_FADV_SEQUENTIAL
+    posix_fadvise(fd_, 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
+  }
+  ~PlainFileChunkSource() {
+    if (fd_ >= 0)
+      ::close(fd_);
+  }
+  PlainFileChunkSource(const PlainFileChunkSource &) = delete;
+  PlainFileChunkSource &operator=(const PlainFileChunkSource &) = delete;
+
+  size_t plan(size_t cap) {
+    start_ = off_;
+    len_ = std::min(cap, size_ - off_);
+    off_ += len_;
+    eof_ = (off_ >= size_);
+#ifdef POSIX_FADV_WILLNEED
+    // start asynchronous readahead of the whole chunk now, so the device
+    // works while the current chunk is parsed (matters most at -t 1)
+    if (len_)
+      posix_fadvise(fd_, static_cast<off_t>(start_),
+                    static_cast<off_t>(std::min(2 * len_, size_ - start_)),
+                    POSIX_FADV_WILLNEED);
+#endif
+    return (len_ + PIECE - 1) / PIECE;
+  }
+  void run(size_t i, char *dst) {
+    const size_t a = i * PIECE, b = std::min(len_, a + PIECE);
+    size_t done = a;
+    while (done < b) {
+      const ssize_t n = pread(fd_, dst + done, b - done,
+                              static_cast<off_t>(start_ + done));
+      if (n <= 0) {
+        failed_.store(true, std::memory_order_relaxed);
+        return;
+      }
+      done += static_cast<size_t>(n);
+    }
+  }
+  size_t produced() const {
+    if (failed_.load(std::memory_order_relaxed))
+      throw std::runtime_error("read error in FASTQ file");
+    return len_;
+  }
+  bool at_eof() const { return eof_; }
+
+ private:
+  static constexpr size_t PIECE = size_t(4) << 20;
+  int fd_ = -1;
+  size_t size_ = 0, off_ = 0, start_ = 0, len_ = 0;
+  bool eof_ = false;
+  std::atomic<bool> failed_{false};
+};
+#endif
+
+std::unique_ptr<PairedHooks::DupPrefix>
+fastq_dup_prefix(const std::string &filename) {
+  // the walk of read_bytes_fused's prefix over the whole file: records are
+  // consumed in file order until the tracker holds its last sequence
+  std::unique_ptr<PairedHooks::DupPrefix> r(new PairedHooks::DupPrefix);
+  PlainBlockReader src(filename);
+  const char *base = src.data();
+  const std::size_t size = src.size();
+  std::size_t p = FastqPolicy::find_start(base, size, 0);
+  bool cont = true;
+  while (cont && p < size) {
+    const char *key;
+    std::size_t klen;
+    const std::size_t next = FastqPolicy::dup_key(base, size, p, key, klen);
+    const auto fe = r->map.find_or_emplace(key, klen, 1);
+    if (fe.second) {
+      r->count_at_limit = r->reads;
+      ++r->num_unique_seen;
+      if (r->num_unique_seen == Constants::unique_reads_stop_counting)
+        cont = false;
+    }
+    else {
+      ++fe.first->second;
+      ++r->count_at_limit;
+    }
+    ++r->reads;
+    p = next;
+  }
+  r->stop = p;
+  r->full = !cont;
+  return r;
+}
+
 void
 read_uncompressed_chunked(FalcoConfig &config, FastqStats &master,
                           std::size_t nthreads) {
+#if defined(USE_ISAL) || defined(USE_RAPIDGZIP)
+  // Streamed reads for tile-less input (the stream driver is tile-less; tiled
+  // input keeps the memory-mapped driver below).
+  {
+    ParallelWorker probe(config, FastqStats::SHORT_READ_THRESHOLD);
+    // Multi-threaded runs on a file that is not (mostly) in the page cache
+    // stream it with explicit reads; cached files, and single-threaded runs
+    // (whose strictly sequential mmap parse keeps kernel readahead ahead of
+    // the parser), keep the zero-copy memory-mapped driver.
+    if (probe.tile_ignore && nthreads > 1 &&
+        file_cache_resident_fraction(config.filename) < 0.9) {
+      PlainFileChunkSource src(config.filename);
+      read_stream_fused(config, master, nthreads, src);
+      return;
+    }
+  }
+#endif
   // Heap-allocated so the munmap can be handed to the background releaser inside
   // read_chunked_core; the closure runs (and completes) before the core returns.
   PlainBlockReader *src = new PlainBlockReader(config.filename);
@@ -3593,9 +5160,6 @@ decompress_bgzf_libdeflate(const std::string &path, std::size_t nthreads) {
     void *m = mmap(nullptr, utotal, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (m != MAP_FAILED) {
-#ifdef MADV_HUGEPAGE  // Linux-only optimization hint; skipped elsewhere
-      madvise(m, utotal, MADV_HUGEPAGE);
-#endif
       out = static_cast<char *>(m); huge = true;
     }
   }
@@ -3693,10 +5257,22 @@ decompress_bgzf_libdeflate(const std::string &path, std::size_t nthreads) {
 }
 #endif  // USE_HTS && USE_LIBDEFLATE
 
+#if defined(USE_HTS) && defined(USE_LIBDEFLATE) && \
+    (defined(USE_ISAL) || defined(USE_RAPIDGZIP))
+static bool read_bgzf_fastq_fused(FalcoConfig &config, FastqStats &master,
+                                  std::size_t nthreads);
+#endif
+
 void
 read_gz_chunked(FalcoConfig &config, FastqStats &master,
                 std::size_t nthreads) {
-#if defined(USE_HTS) && defined(USE_LIBDEFLATE)
+#if defined(USE_HTS) && defined(USE_LIBDEFLATE) && \
+    (defined(USE_ISAL) || defined(USE_RAPIDGZIP))
+  // BGZF: inflate each chunk's blocks in parallel straight into the streaming
+  // parser (bounded memory, no temporary decompressed copy).
+  if (read_bgzf_fastq_fused(config, master, nthreads))
+    return;
+#elif defined(USE_HTS) && defined(USE_LIBDEFLATE)
   // Fast path: parallel BGZF block decompression with libdeflate, then parse.
   {
     GzBuffer g = decompress_bgzf_libdeflate(config.filename, nthreads);
@@ -3735,19 +5311,176 @@ read_gz_chunked(FalcoConfig &config, FastqStats &master,
   if (config.seekable_input && nthreads >= 2 &&
       get_file_size(config.filename) >= (std::size_t(1) << 30) &&
       std::getenv("FA_RAPIDGZIP")) {
-    RapidgzipSource src(config.filename, nthreads);
+    RapidgzipSource raw(config.filename, nthreads);
+    SerialChunkSource<RapidgzipSource> src(raw);
     read_stream_fused(config, master, nthreads, src);
     return;
   }
 #endif
 #if defined(USE_ISAL)
   {
-    IsalInflater src(config.filename);
-    read_stream_fused(config, master, nthreads, src);
+    IsalInflater raw(config.filename);
+    SerialChunkSource<IsalInflater> src(raw);
+    // One serial inflater bounds the throughput: seven parsing threads keep
+    // up with it, so a larger team and chunks beyond 32 MB only add CPU time
+    // and memory. Output is identical at any team size.
+    read_stream_fused(config, master, std::min<std::size_t>(nthreads, 8), src,
+                      std::size_t(32) << 20);
   }
 #else
   // Fallback: background block decompressor feeding the serial dispatcher.
   read_gz_parallel(config, master, nthreads);
+#endif
+}
+
+#if defined(USE_ISAL)
+// [FalcoAmadeus] Byte source that yields the concatenation of several FASTQ
+// files, each decompressed with ISA-L when gzipped (by magic bytes) or read
+// as-is otherwise. Feeding it to read_stream_fused parses exactly the bytes a
+// concatenated copy would hold, without writing that copy.
+class ChainedFastqSource {
+ public:
+  explicit ChainedFastqSource(const std::vector<std::string> &files)
+      : files_(files) {}
+  ~ChainedFastqSource() { close_plain(); }
+  ChainedFastqSource(const ChainedFastqSource &) = delete;
+  ChainedFastqSource &operator=(const ChainedFastqSource &) = delete;
+
+  size_t fill(char *out, size_t cap) {
+    while (idx_ < files_.size()) {
+      if (!open_ && !open_next())
+        return 0;
+      size_t got = 0;
+      if (gz_) {
+        got = gz_->fill(out, cap);
+      }
+      else {
+        while (got < cap) {
+          const ssize_t n = ::read(fd_, out + got, cap - got);
+          if (n < 0)
+            throw std::runtime_error("read error in file: " + files_[idx_]);
+          if (n == 0)
+            break;
+          got += static_cast<size_t>(n);
+        }
+      }
+      if (got > 0)
+        return got;
+      // current file exhausted: move on to the next one
+      gz_.reset();
+      close_plain();
+      open_ = false;
+      ++idx_;
+    }
+    return 0;
+  }
+
+ private:
+  bool open_next() {
+    const std::string &f = files_[idx_];
+    unsigned char magic[2] = {0, 0};
+    const int fd = ::open(f.c_str(), O_RDONLY);
+    if (fd < 0)
+      throw std::runtime_error("Cannot open FASTQ file : " + f);
+    const bool is_gz = (::read(fd, magic, 2) == 2 && magic[0] == 0x1f &&
+                        magic[1] == 0x8b);
+    if (is_gz) {
+      ::close(fd);
+      gz_.reset(new IsalInflater(f));
+    }
+    else {
+      ::lseek(fd, 0, SEEK_SET);
+      fd_ = fd;
+    }
+    open_ = true;
+    return true;
+  }
+  void close_plain() {
+    if (fd_ >= 0)
+      ::close(fd_);
+    fd_ = -1;
+  }
+
+  std::vector<std::string> files_;
+  size_t idx_ = 0;
+  bool open_ = false;
+  int fd_ = -1;
+  std::unique_ptr<IsalInflater> gz_;
+};
+#endif
+
+// Sequential reads of an uncompressed stream (pipe, stdin, FIFO).
+class FdFastqSource {
+ public:
+  explicit FdFastqSource(const std::string &path) {
+    fd_ = ::open(path.c_str(), O_RDONLY);
+    if (fd_ < 0)
+      throw std::runtime_error("Cannot open FASTQ file : " + path);
+  }
+  ~FdFastqSource() { ::close(fd_); }
+  FdFastqSource(const FdFastqSource &) = delete;
+  FdFastqSource &operator=(const FdFastqSource &) = delete;
+  size_t fill(char *out, size_t cap) {
+    size_t got = 0;
+    while (got < cap) {
+      const ssize_t n = ::read(fd_, out + got, cap - got);
+      if (n < 0) {
+        if (errno == EINTR)
+          continue;
+        throw std::runtime_error("read error in input stream");
+      }
+      if (n == 0)
+        break;
+      got += static_cast<size_t>(n);
+    }
+    return got;
+  }
+
+ private:
+  int fd_ = -1;
+};
+
+bool
+piped_fastq_supported() {
+  return true;
+}
+
+void
+read_piped_fastq(FalcoConfig &config, FastqStats &master,
+                 std::size_t nthreads) {
+  FdFastqSource raw(config.filename);
+  SerialChunkSource<FdFastqSource> src(raw);
+  // a pipe delivers a few GB/s at most: small chunks keep the double buffer
+  // (and the memory) small without slowing the parse down
+  read_stream_fused(config, master, nthreads, src, std::size_t(16) << 20);
+}
+
+bool
+pooled_stream_supported(const FalcoConfig &config,
+                        const std::string &first_file) {
+#if defined(USE_ISAL)
+  // The stream driver reconstructs per-tile quality in stream order, so a
+  // pooled stream of tiled mates is analysed as their concatenation.
+  (void)config;
+  (void)first_file;
+  return true;
+#else
+  (void)config;
+  (void)first_file;
+  return false;
+#endif
+}
+
+void
+read_pooled_fastq(FalcoConfig &config, FastqStats &master, size_t nthreads,
+                  const std::vector<std::string> &files) {
+#if defined(USE_ISAL)
+  ChainedFastqSource raw(files);
+  SerialChunkSource<ChainedFastqSource> src(raw);
+  read_stream_fused(config, master, nthreads, src);
+#else
+  (void)config; (void)master; (void)nthreads; (void)files;
+  throw std::runtime_error("pooled FASTQ streaming requires ISA-L");
 #endif
 }
 
@@ -4509,6 +6242,130 @@ struct BgzfIndex {
   bool ok = false;
 };
 
+// [FalcoAmadeus] Incremental walk of a BGZF block chain through a sliding
+// pread window (no decompression). Walking through a bounded buffer instead of
+// an mmap of the whole compressed file keeps RSS lean on every platform: the
+// mmap variant relied on MADV_DONTNEED drop-behind, which Darwin treats as a
+// lazy hint (measured ~3.8 GB peak RSS on a 4 GB BAM on macOS). A BGZF block
+// is at most 65536 bytes, so a window refill from the current block offset
+// always fits a whole block.
+class BgzfWalker {
+ public:
+  struct Block {
+    std::size_t coff, clen, uoff, ulen;
+  };
+  BgzfWalker(int fd, std::size_t csize) : fd_(fd), csize_(csize), wbuf_(WIN) {}
+
+  // Next block with a nonzero uncompressed size. Returns false at the end of
+  // the chain; ok() then tells whether the chain is a valid BGZF file (an
+  // invalid first block, or a gzip member without a BGZF size field, makes
+  // it invalid; trailing bytes that are not a block end the chain).
+  bool next(Block &b) {
+    while (!done_) {
+      std::size_t isize = 0, bsize = 0;
+      if (!step(bsize, isize)) {
+        done_ = true;
+        break;
+      }
+      const std::size_t p = p_;
+      p_ += bsize;
+      const std::size_t u = utotal_;
+      utotal_ += isize;
+      if (isize > 0) {
+        b = Block{p, bsize, u, isize};
+        ++nblocks_;
+        return true;
+      }
+    }
+    return false;
+  }
+  bool done() const { return done_; }
+  bool ok() const { return ok_; }
+  std::size_t nblocks() const { return nblocks_; }
+  std::size_t utotal() const { return utotal_; }
+
+ private:
+  // 1 MB: holds any whole block (<= 64 KB); the window lives as long as the
+  // walk, which overlaps the whole run for BGZF FASTQ
+  static constexpr std::size_t WIN = std::size_t(1) << 20;
+  void fill_from(std::size_t off) {
+    wbase_ = off;
+    wlen_ = 0;
+    while (wlen_ < WIN) {
+      const ssize_t n = pread(fd_, wbuf_.data() + wlen_,
+                              std::min(WIN - wlen_, csize_ - off - wlen_),
+                              static_cast<off_t>(off + wlen_));
+      if (n <= 0)
+        break;
+      wlen_ += static_cast<std::size_t>(n);
+      if (off + wlen_ >= csize_)
+        break;
+    }
+  }
+  const unsigned char *at(std::size_t abs) const {
+    return wbuf_.data() + (abs - wbase_);
+  }
+  static std::size_t le16(const unsigned char *q) {
+    return static_cast<std::size_t>(q[0]) | (static_cast<std::size_t>(q[1]) << 8);
+  }
+  static std::size_t le32(const unsigned char *q) {
+    return static_cast<std::size_t>(q[0]) | (static_cast<std::size_t>(q[1]) << 8) |
+           (static_cast<std::size_t>(q[2]) << 16) |
+           (static_cast<std::size_t>(q[3]) << 24);
+  }
+  // Parse the block at p_; false ends the chain (ok_ records validity).
+  bool step(std::size_t &bsize, std::size_t &isize) {
+    const std::size_t p = p_;
+    if (p + 18 > csize_)
+      return false;
+    // ensure the window holds this block's header; a full block always fits
+    if (p + 18 > wbase_ + wlen_)
+      fill_from(p);
+    if (p + 18 > wbase_ + wlen_)
+      return false;  // short read: treat like a truncated file
+    if (!(at(p)[0] == 0x1f && at(p)[1] == 0x8b && at(p)[2] == 8 &&
+          (at(p)[3] & 4))) {
+      ok_ = (p != 0);
+      return false;
+    }
+    const std::size_t xlen = le16(at(p) + 10);
+    std::size_t xp = p + 12;
+    const std::size_t xe = xp + xlen;
+    if (xe > wbase_ + wlen_ && xe <= csize_) {
+      fill_from(p);
+      if (xe > wbase_ + wlen_)
+        return false;
+    }
+    bsize = 0;
+    while (xp + 4 <= xe && xe <= csize_) {
+      const std::size_t sl = le16(at(xp) + 2);
+      if (at(xp)[0] == 'B' && at(xp)[1] == 'C' && sl == 2) {
+        bsize = le16(at(xp) + 4) + 1;
+        break;
+      }
+      xp += 4 + sl;
+    }
+    if (bsize == 0 || p + bsize > csize_) {
+      ok_ = (p != 0 && bsize != 0);
+      return false;
+    }
+    if (p + bsize > wbase_ + wlen_) {  // footer past the window: refill
+      fill_from(p);
+      if (p + bsize > wbase_ + wlen_)
+        return false;
+    }
+    isize = le32(at(p + bsize - 4));
+    return true;
+  }
+
+  int fd_;
+  std::size_t csize_;
+  std::vector<unsigned char> wbuf_;
+  std::size_t wbase_ = 0, wlen_ = 0;  // file offset and valid bytes of window
+  std::size_t p_ = 0, utotal_ = 0, nblocks_ = 0;
+  bool done_ = false, ok_ = true;
+};
+
 static BgzfIndex
 bgzf_walk_index(const std::string &path) {
   BgzfIndex r;
@@ -4519,92 +6376,238 @@ bgzf_walk_index(const std::string &path) {
   if (fstat(fd, &stt) != 0) { close(fd); return r; }
   const std::size_t csize = static_cast<std::size_t>(stt.st_size);
   if (csize < 18) { close(fd); return r; }
-  // Walk the block chain through a small sliding pread window instead of an
-  // mmap of the whole compressed file. The mmap variant relied on
-  // MADV_DONTNEED drop-behind to stay lean, but Darwin treats that as a lazy
-  // hint and kept the entire file resident (measured ~3.8 GB peak RSS on a
-  // 4 GB BAM on macOS); a bounded buffer costs the same one sequential read
-  // and is lean on every platform. A BGZF block is at most 65536 bytes, so a
-  // window refill from the current block offset always fits a whole block.
-  const std::size_t WIN = std::size_t(8) << 20;
-  std::vector<unsigned char> wbuf(WIN);
-  std::size_t wbase = 0, wlen = 0;  // file offset and valid bytes of the window
-  auto fill_from = [&](std::size_t off) {
-    wbase = off;
-    wlen = 0;
-    while (wlen < WIN) {
-      const ssize_t n = pread(fd, wbuf.data() + wlen,
-                              std::min(WIN - wlen, csize - off - wlen),
-                              static_cast<off_t>(off + wlen));
-      if (n <= 0)
-        break;
-      wlen += static_cast<std::size_t>(n);
-      if (off + wlen >= csize)
-        break;
-    }
-  };
-  // window-relative view of an absolute file offset (caller bounds-checks)
-  auto at = [&](std::size_t abs) { return wbuf.data() + (abs - wbase); };
-  auto le16 = [](const unsigned char *q) {
-    return static_cast<std::size_t>(q[0]) | (static_cast<std::size_t>(q[1]) << 8);
-  };
-  auto le32 = [](const unsigned char *q) {
-    return static_cast<std::size_t>(q[0]) | (static_cast<std::size_t>(q[1]) << 8) |
-           (static_cast<std::size_t>(q[2]) << 16) |
-           (static_cast<std::size_t>(q[3]) << 24);
-  };
-  fill_from(0);
-  std::size_t p = 0, utotal = 0;
-  bool bgzf_ok = true;
-  while (p + 18 <= csize) {
-    // ensure the window holds this block's header; a full block always fits
-    if (p + 18 > wbase + wlen)
-      fill_from(p);
-    if (p + 18 > wbase + wlen)
-      break;  // short read: treat like a truncated file
-    if (!(at(p)[0] == 0x1f && at(p)[1] == 0x8b && at(p)[2] == 8 &&
-          (at(p)[3] & 4))) {
-      bgzf_ok = (p != 0);
-      break;
-    }
-    const std::size_t xlen = le16(at(p) + 10);
-    std::size_t xp = p + 12;
-    const std::size_t xe = xp + xlen;
-    if (xe > wbase + wlen && xe <= csize) {
-      fill_from(p);
-      if (xe > wbase + wlen) break;
-    }
-    std::size_t bsize = 0;
-    while (xp + 4 <= xe && xe <= csize) {
-      const std::size_t sl = le16(at(xp) + 2);
-      if (at(xp)[0] == 'B' && at(xp)[1] == 'C' && sl == 2) {
-        bsize = le16(at(xp) + 4) + 1;
-        break;
-      }
-      xp += 4 + sl;
-    }
-    if (bsize == 0 || p + bsize > csize) {
-      bgzf_ok = (p != 0 && bsize != 0);
-      break;
-    }
-    if (p + bsize > wbase + wlen) {  // footer past the window: refill
-      fill_from(p);
-      if (p + bsize > wbase + wlen) break;
-    }
-    const std::size_t isize = le32(at(p + bsize - 4));
-    if (isize > 0) {
-      r.coff.push_back(p);
-      r.clen.push_back(bsize);
-      r.uoff.push_back(utotal);
-      r.ulen.push_back(isize);
-    }
-    utotal += isize;
-    p += bsize;
+  BgzfWalker w(fd, csize);
+  BgzfWalker::Block b;
+  while (w.next(b)) {
+    r.coff.push_back(b.coff);
+    r.clen.push_back(b.clen);
+    r.uoff.push_back(b.uoff);
+    r.ulen.push_back(b.ulen);
   }
-  if (!bgzf_ok || r.coff.empty()) { close(fd); return r; }
-  r.fd = fd; r.csize = csize; r.utotal = utotal; r.ok = true;
+  if (!w.ok() || r.coff.empty()) { close(fd); return r; }
+  r.fd = fd; r.csize = csize; r.utotal = w.utotal(); r.ok = true;
   return r;
 }
+
+#if defined(USE_LIBDEFLATE) && (defined(USE_ISAL) || defined(USE_RAPIDGZIP))
+// [FalcoAmadeus] Chunk source for BGZF-compressed FASTQ (see
+// read_stream_fused). A background thread walks the block chain (headers
+// only, through BgzfWalker) and prepares up to two chunk plans ahead: the
+// runs of blocks that fit a chunk. plan() takes the next prepared run and
+// splits it into groups; run(i) reads and inflates group i straight into the
+// destination at the blocks' known offsets. read_stream_fused executes the
+// groups as items of its parse loop, so the next chunk inflates in parallel
+// while the current one is parsed, and the walk overlaps both instead of
+// reading the whole compressed file before the first chunk. The bytes
+// delivered, and their order, are exactly the decompressed stream.
+//
+// The up-front walk this replaces also decided whether the file is BGZF at
+// all; a gzip member without a BGZF size field later in the file sends the
+// whole file to the plain-gzip path. The walker reports that case through
+// invalid(); the caller then discards the partial statistics and re-reads
+// the file on the plain-gzip path, as before.
+class BgzfParallelSource {
+ public:
+  BgzfParallelSource(int fd, std::size_t csize, std::size_t cap)
+    : fd_(fd), walker_(fd, csize), cap_(cap) {
+    th_ = std::thread([this] { walk(); });
+  }
+  ~BgzfParallelSource() {
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      stop_ = true;
+    }
+    cv_.notify_all();
+    th_.join();
+  }
+  BgzfParallelSource(const BgzfParallelSource &) = delete;
+  BgzfParallelSource &operator=(const BgzfParallelSource &) = delete;
+
+  // True when the file holds no data block or is not a valid BGZF chain
+  // (blocks until the walker has decided, which it does at its first block
+  // for any input that is not BGZF from the start).
+  bool empty_or_invalid() {
+    std::unique_lock<std::mutex> lk(m_);
+    cv_.wait(lk, [&] { return !q_.empty() || walk_done_; });
+    return invalid_ || (!q_.empty() && q_.front().blocks.empty() &&
+                        q_.front().eof);
+  }
+  bool invalid() {
+    std::lock_guard<std::mutex> lk(m_);
+    return invalid_;
+  }
+
+  size_t plan(size_t cap) {
+    if (cap != cap_)
+      throw std::logic_error("BGZF source: chunk size mismatch");
+    {
+      std::unique_lock<std::mutex> lk(m_);
+      cv_.wait(lk, [&] { return !q_.empty(); });
+      cur_ = std::move(q_.front());
+      q_.pop_front();
+    }
+    cv_.notify_all();
+    produced_ = cur_.need;
+    eof_ = cur_.eof;
+    const auto &B = cur_.blocks;
+    if (B.empty())
+      return 0;
+    // the compressed bytes of the run are read by the work items themselves,
+    // each its own group, so no thread reads the whole run serially
+    const size_t clen = B.back().coff + B.back().clen - B.front().coff;
+    if (cbuf_.size() < clen)
+      cbuf_.resize(clen);
+    return (B.size() + GROUP - 1) / GROUP;
+  }
+
+  // Read and inflate block group i of the planned run into dst (the chunk
+  // start). Errors are recorded and raised by the next produced() call, since
+  // an exception must not leave an OpenMP worksharing loop.
+  void run(size_t i, char *dst) {
+    const auto &B = cur_.blocks;
+    const size_t g0 = i * GROUP;
+    const size_t g1 = std::min(B.size(), g0 + GROUP);
+    const size_t c0 = B.front().coff, u0 = B.front().uoff;
+    {
+      const size_t ca = B[g0].coff, cb = B[g1 - 1].coff + B[g1 - 1].clen;
+      size_t done = ca;
+      while (done < cb) {
+        const ssize_t n = pread(fd_, cbuf_.data() + (done - c0), cb - done,
+                                static_cast<off_t>(done));
+        if (n <= 0) {
+          failed_.store(true, std::memory_order_relaxed);
+          return;
+        }
+        done += static_cast<size_t>(n);
+      }
+    }
+    thread_local libdeflate_decompressor *d = nullptr;
+    if (d == nullptr)
+      d = libdeflate_alloc_decompressor();
+    for (size_t b = g0; b < g1; ++b) {
+      size_t act = 0;
+      if (d == nullptr ||
+          libdeflate_gzip_decompress(
+            d, cbuf_.data() + (B[b].coff - c0), B[b].clen,
+            dst + (B[b].uoff - u0), B[b].ulen, &act) != LIBDEFLATE_SUCCESS ||
+          act != B[b].ulen)
+        failed_.store(true, std::memory_order_relaxed);
+    }
+  }
+
+  size_t produced() const {
+    if (failed_.load(std::memory_order_relaxed))
+      throw std::runtime_error("BGZF block failed to read or decompress");
+    return produced_;
+  }
+  bool at_eof() const { return eof_; }
+
+ private:
+  struct Plan {
+    std::vector<BgzfWalker::Block> blocks;
+    size_t need = 0;
+    bool eof = false;
+  };
+  static constexpr size_t GROUP = 16;  // blocks per work item (~1 MB)
+  static constexpr size_t AHEAD = 2;   // plans prepared ahead of plan()
+
+  // Walker thread: the same block selection as one pass over a full index
+  // (blocks are added while they fit the chunk; a chunk is the last one when
+  // no block follows it).
+  void walk() {
+    BgzfWalker::Block pending{};
+    bool have_pending = false;
+    for (;;) {
+      {
+        std::unique_lock<std::mutex> lk(m_);
+        cv_.wait(lk, [&] { return stop_ || q_.size() < AHEAD; });
+        if (stop_)
+          return;
+      }
+      Plan P;
+      bool end = false;
+      for (;;) {
+        if (!have_pending) {
+          if (!walker_.next(pending)) {
+            end = true;
+            break;
+          }
+          have_pending = true;
+        }
+        if (P.need + pending.ulen > cap_ && !P.blocks.empty())
+          break;
+        P.need += pending.ulen;
+        P.blocks.push_back(pending);
+        have_pending = false;
+      }
+      const bool invalid = end && !walker_.ok();
+      if (invalid) {  // nothing more is delivered; the caller re-reads
+        P.blocks.clear();
+        P.need = 0;
+      }
+      P.eof = end;
+      {
+        std::lock_guard<std::mutex> lk(m_);
+        q_.push_back(std::move(P));
+        if (end) {
+          invalid_ = invalid;
+          walk_done_ = true;
+        }
+      }
+      cv_.notify_all();
+      if (end)
+        return;
+    }
+  }
+
+  int fd_;
+  BgzfWalker walker_;  // used by the walker thread only
+  const size_t cap_;
+  std::thread th_;
+  std::mutex m_;
+  std::condition_variable cv_;
+  std::deque<Plan> q_;
+  bool stop_ = false, walk_done_ = false, invalid_ = false;
+  Plan cur_;  // the run being produced (plan() and run() only)
+  size_t produced_ = 0;
+  bool eof_ = false;
+  std::atomic<bool> failed_{false};
+  std::vector<unsigned char> cbuf_;
+};
+
+// Returns false when the file is not BGZF (caller uses the plain-gzip path).
+static bool
+read_bgzf_fastq_fused(FalcoConfig &config, FastqStats &master,
+                      std::size_t nthreads) {
+  const int fd = open(config.filename.c_str(), O_RDONLY);
+  if (fd < 0)
+    return false;
+  struct stat stt;
+  if (fstat(fd, &stt) != 0 || stt.st_size < 18) {
+    close(fd);
+    return false;
+  }
+  bool invalid = false;
+  {
+    BgzfParallelSource src(fd, static_cast<std::size_t>(stt.st_size),
+                           stream_chunk_size(nthreads));
+    if (src.empty_or_invalid()) {
+      close(fd);
+      return false;
+    }
+    read_stream_fused(config, master, nthreads, src);
+    invalid = src.invalid();
+  }
+  close(fd);
+  if (invalid) {  // not BGZF after all: discard and use the plain-gzip path
+    master = FastqStats(config.do_kmer);
+    if (config.paired_hooks)
+      config.paired_hooks->failed = true;
+    return false;
+  }
+  return true;
+}
+#endif
 
 // [FalcoAmadeus] FUSED parallel BAM driver: decompress ONE ~128 MB chunk of BGZF
 // blocks at a time into a REUSED anonymous huge-page buffer (faulted once, then
@@ -4626,11 +6629,11 @@ read_bam_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads) {
   ParallelWorker cfg(config, BUF);
   const bool tile_ignore = cfg.tile_ignore;
   const bool do_hash = cfg.do_sequence_hash;
-  if (!tile_ignore) {  // fused path is tile-less; tiled BAM uses the full-buffer driver
-    close(ix.fd);
-    read_bam_chunked(config, master, nthreads);
-    return;
-  }
+  // [FalcoAmadeus] Tiled input (Illumina read names) takes the copying record
+  // parser, which reads the tile from the name; its tile reads are folded in
+  // global read order per chunk (TileFold, as in the byte-split driver).
+  if (tile_ignore)
+    config.do_tile = false;
 
   // ---- group blocks into ~32 MB decompressed chunks (double-buffered) ----
   // [FalcoAmadeus P4] Half the old 64 MB chunks, TWO chunk buffers: the
@@ -4664,9 +6667,6 @@ read_bam_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads) {
     bam_read_serial(config, master);
     return;
   }
-#ifdef MADV_HUGEPAGE  // Linux-only optimization hint; skipped elsewhere
-  madvise(bufmem, 2 * bufcap, MADV_HUGEPAGE);
-#endif
   char *const bufs2[2] = { bufmem, bufmem + bufcap };
   char *buf = bufs2[0];  // the dup-prefix pass below runs single-buffered
   auto rd_bsz = [&](const char *bp, std::size_t q) {
@@ -4797,6 +6797,7 @@ read_bam_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads) {
   };
   const std::size_t R_MAX_BAM = std::max<std::size_t>(4 * nthreads, 1);
   GCReplayer replayer(master, R_MAX_BAM);
+  TileFold tiles(tile_ignore ? 0 : R_MAX_BAM);
   // pipeline state (aux-thread writes ordered against the main thread by the
   // replayer's mutex: wait_idle() before any read)
   std::vector<char> cbufs2[2];        // compressed bytes per buffer slot
@@ -4944,20 +6945,31 @@ read_bam_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads) {
         const std::size_t r = task - ninfl;
         const std::size_t lo = nrec * r / nranges;
         const std::size_t hi = nrec * (r + 1) / nranges;
+        TileFold::Range trec;
         if (lo >= hi) { replayer.parse_bufs()[r].clear(); }
         else {
           FastqStats &ws = *wstats[tid];
           BamReader &w = *bw[tid];
-          std::vector<GCRecord> &gc = replayer.parse_bufs()[r];
-          gc.clear();
+          LocalGCBuf gcl(replayer.parse_bufs()[r]);
+          std::vector<GCRecord> &gc = gcl.v;
           const std::vector<std::size_t> &offs = offs2[s];
           char *const bp = bufs2[s];
           for (std::size_t j = lo; j < hi; ++j) {
             const std::size_t g = total + j;
             const std::size_t p = offs[j];
             gc.emplace_back(GCRecord{0, 0, 0});
-            const std::size_t seqlen = w.process_record_parallel_inplace(
-              bp + p + 4, ws, &gc.back(), g);
+            std::size_t seqlen;
+            if (tile_ignore) {
+              seqlen = w.process_record_parallel_inplace(bp + p + 4, ws,
+                                                         &gc.back(), g);
+            }
+            else {
+              std::size_t tile_cur = 0;
+              seqlen = w.process_record_parallel(
+                bp + p + 4, static_cast<uint32_t>(rd_bsz(bp, p)), ws,
+                &gc.back(), g, tile_cur);
+              trec.record(g, seqlen, tile_cur);
+            }
             if (count_dup && g >= fill_boundary) {
               const auto it = master.sequence_count.find(
                 w.buffer, get_truncate_point(seqlen));
@@ -4966,9 +6978,13 @@ read_bam_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads) {
             }
           }
         }
+        if (!tile_ignore)
+          tiles.end_range(r, trec);
       }
     }
     if (fa_times) t_phase += now() - t0;
+    if (!tile_ignore)
+      tiles.fold(nranges);  // chunk order = global read order
     prev_nranges = nranges;
     total += nrec;
     // ---- wait for the aux job (replay + pread + walk) and check failures ---
@@ -4993,6 +7009,8 @@ read_bam_fused(FalcoConfig &config, FastqStats &master, std::size_t nthreads) {
   merge_worker_stats(config, master, nthreads, total, wstats, empty_gc, deltas,
                      tilerecs, gstart, count_dup, /*tile_ignore=*/true,
                      /*skip_gc=*/true);
+  if (!tile_ignore)
+    tiles.finish(config, master, wstats);
   munmap(bufmem, 2 * bufcap);
   close(ix.fd);
   return;
@@ -5239,7 +7257,10 @@ read_bam_chunked(FalcoConfig &config, FastqStats &master,
       const std::size_t n = counts[t], g0 = gstart[t];
       gcrec[t].assign(n, GCRecord{0, 0, 0});
       if (count_dup) deltas[t].assign(nent, 0);
-      tilerecs[t].reserve(n);
+      // appended on this thread's stack, then moved back: the per-thread
+      // vectors are adjacent objects (see LocalGCBuf)
+      std::vector<std::pair<std::uint32_t, std::uint32_t>> trec;
+      trec.reserve(n);
       std::size_t q = choff[t], jdrop = choff[t];
       for (std::size_t j = 0; j < n; ++j) {
         const std::size_t bsz = rd_bsz(q);
@@ -5253,11 +7274,12 @@ read_bam_chunked(FalcoConfig &config, FastqStats &master,
           if (it != master.sequence_count.end())
             ++deltas[t][static_cast<std::size_t>(it - mbegin)];
         }
-        tilerecs[t].push_back({static_cast<std::uint32_t>(seqlen),
-                               static_cast<std::uint32_t>(tile_cur)});
+        trec.push_back({static_cast<std::uint32_t>(seqlen),
+                        static_cast<std::uint32_t>(tile_cur)});
         q += 4 + bsz;
         if (q - jdrop >= (std::size_t(512) << 10)) { bdrop(jdrop, q); jdrop = q; }
       }
+      tilerecs[t].swap(trec);
     }
     (void)nent; (void)mbegin;
     merge_worker_stats(config, master, nthreads, total, wstats, gcrec, deltas,

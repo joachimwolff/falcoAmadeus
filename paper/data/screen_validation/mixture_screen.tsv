@@ -1,0 +1,24 @@
+##FalcoAmadeus-Screen	4
+File	/tmp/claude-1000167729/-home-mh-hannover-local-wolffjoa/f9d7258c-86dd-4397-b28f-786448f0955e/scratchpad/scr/mix.fastq
+Reads per file	the first 1000000
+#Contamination screen: canonical 31-mers of the reads, selected by hash at each reference's scale (1 in 1 to 2048 k-mers, about 4000 per reference), looked up in the same selection of the reference. Found: share of the reads' k-mers present in the reference (at its scale); only: present in this reference and no other of the panel (at the common scale 1 in 2048). Sequencing errors lower all shares, as a k-mer with an error is found nowhere.
+Reads screened	1000000
+k-mers at the common scale	34084
+#Reference	Found (%)	Only in this reference (%)	Reference bases	Scale
+human	85.9113	84.7348	3099750718	2048
+mouse	4.09283	3.33588	2728222451	2048
+rat	0.707077	0	2647915728	2048
+fly	0	0	143726002	2048
+worm	0	0	100286401	2048
+yeast	0.00586786	0	12157105	2048
+arabidopsis	0	0	119667750	2048
+ecoli	1.79831	1.86304	4641652	1024
+phix	0.956284	0	5386	1
+lambda	0.495577	0	48502	8
+human_mt	0.00145483	0	16569	4
+mouse_mt	0.000350769	0	16299	4
+human_rrna	0.910851	0	13478	2
+mycoplasma	0.942673	1.01221	4279280	1024
+vectors	1.7881	0.325666	688131	128
+Several references	2.47624
+No reference	6.2522

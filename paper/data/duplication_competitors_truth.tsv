@@ -1,0 +1,7 @@
+metric	value
+pairs	2000000
+molecules	1398601
+pe_pcr_duplicate_rate_pct	30.0699
+pe_fragment_duplicate_rate_pct	36.3929
+se_pcr_duplicate_rate_pct	16.5478
+se_start_duplicate_rate_pct	21.7487

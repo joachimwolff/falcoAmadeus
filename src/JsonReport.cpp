@@ -1,0 +1,751 @@
+/* [FalcoAmadeus] Machine-readable summary; see JsonReport.hpp. */
+#include "JsonReport.hpp"
+
+#include "FastqStats.hpp"
+#include "config.h"
+
+#include <algorithm>
+#include <cstdio>
+#include <cctype>
+#include <cstdlib>
+#include <fstream>
+#include <memory>
+#include <mutex>
+#include <sstream>
+#include <stdexcept>
+
+namespace {
+
+std::mutex quality_mutex;
+std::map<std::string, BaseQuality> &
+quality_registry() {
+  static std::map<std::string, BaseQuality> r;
+  return r;
+}
+
+std::string
+esc(const std::string &s) {
+  std::string o;
+  for (const char c : s) {
+    switch (c) {
+    case '"': o += "\\\""; break;
+    case '\\': o += "\\\\"; break;
+    case '\n': o += "\\n"; break;
+    case '\t': o += "\\t"; break;
+    case '\r': o += "\\r"; break;
+    default:
+      if (static_cast<unsigned char>(c) < 0x20) {
+        char b[8];
+        std::snprintf(b, sizeof b, "\\u%04x", c);
+        o += b;
+      }
+      else
+        o += c;
+    }
+  }
+  return o;
+}
+
+// a limit as written in a rules file would read it (no exponent)
+std::string
+plain(const double v) {
+  char b[64];
+  std::snprintf(b, sizeof b, "%.6f", v);
+  std::string s(b);
+  while (!s.empty() && s.back() == '0')
+    s.pop_back();
+  if (!s.empty() && s.back() == '.')
+    s.pop_back();
+  return s;
+}
+
+// a number as written (JSON number) or a string
+std::string
+value(const std::string &v) {
+  if (!v.empty()) {
+    char *end = nullptr;
+    const double d = std::strtod(v.c_str(), &end);
+    (void)d;
+    if (end && *end == '\0' && (std::isdigit(static_cast<unsigned char>(v[0])) ||
+                                v[0] == '-' || v[0] == '.') &&
+        v.find_first_of("nNiI") == std::string::npos)
+      return v;
+  }
+  return "\"" + esc(v) + "\"";
+}
+
+std::string
+key(std::string k) {  // "Paired-end exact" -> "paired_end_exact"
+  std::string o;
+  bool us = false;
+  for (const char c : k) {
+    if (std::isalnum(static_cast<unsigned char>(c))) {
+      o += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      us = false;
+    }
+    else if (!us && !o.empty()) {
+      o += '_';
+      us = true;
+    }
+  }
+  while (!o.empty() && o.back() == '_')
+    o.pop_back();
+  return o;
+}
+
+std::vector<std::string>
+split(const std::string &line) {
+  std::vector<std::string> f;
+  std::size_t a = 0;
+  for (;;) {
+    const std::size_t b = line.find('\t', a);
+    f.push_back(line.substr(a, b == std::string::npos ? b : b - a));
+    if (b == std::string::npos)
+      return f;
+    a = b + 1;
+  }
+}
+
+bool
+numeric(const std::string &s) {
+  return !s.empty() &&
+         s.find_first_not_of("0123456789.-") == std::string::npos;
+}
+
+// JSON object writer with comma handling
+struct Obj {
+  std::ostringstream &o;
+  bool first = true;
+  explicit Obj(std::ostringstream &os) : o(os) { o << "{"; }
+  void k(const std::string &name) {
+    o << (first ? "" : ",") << "\"" << esc(name) << "\":";
+    first = false;
+  }
+  void kv(const std::string &name, const std::string &raw_json) {
+    k(name);
+    o << raw_json;
+  }
+  void end() { o << "}"; }
+};
+
+// One view: Basic Statistics, module grades, FastQC duplication, assay
+// notes, base quality
+void
+view_json(std::ostringstream &o, const JsonView &v,
+          std::map<std::string, double> &gs, const bool count_bases) {
+  Obj ob(o);
+  std::ifstream in(v.data_file);
+  std::string line, module;
+  std::vector<std::pair<std::string, std::string>> basic, grades;
+  std::vector<std::string> notes;
+  std::string dedup;
+  while (std::getline(in, line)) {
+    if (line.rfind(">>", 0) == 0 && line != ">>END_MODULE") {
+      const auto f = split(line.substr(2));
+      module = f[0];
+      if (f.size() > 1)
+        grades.emplace_back(f[0], f[1]);
+      continue;
+    }
+    if (line.rfind("#Assay", 0) == 0) {
+      notes.push_back(line.substr(1));
+      continue;
+    }
+    if (line.rfind("#Total Deduplicated Percentage", 0) == 0) {
+      dedup = split(line).back();
+      continue;
+    }
+    if (module == "Basic Statistics" && !line.empty() && line[0] != '#') {
+      const auto f = split(line);
+      if (f.size() >= 2)
+        basic.emplace_back(f[0], f[1]);
+    }
+  }
+  ob.kv("data_file", "\"" + esc(v.data_file) + "\"");
+  ob.k("basic_statistics");
+  {
+    Obj b(o);
+    for (const auto &kv : basic)
+      b.kv(key(kv.first), value(kv.second));
+    b.end();
+  }
+  ob.k("modules");
+  {
+    Obj m(o);
+    for (const auto &g : grades)
+      m.kv(g.first, "\"" + esc(g.second) + "\"");
+    m.end();
+  }
+  if (!dedup.empty()) {
+    ob.kv("fastqc_total_deduplicated_pct", value(dedup));
+  }
+  if (const BaseQuality *q = find_base_quality(v.key)) {
+    if (q->bases > 0) {
+      const double q20 = 100.0 * q->q20 / q->bases;
+      const double q30 = 100.0 * q->q30 / q->bases;
+      ob.kv("bases", value(std::to_string(static_cast<long long>(q->bases))));
+      ob.kv("q20_bases_pct", value(std::to_string(q20)));
+      ob.kv("q30_bases_pct", value(std::to_string(q30)));
+      if (count_bases) {  // the combined view repeats the mates' bases
+        gs["bases"] += q->bases;
+        gs["q30"] += q->q30;
+      }
+    }
+  }
+  if (!notes.empty()) {
+    ob.k("assay_notes");
+    o << "[";
+    for (std::size_t i = 0; i < notes.size(); ++i)
+      o << (i ? "," : "") << "\"" << esc(notes[i]) << "\"";
+    o << "]";
+  }
+  ob.end();
+}
+
+// An extra report: key-value lines, fold rows (complexity), reference rows
+// (screen), insert-size histogram rows
+void
+extra_json(std::ostringstream &o, const std::string &section,
+           const std::string &file, std::map<std::string, double> &gs) {
+  std::ifstream in(file);
+  Obj ob(o);
+  ob.kv("file", "\"" + esc(file) + "\"");
+  std::string line, header;
+  std::vector<std::vector<std::string>> folds, refs, hist;
+  while (std::getline(in, line)) {
+    if (line.empty())
+      continue;
+    if (line[0] == '#') {
+      header = line;
+      continue;
+    }
+    const auto f = split(line);
+    if (f.size() == 4 && f[0].size() > 1 && f[0].back() == 'x' &&
+        numeric(f[0].substr(0, f[0].size() - 1))) {
+      folds.push_back(f);
+      continue;
+    }
+    if (header.rfind("#Reference", 0) == 0 && f.size() >= 3 &&
+        !numeric(f[0])) {
+      refs.push_back(f);
+      continue;
+    }
+    if (f.size() == 2 && numeric(f[0])) {  // histogram row
+      if (header.rfind("#Insert size", 0) == 0)
+        hist.push_back(f);
+      continue;
+    }
+    if (f.size() >= 3 && numeric(f[0]))
+      continue;  // duplication-level tables (the text report has them)
+    if (f.size() >= 2 && f[0].rfind("##", 0) != 0) {
+      const std::string k = key(f[0]);
+      ob.kv(k, value(f[1]));
+      if (f.size() >= 3 && numeric(f[2]))
+        ob.kv(k + "_pct", value(f[2]));
+      // general statistics columns
+      if (section == "paired_duplication" && k == "paired_end_exact")
+        gs["paired_dup_pct"] = std::atof(f[1].c_str());
+      if (k == "paired_end_aware" || (section == "aware_duplication" &&
+                                      k == "aware"))
+        gs["aware_dup_pct"] = std::atof(f[1].c_str());
+      if (k == "insert_size_peak")
+        gs["insert_size_peak"] = std::atof(f[1].c_str());
+      if (k == "pairs_with_adapter_read_through" && f.size() >= 3)
+        gs["adapter_read_through_pct"] = std::atof(f[2].c_str());
+      if (k == "adapter_dimers" && f.size() >= 3)
+        gs["adapter_dimer_pct"] = std::atof(f[2].c_str());
+      if (k == "optical_duplicates" && f.size() >= 3)
+        gs["optical_dup_pct"] = std::atof(f[2].c_str());
+      if (section == "umi_qc" && k == "mean_family_size")
+        gs["umi_mean_family_size"] = std::atof(f[1].c_str());
+      if (section == "umi_qc" &&
+          k.find("share_of_the_possible_umis_used") != std::string::npos)
+        gs["umi_space_used_pct"] = std::max(gs["umi_space_used_pct"],
+                                            std::atof(f[1].c_str()));
+      if (section == "screen" && k == "no_reference")
+        gs["screen_no_reference_pct"] = std::atof(f[1].c_str());
+    }
+  }
+  if (!folds.empty()) {
+    ob.k("complexity");
+    Obj c(o);
+    for (const auto &f : folds) {
+      c.k(f[0]);
+      Obj r(o);
+      r.kv("sequenced", value(f[1]));
+      r.kv("expected_distinct", value(f[2]));
+      r.kv("fraction_distinct", value(f[3]));
+      r.end();
+      if (f[0] == "10x")
+        gs["complexity_10x_distinct_pct"] = 100.0 * std::atof(f[3].c_str());
+    }
+    c.end();
+  }
+  if (!refs.empty()) {
+    ob.k("references");
+    Obj c(o);
+    double top = -1;
+    std::string top_name;
+    for (const auto &f : refs) {
+      c.k(f[0]);
+      Obj r(o);
+      r.kv("found_pct", value(f[1]));
+      r.kv("only_pct", value(f[2]));
+      if (f.size() > 3)
+        r.kv("reference_bases", value(f[3]));
+      if (f.size() > 4)
+        r.kv("scale", value(f[4]));
+      r.end();
+      const double v = std::atof(f[1].c_str());
+      if (v > top) {
+        top = v;
+        top_name = f[0];
+      }
+    }
+    c.end();
+    if (top >= 0)
+      gs["screen_top_pct"] = top;
+  }
+  if (!hist.empty()) {
+    ob.k("histogram");
+    Obj c(o);
+    for (const auto &f : hist)
+      c.kv(f[0], value(f[1]));
+    c.end();
+  }
+  ob.end();
+}
+
+// The trimming preview: per section (reads; or forward and reverse), the
+// quality cuts by cutoff and the adapter estimate
+void
+trim_json(std::ostringstream &o, const std::string &file,
+          std::map<std::string, double> &gs) {
+  std::ifstream in(file);
+  Obj ob(o);
+  ob.kv("file", "\"" + esc(file) + "\"");
+  std::string line;
+  bool open = false, in_q = false;
+  Obj *sec = nullptr;
+  std::unique_ptr<Obj> sec_obj, q_obj;
+  auto close_q = [&] {
+    if (q_obj) {
+      q_obj->end();
+      q_obj.reset();
+    }
+    in_q = false;
+  };
+  while (std::getline(in, line)) {
+    if (line.empty() || line.rfind("##", 0) == 0)
+      continue;
+    if (line == "#Reads" || line == "#Forward" || line == "#Reverse") {
+      close_q();
+      if (open)
+        sec_obj->end();
+      ob.k(key(line.substr(1)));
+      sec_obj = std::make_unique<Obj>(o);
+      sec = sec_obj.get();
+      open = true;
+      continue;
+    }
+    if (line.rfind("#Cutoff", 0) == 0 && sec != nullptr) {
+      sec->k("quality");
+      q_obj = std::make_unique<Obj>(o);
+      in_q = true;
+      continue;
+    }
+    if (line[0] == '#')
+      continue;
+    const auto f = split(line);
+    if (sec == nullptr) {
+      if (f.size() >= 2)
+        ob.kv(key(f[0]), value(f[1]));
+      continue;
+    }
+    if (in_q && f.size() == 6 && numeric(f[0])) {
+      q_obj->k(f[0]);
+      Obj r(o);
+      r.kv("bases_removed_pct", value(f[1]));
+      r.kv("reads_trimmed_pct", value(f[2]));
+      r.kv("shorter_than_20_pct", value(f[3]));
+      r.kv("shorter_than_36_pct", value(f[4]));
+      r.kv("shorter_than_50_pct", value(f[5]));
+      r.end();
+      if (f[0] == "20") {
+        double &g = gs["trim_q20_bases_removed_pct"];
+        g = std::max(g, std::atof(f[1].c_str()));
+      }
+      continue;
+    }
+    close_q();
+    if (f.size() >= 2 && f[0] == "Adapter") {
+      sec->kv("adapter", value(f[1]));
+      if (f.size() >= 3)
+        sec->kv("adapter_sequence", value(f[2]));
+      continue;
+    }
+    if (f.size() >= 2) {
+      std::string k = key(f[0]);
+      if (f[0].find("(%)") != std::string::npos)
+        k += "_pct";
+      sec->kv(k, value(f[1]));
+      if (f.size() >= 3 && numeric(f[2]))
+        sec->kv(k + "_pct", value(f[2]));
+    }
+  }
+  close_q();
+  if (open)
+    sec_obj->end();
+  ob.end();
+}
+
+// Flattens the JSON this file writes (objects, arrays, strings, numbers)
+// into path -> value text (numbers as written); array elements are skipped.
+struct Flat {
+  const std::string &j;
+  std::size_t i = 0;
+  std::map<std::string, std::string> out;
+  explicit Flat(const std::string &s) : j(s) {}
+  void ws() {
+    while (i < j.size() && std::isspace(static_cast<unsigned char>(j[i])))
+      ++i;
+  }
+  std::string str() {
+    std::string r;
+    ++i;  // opening quote
+    while (i < j.size() && j[i] != '"') {
+      if (j[i] == '\\' && i + 1 < j.size()) {
+        r += j[i + 1];
+        i += 2;
+      }
+      else
+        r += j[i++];
+    }
+    ++i;
+    return r;
+  }
+  void val(const std::string &path) {
+    ws();
+    if (j[i] == '{') {
+      ++i;
+      ws();
+      if (j[i] == '}') {
+        ++i;
+        return;
+      }
+      for (;;) {
+        ws();
+        const std::string k = str();
+        ws();
+        ++i;  // ':'
+        val(path.empty() ? k : path + "." + k);
+        ws();
+        if (j[i] == ',') {
+          ++i;
+          continue;
+        }
+        ++i;  // '}'
+        return;
+      }
+    }
+    if (j[i] == '[') {
+      int depth = 0;
+      bool in_str = false;
+      for (; i < j.size(); ++i) {
+        const char c = j[i];
+        if (in_str) {
+          if (c == '\\')
+            ++i;
+          else if (c == '"')
+            in_str = false;
+        }
+        else if (c == '"')
+          in_str = true;
+        else if (c == '[')
+          ++depth;
+        else if (c == ']' && --depth == 0) {
+          ++i;
+          return;
+        }
+      }
+      return;
+    }
+    if (j[i] == '"') {
+      out[path] = str();
+      return;
+    }
+    const std::size_t a = i;
+    while (i < j.size() && j[i] != ',' && j[i] != '}' && j[i] != ']' &&
+           !std::isspace(static_cast<unsigned char>(j[i])))
+      ++i;
+    out[path] = j.substr(a, i - a);
+  }
+};
+
+}  // namespace
+
+std::vector<AcceptanceRule>
+read_acceptance_rules(const std::string &path) {
+  std::ifstream in(path);
+  if (!in)
+    throw std::runtime_error("cannot open acceptance rules: " + path);
+  std::vector<AcceptanceRule> rules;
+  std::string line;
+  std::size_t ln = 0;
+  while (std::getline(in, line)) {
+    ++ln;
+    const std::size_t h = line.find('#');
+    if (h != std::string::npos)
+      line.erase(h);
+    std::istringstream is(line);
+    AcceptanceRule r;
+    if (!(is >> r.metric))
+      continue;
+    std::string w, f;
+    if (!(is >> r.op >> w >> f) || (r.op != ">=" && r.op != "<="))
+      throw std::runtime_error(
+        "acceptance rules " + path + ", line " + std::to_string(ln) +
+        ": expected 'metric >= warn fail' or 'metric <= warn fail'");
+    char *e1 = nullptr, *e2 = nullptr;
+    r.warn = std::strtod(w.c_str(), &e1);
+    r.fail = std::strtod(f.c_str(), &e2);
+    if (*e1 != '\0' || *e2 != '\0')
+      throw std::runtime_error("acceptance rules " + path + ", line " +
+                               std::to_string(ln) + ": limits must be numbers");
+    if ((r.op == ">=" && r.fail > r.warn) || (r.op == "<=" && r.fail < r.warn))
+      throw std::runtime_error("acceptance rules " + path + ", line " +
+                               std::to_string(ln) +
+                               ": the fail limit must be beyond the warn limit");
+    rules.push_back(r);
+  }
+  return rules;
+}
+
+void
+record_base_quality(const std::string &key, const FastqStats &stats) {
+  BaseQuality q;
+  const std::size_t off = static_cast<std::size_t>(stats.encoding_offset);
+  q.phred_base = 33 + static_cast<int>(stats.encoding_offset);
+  const std::size_t npos = stats.max_read_length;
+  for (std::size_t i = 0; i < npos; ++i)
+    for (std::size_t j = 0; j < FastqStats::kNumQualityValues; ++j) {
+      const std::size_t c =
+        i < FastqStats::SHORT_READ_THRESHOLD
+          ? stats.position_quality_count[(i << FastqStats::kBitShiftQuality) |
+                                         j]
+          : stats.long_position_quality_count
+              [((i - FastqStats::SHORT_READ_THRESHOLD)
+                << FastqStats::kBitShiftQuality) |
+               j];
+      if (c == 0)
+        continue;
+      const double d = static_cast<double>(c);
+      q.bases += d;
+      const long phred = static_cast<long>(j) - static_cast<long>(off);
+      if (phred >= 20)
+        q.q20 += d;
+      if (phred >= 30)
+        q.q30 += d;
+    }
+  std::lock_guard<std::mutex> lk(quality_mutex);
+  quality_registry()[key] = q;
+}
+
+const BaseQuality *
+find_base_quality(const std::string &key) {
+  std::lock_guard<std::mutex> lk(quality_mutex);
+  const auto it = quality_registry().find(key);
+  return it == quality_registry().end() ? nullptr : &it->second;
+}
+
+std::string
+write_json_reports(const std::string &out_dir, const std::string &prefix,
+                   const std::string &sample,
+                   const std::vector<std::string> &inputs,
+                   const std::vector<JsonView> &views,
+                   const std::vector<std::pair<std::string, std::string>>
+                     &extras,
+                   const std::string &acceptance_rules) {
+  std::map<std::string, double> gs;
+  std::ostringstream o;
+  {
+    Obj top(o);
+    top.kv("falcoAmadeus_version", "\"" + esc(VERSION) + "\"");
+    top.kv("sample", "\"" + esc(sample) + "\"");
+    top.k("inputs");
+    o << "[";
+    for (std::size_t i = 0; i < inputs.size(); ++i)
+      o << (i ? "," : "") << "\"" << esc(inputs[i]) << "\"";
+    o << "]";
+    top.k("views");
+    {
+      Obj v(o);
+      bool mates = false;
+      for (const auto &jv : views)
+        if (jv.name != "combined" && std::ifstream(jv.data_file))
+          mates = true;
+      for (const auto &jv : views) {
+        std::ifstream probe(jv.data_file);
+        if (!probe)
+          continue;
+        v.k(jv.name);
+        view_json(o, jv, gs, jv.name != "combined" || !mates);
+      }
+      v.end();
+    }
+    for (const auto &ex : extras) {
+      std::ifstream probe(ex.second);
+      if (!probe)
+        continue;
+      top.k(ex.first);
+      if (ex.first == "trimming_preview")
+        trim_json(o, ex.second, gs);
+      else
+        extra_json(o, ex.first, ex.second, gs);
+    }
+    top.end();
+  }
+  const std::string base = out_dir + "/" + prefix;
+  if (gs.count("bases") && gs["bases"] > 0)
+    gs["q30_bases_pct"] = 100.0 * gs["q30"] / gs["bases"];
+  std::string json = o.str();
+  std::string overall;
+  if (!acceptance_rules.empty()) {
+    const auto rules = read_acceptance_rules(acceptance_rules);
+    Flat fl(json);
+    fl.val("");
+    std::ostringstream t, a;
+    int worst = 0;  // 0 PASS, 1 WARN, 2 FAIL
+    static const char *names[] = {"PASS", "WARN", "FAIL"};
+    std::vector<std::string> rows;
+    a << ",\"acceptance\":{\"rules\":\"" << esc(acceptance_rules)
+      << "\",\"results\":[";
+    for (std::size_t k = 0; k < rules.size(); ++k) {
+      const AcceptanceRule &r = rules[k];
+      std::string vtext;
+      bool have = false;
+      double v = 0;
+      auto it = fl.out.find(r.metric);
+      if (it != fl.out.end() && numeric(it->second)) {
+        v = std::atof(it->second.c_str());
+        vtext = it->second;
+        have = true;
+      }
+      else if (gs.count(r.metric)) {
+        v = gs[r.metric];
+        vtext = std::to_string(v);
+        have = true;
+      }
+      std::string res;
+      if (!have) {
+        res = "MISSING";
+        worst = 2;
+      }
+      else {
+        int g = 0;
+        if (r.op == ">=")
+          g = v < r.fail ? 2 : (v < r.warn ? 1 : 0);
+        else
+          g = v > r.fail ? 2 : (v > r.warn ? 1 : 0);
+        res = names[g];
+        worst = std::max(worst, g);
+      }
+      t << r.metric << "\t" << (have ? vtext : "-") << "\t" << r.op << "\t"
+        << plain(r.warn) << "\t" << plain(r.fail) << "\t" << res << "\n";
+      a << (k ? "," : "") << "{\"metric\":\"" << esc(r.metric)
+        << "\",\"value\":" << (have ? value(vtext) : "null")
+        << ",\"op\":\"" << r.op << "\",\"warn\":" << plain(r.warn)
+        << ",\"fail\":" << plain(r.fail) << ",\"result\":\"" << res
+        << "\"}";
+    }
+    overall = names[worst];
+    a << "],\"overall\":\"" << overall << "\"}";
+    json.insert(json.size() - 1, a.str());  // before the closing brace
+    std::ofstream f(base + "acceptance.txt", std::ios::binary);
+    f << "##FalcoAmadeus-Acceptance\t" << VERSION << "\n";
+    f << "Sample\t" << sample << "\n";
+    f << "Rules\t" << acceptance_rules << "\n";
+    f << "Overall\t" << overall << "\n";
+    f << "#Metric\tValue\tRule\tWarn\tFail\tResult\n" << t.str();
+    if (!f.good())
+      throw std::runtime_error("cannot write " + base + "acceptance.txt");
+  }
+  {
+    std::ofstream f(base + "falcoAmadeus_summary.json", std::ios::binary);
+    f << json << "\n";
+    if (!f.good())
+      throw std::runtime_error("cannot write " + base +
+                               "falcoAmadeus_summary.json");
+  }
+  // MultiQC custom content: general statistics columns
+  struct Col {
+    const char *id, *title, *desc, *suffix;
+    double max;
+  };
+  static const Col cols[] = {
+    {"q30_bases_pct", "Q30 bases", "Bases with Phred quality 30 or more",
+     "%", 100},
+    {"paired_dup_pct", "Pair dups", "Paired duplicate rate, exact", "%", 100},
+    {"aware_dup_pct", "Aware dups",
+     "Duplicate rate allowing sequencing errors / UMIs", "%", 100},
+    {"complexity_10x_distinct_pct", "Distinct @10x",
+     "Expected distinct share at 10x the reads", "%", 100},
+    {"insert_size_peak", "Insert peak", "Insert size peak (mate overlap)",
+     " bp", 0},
+    {"adapter_read_through_pct", "Read-through",
+     "Pairs with insert shorter than the read", "%", 100},
+    {"adapter_dimer_pct", "Dimers", "Adapter dimers", "%", 100},
+    {"screen_top_pct", "Screen top",
+     "k-mer share of the most frequent screened reference", "%", 100},
+    {"screen_no_reference_pct", "Screen none",
+     "k-mer share found in no screened reference", "%", 100},
+    {"optical_dup_pct", "Optical dups",
+     "Optical duplicates (Picard's rule) of all pairs", "%", 100},
+    {"umi_mean_family_size", "UMI family",
+     "Mean reads per UMI family (same UMI and sequence)", "", 0},
+    {"umi_space_used_pct", "UMI space",
+     "Share of the possible UMI sequences in use (the fuller source)", "%",
+     100},
+    {"trim_q20_bases_removed_pct", "Q20 trim",
+     "Bases cutadapt -q 20 would remove (the larger mate)", "%", 100},
+  };
+  std::ostringstream m;
+  {
+    Obj top(m);
+    top.kv("id", "\"falcoamadeus\"");
+    top.kv("section_name", "\"falcoAmadeus\"");
+    top.kv("plot_type", "\"generalstats\"");
+    top.k("pconfig");
+    m << "[";
+    bool first = true;
+    for (const Col &c : cols) {
+      if (!gs.count(c.id))
+        continue;
+      m << (first ? "" : ",") << "{\"" << c.id << "\":{\"title\":\""
+        << c.title << "\",\"description\":\"" << c.desc
+        << "\",\"suffix\":\"" << c.suffix << "\"";
+      if (c.max > 0)
+        m << ",\"max\":" << c.max << ",\"min\":0";
+      m << "}}";
+      first = false;
+    }
+    m << "]";
+    top.k("data");
+    {
+      Obj d(m);
+      d.k(sample);
+      Obj s(m);
+      for (const Col &c : cols)
+        if (gs.count(c.id))
+          s.kv(c.id, value(std::to_string(gs[c.id])));
+      s.end();
+      d.end();
+    }
+    top.end();
+  }
+  std::ofstream f(base + "falcoAmadeus_mqc.json", std::ios::binary);
+  f << m.str() << "\n";
+  if (!f.good())
+    throw std::runtime_error("cannot write " + base + "falcoAmadeus_mqc.json");
+  return overall;
+}

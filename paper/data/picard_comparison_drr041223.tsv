@@ -1,0 +1,13 @@
+metric	value
+pairs_total	3183182
+pairs_compared	1715487
+min_mapq	30
+picard_duplicate_pairs	285468
+picard_duplicate_rate_pct	16.6406
+picard_mates_disagree	0
+sequence_duplicate_pairs	227775
+sequence_duplicate_rate_pct	13.2776
+picard_flagged_with_sequence_partner	231752
+picard_flagged_with_sequence_partner_pct	81.1832
+sequence_extra_copies_flagged_by_picard	227386
+sequence_extra_copies_flagged_by_picard_pct	99.8292

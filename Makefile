@@ -130,7 +130,11 @@ am__dirstamp = $(am__leading_dot)dirstamp
 am_falcoAmadeus_OBJECTS = src/falco.$(OBJEXT) src/FastqStats.$(OBJEXT) \
 	src/HtmlMaker.$(OBJEXT) src/Module.$(OBJEXT) \
 	src/StreamReader.$(OBJEXT) src/FalcoConfig.$(OBJEXT) \
-	src/OptionParser.$(OBJEXT) src/smithlab_utils.$(OBJEXT)
+	src/OptionParser.$(OBJEXT) src/smithlab_utils.$(OBJEXT) \
+	src/PairDupAware.$(OBJEXT) src/Complexity.$(OBJEXT) \
+	src/InsertSize.$(OBJEXT) src/Screen.$(OBJEXT) \
+	src/TrimPreview.$(OBJEXT) src/UmiQc.$(OBJEXT) \
+	src/JsonReport.$(OBJEXT)
 falcoAmadeus_OBJECTS = $(am_falcoAmadeus_OBJECTS)
 falcoAmadeus_LDADD = $(LDADD)
 AM_V_P = $(am__v_P_$(V))
@@ -148,11 +152,14 @@ am__v_at_1 =
 DEFAULT_INCLUDES = -I.
 depcomp = $(SHELL) $(top_srcdir)/depcomp
 am__maybe_remake_depfiles = depfiles
-am__depfiles_remade = src/$(DEPDIR)/FalcoConfig.Po \
-	src/$(DEPDIR)/FastqStats.Po src/$(DEPDIR)/HtmlMaker.Po \
-	src/$(DEPDIR)/Module.Po src/$(DEPDIR)/OptionParser.Po \
-	src/$(DEPDIR)/StreamReader.Po src/$(DEPDIR)/falco.Po \
-	src/$(DEPDIR)/smithlab_utils.Po
+am__depfiles_remade = src/$(DEPDIR)/Complexity.Po \
+	src/$(DEPDIR)/FalcoConfig.Po src/$(DEPDIR)/FastqStats.Po \
+	src/$(DEPDIR)/HtmlMaker.Po src/$(DEPDIR)/InsertSize.Po \
+	src/$(DEPDIR)/JsonReport.Po src/$(DEPDIR)/Module.Po \
+	src/$(DEPDIR)/OptionParser.Po src/$(DEPDIR)/PairDupAware.Po \
+	src/$(DEPDIR)/Screen.Po src/$(DEPDIR)/StreamReader.Po \
+	src/$(DEPDIR)/TrimPreview.Po src/$(DEPDIR)/UmiQc.Po \
+	src/$(DEPDIR)/falco.Po src/$(DEPDIR)/smithlab_utils.Po
 am__mv = mv -f
 CXXCOMPILE = $(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) \
 	$(AM_CPPFLAGS) $(CPPFLAGS) $(AM_CXXFLAGS) $(CXXFLAGS)
@@ -474,16 +481,16 @@ OPENMP_CXXFLAGS = -fopenmp
 PACKAGE = falcoAmadeus
 PACKAGE_BUGREPORT = 
 PACKAGE_NAME = FalcoAmadeus
-PACKAGE_STRING = FalcoAmadeus 3
+PACKAGE_STRING = FalcoAmadeus 4
 PACKAGE_TARNAME = falcoAmadeus
 PACKAGE_URL = https://github.com/joachimwolff/falcoAmadeus
-PACKAGE_VERSION = 3
+PACKAGE_VERSION = 4
 PATH_SEPARATOR = :
 RAPIDGZIP_CPPFLAGS = -I/home/mh-hannover.local/wolffjoa/src/rapidgzip/librapidarchive/src -I/home/mh-hannover.local/wolffjoa/src/rapidgzip/librapidarchive/src/core -I/home/mh-hannover.local/wolffjoa/src/rapidgzip/librapidarchive/src/huffman -I/home/mh-hannover.local/wolffjoa/src/rapidgzip/librapidarchive/src/indexed_bzip2
 SET_MAKE = 
 SHELL = /bin/bash
 STRIP = 
-VERSION = 3
+VERSION = 4
 abs_builddir = /home/mh-hannover.local/wolffjoa/src/falco
 abs_srcdir = /home/mh-hannover.local/wolffjoa/src/falco
 abs_top_builddir = /home/mh-hannover.local/wolffjoa/src/falco
@@ -547,6 +554,20 @@ falcoAmadeus_SOURCES = \
 	src/FalcoConfig.cpp \
 	src/OptionParser.cpp \
 	src/smithlab_utils.cpp \
+	src/PairDupAware.cpp \
+	src/Complexity.cpp \
+	src/InsertSize.cpp \
+	src/Screen.cpp \
+	src/TrimPreview.cpp \
+	src/UmiQc.cpp \
+	src/JsonReport.cpp \
+	src/JsonReport.hpp \
+	src/Screen.hpp \
+	src/TrimPreview.hpp \
+	src/UmiQc.hpp \
+	src/InsertSize.hpp \
+	src/Complexity.hpp \
+	src/PairDupAware.hpp \
 	src/Module.hpp \
 	src/FastqStats.hpp \
 	src/HtmlMaker.hpp \
@@ -677,6 +698,19 @@ src/OptionParser.$(OBJEXT): src/$(am__dirstamp) \
 	src/$(DEPDIR)/$(am__dirstamp)
 src/smithlab_utils.$(OBJEXT): src/$(am__dirstamp) \
 	src/$(DEPDIR)/$(am__dirstamp)
+src/PairDupAware.$(OBJEXT): src/$(am__dirstamp) \
+	src/$(DEPDIR)/$(am__dirstamp)
+src/Complexity.$(OBJEXT): src/$(am__dirstamp) \
+	src/$(DEPDIR)/$(am__dirstamp)
+src/InsertSize.$(OBJEXT): src/$(am__dirstamp) \
+	src/$(DEPDIR)/$(am__dirstamp)
+src/Screen.$(OBJEXT): src/$(am__dirstamp) \
+	src/$(DEPDIR)/$(am__dirstamp)
+src/TrimPreview.$(OBJEXT): src/$(am__dirstamp) \
+	src/$(DEPDIR)/$(am__dirstamp)
+src/UmiQc.$(OBJEXT): src/$(am__dirstamp) src/$(DEPDIR)/$(am__dirstamp)
+src/JsonReport.$(OBJEXT): src/$(am__dirstamp) \
+	src/$(DEPDIR)/$(am__dirstamp)
 
 falcoAmadeus$(EXEEXT): $(falcoAmadeus_OBJECTS) $(falcoAmadeus_DEPENDENCIES) $(EXTRA_falcoAmadeus_DEPENDENCIES) 
 	@rm -f falcoAmadeus$(EXEEXT)
@@ -689,12 +723,19 @@ mostlyclean-compile:
 distclean-compile:
 	-rm -f *.tab.c
 
+include src/$(DEPDIR)/Complexity.Po # am--include-marker
 include src/$(DEPDIR)/FalcoConfig.Po # am--include-marker
 include src/$(DEPDIR)/FastqStats.Po # am--include-marker
 include src/$(DEPDIR)/HtmlMaker.Po # am--include-marker
+include src/$(DEPDIR)/InsertSize.Po # am--include-marker
+include src/$(DEPDIR)/JsonReport.Po # am--include-marker
 include src/$(DEPDIR)/Module.Po # am--include-marker
 include src/$(DEPDIR)/OptionParser.Po # am--include-marker
+include src/$(DEPDIR)/PairDupAware.Po # am--include-marker
+include src/$(DEPDIR)/Screen.Po # am--include-marker
 include src/$(DEPDIR)/StreamReader.Po # am--include-marker
+include src/$(DEPDIR)/TrimPreview.Po # am--include-marker
+include src/$(DEPDIR)/UmiQc.Po # am--include-marker
 include src/$(DEPDIR)/falco.Po # am--include-marker
 include src/$(DEPDIR)/smithlab_utils.Po # am--include-marker
 
@@ -1184,12 +1225,19 @@ clean-am: clean-binPROGRAMS clean-generic mostlyclean-am
 
 distclean: distclean-am
 	-rm -f $(am__CONFIG_DISTCLEAN_FILES)
+	-rm -f src/$(DEPDIR)/Complexity.Po
 	-rm -f src/$(DEPDIR)/FalcoConfig.Po
 	-rm -f src/$(DEPDIR)/FastqStats.Po
 	-rm -f src/$(DEPDIR)/HtmlMaker.Po
+	-rm -f src/$(DEPDIR)/InsertSize.Po
+	-rm -f src/$(DEPDIR)/JsonReport.Po
 	-rm -f src/$(DEPDIR)/Module.Po
 	-rm -f src/$(DEPDIR)/OptionParser.Po
+	-rm -f src/$(DEPDIR)/PairDupAware.Po
+	-rm -f src/$(DEPDIR)/Screen.Po
 	-rm -f src/$(DEPDIR)/StreamReader.Po
+	-rm -f src/$(DEPDIR)/TrimPreview.Po
+	-rm -f src/$(DEPDIR)/UmiQc.Po
 	-rm -f src/$(DEPDIR)/falco.Po
 	-rm -f src/$(DEPDIR)/smithlab_utils.Po
 	-rm -f Makefile
@@ -1239,12 +1287,19 @@ installcheck-am:
 maintainer-clean: maintainer-clean-am
 	-rm -f $(am__CONFIG_DISTCLEAN_FILES)
 	-rm -rf $(top_srcdir)/autom4te.cache
+	-rm -f src/$(DEPDIR)/Complexity.Po
 	-rm -f src/$(DEPDIR)/FalcoConfig.Po
 	-rm -f src/$(DEPDIR)/FastqStats.Po
 	-rm -f src/$(DEPDIR)/HtmlMaker.Po
+	-rm -f src/$(DEPDIR)/InsertSize.Po
+	-rm -f src/$(DEPDIR)/JsonReport.Po
 	-rm -f src/$(DEPDIR)/Module.Po
 	-rm -f src/$(DEPDIR)/OptionParser.Po
+	-rm -f src/$(DEPDIR)/PairDupAware.Po
+	-rm -f src/$(DEPDIR)/Screen.Po
 	-rm -f src/$(DEPDIR)/StreamReader.Po
+	-rm -f src/$(DEPDIR)/TrimPreview.Po
+	-rm -f src/$(DEPDIR)/UmiQc.Po
 	-rm -f src/$(DEPDIR)/falco.Po
 	-rm -f src/$(DEPDIR)/smithlab_utils.Po
 	-rm -f Makefile

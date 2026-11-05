@@ -36,16 +36,6 @@ const size_t FastqStats::kBitShiftAdapter;
 const std::uint32_t FastqStats::kQualTileFlushReads;
 const std::uint32_t FastqStats::kBaseTileFlushReads;
 
-// To make the gc models static const
-static std::array<GCModel, FastqStats::SHORT_READ_THRESHOLD>
-make_gc_models() {
-  std::array<GCModel, FastqStats::SHORT_READ_THRESHOLD> ans;
-  for (size_t i = 0; i < FastqStats::SHORT_READ_THRESHOLD; ++i) {
-    ans[i] = GCModel(i);
-  }
-  return ans;
-}
-
 /****************************************************************/
 /******************** FASTQ STATS FUNCTIONS *********************/
 /****************************************************************/
@@ -79,14 +69,26 @@ FastqStats::flush_tile8() {
 // FastqStats.hpp comment for the flush-point / overflow invariants). Addition
 // commutes, so the result is byte-identical to the direct scatter.
 void
-FastqStats::flush_qtile() {
+FastqStats::flush_qtile(const bool with_long) {
+  // Only nonzero tile entries are folded and cleared: adding or storing a
+  // zero would dirty (and make resident) every page of both tables.
   for (std::size_t q = 0; q < kNumQualityValues; ++q) {
-    const std::uint16_t *src = &qual_tile[q * SHORT_READ_THRESHOLD];
+    std::uint16_t *src = &qual_tile[q * SHORT_READ_THRESHOLD];
     for (std::size_t p = 0; p < SHORT_READ_THRESHOLD; ++p)
-      position_quality_count[(p << kBitShiftQuality) | q] += src[p];
+      if (src[p] != 0) {
+        position_quality_count[(p << kBitShiftQuality) | q] += src[p];
+        src[p] = 0;
+      }
   }
-  qual_tile.fill(0);
   qual_tile_reads = 0;
+  if (!with_long)
+    return;
+  for (std::size_t i = 0; i < long_qual_tile.size(); ++i)
+    if (long_qual_tile[i] != 0) {
+      long_position_quality_count[i] += long_qual_tile[i];
+      long_qual_tile[i] = 0;
+    }
+  long_qtile_reads = 0;
 }
 
 FastqStats::FastqStats(bool need_kmer) {
@@ -114,23 +116,19 @@ FastqStats::FastqStats(bool need_kmer) {
   read_length_freq.fill(0);
   quality_count.fill(0);
   gc_count.fill(0);
-  position_quality_count.fill(0);
-  qual_tile.fill(0);
+  // position_quality_count and qual_tile start zeroed (ZeroedArray)
   qual_tile_reads = 0;
   pos_kmer_count.fill(0);
-  pos_adapter_count.fill(0);
   // Only the Kmer Content module touches kmer_count; when it is disabled leave
   // the table empty (the write sites are guarded by do_kmer, the merge bounds
   // itself to master.kmer_count.size(), and the module -- hence every read of
   // kmer_count -- is skipped, so nothing indexes it).
   if (need_kmer)
-    kmer_count =
-      std::vector<size_t>(SHORT_READ_THRESHOLD * (Constants::kmer_mask + 1), 0);
+    kmer_count.resize(SHORT_READ_THRESHOLD * (Constants::kmer_mask + 1));
 }
 
-// Initialize as many gc models as fast bases
-const std::array<GCModel, FastqStats::SHORT_READ_THRESHOLD>
-  FastqStats::gc_models = make_gc_models();
+// GC models are built lazily per read length (see FastqStats.hpp).
+const FastqStats::GCModelTable FastqStats::gc_models;
 
 // When we read new bases, dynamically allocate new space for their statistics
 void
@@ -142,8 +140,11 @@ FastqStats::allocate_new_base(const bool ignore_tile) {
   long_n_base_count.push_back(0);
 
   // space for quality boxplot
+  // (resize: the zero-page storage is not written)
+  long_position_quality_count.resize(long_position_quality_count.size() +
+                                     kNumQualityValues);
   for (size_t i = 0; i < kNumQualityValues; ++i)
-    long_position_quality_count.push_back(0);
+    long_qual_tile.push_back(0);
 
   long_read_length_freq.push_back(0);
 

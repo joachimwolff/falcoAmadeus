@@ -288,24 +288,47 @@ endswith(const std::string &fn, const std::string &extn) {
 //              open-chromatin pileups duplicate.
 //   chipseq  : peak pileups duplicate.
 //   wgbs/emseq/rrbs : bisulfite/EM conversion depletes C (or G) and shifts GC
-//              down; rrbs additionally has an MspI CGG/TGG motif in bases 1-3.
+//              down; rrbs additionally has an MspI CGG/TGG motif in bases 1-3
+//              and samples the same MspI fragments repeatedly; emseq has
+//              10 bp of end bias at both read ends.
+// [FalcoAmadeus] Limits set on an independent calibration set of public
+// runs (8 per assay from BioProjects not in the validation set; script
+// paper/scripts/assay_validation/calibrate.py, values in
+// paper/data/assay_calibration):
+// - the ATAC 5' mask covers the Tn5 insertion bias of every calibration run;
+// - a relaxed GC FAIL limit is 1.25 x the largest GC deviation of a clean
+//   calibration run of that assay (at least the generic 30), a relaxed
+//   duplication FAIL limit 0.8 x its lowest deduplicated percentage (at most
+//   the generic 50; 0 = never FAIL when a clean run keeps under 2 %).
+constexpr std::size_t kAtacMask = 15;
+
 static const std::unordered_map<std::string, AssayProfile> assay_profiles = [] {
   std::unordered_map<std::string, AssayProfile> m;
   auto add = [&m](AssayProfile p) { m[p.name] = p; };
 
   // name, mask, suppress, methylation, relax_gc, downgrade_dup, downgrade_over
+  // [, mask_3p, gc_fail, dup_fail, expect_adapter] (limits: see above)
   add({"generic", 0, false, false, false, false, false});
   add({"wgs",     0, false, false, false, false, false});
-  add({"exome",   0, false, false, true,  true,  false});
-  add({"amplicon",0, true,  false, true,  true,  true});
-  add({"16s",     0, true,  false, true,  true,  true});
-  add({"rnaseq",  13, false, false, true,  true,  true});
-  add({"smallrna",0, true,  false, true,  true,  true});
-  add({"atac",    11, false, false, false, true,  false});
-  add({"chipseq", 0, false, false, false, true,  false});
-  add({"wgbs",    0, false, true,  true,  false, false});
-  add({"emseq",   0, false, true,  true,  false, false});
-  add({"rrbs",    3, false, true,  true,  true,  false});
+  add({"exome",   0, false, false, true,  true,  false, 0, 45, 50});
+  // an amplicon library's GC distribution is a few discrete products, which
+  // the normal-curve deviation does not describe (calibration runs 16 to
+  // 104): no GC FAIL limit, as no per-base composition grade
+  add({"amplicon",0, true,  false, true,  true,  true,  0, 0, 0});
+  add({"16s",     0, true,  false, true,  true,  true,  0, 0, 0});
+  add({"rnaseq",  13, false, false, true,  true,  true, 0, 70, 3});
+  add({"smallrna",0, true,  false, true,  true,  true,  0, 95, 2, true});
+  add({"atac",    kAtacMask, false, false, false, true, false, 0, 0, 13});
+  add({"chipseq", 0, false, false, false, true,  false, 0, 0, 22});
+  add({"wgbs",    0, false, true,  true,  false, false, 0, 40});
+  // EM-seq: 10 bp of composition bias at each read end (Bismark
+  // documentation, library types: --clip_R1 10 --three_prime_clip_R1 10)
+  add({"emseq",   10, false, true,  true,  false, false, 10, 30});
+  // RRBS reads a reduced set of MspI fragments (CpG-island rich, size
+  // selected), so its composition is locus-locked along the whole read,
+  // like an amplicon panel: per-base content is not graded (the conversion
+  // estimate still is)
+  add({"rrbs",    3, true,  true,  true,  true,  true,  0, 95, 34});
   return m;
 }();
 
