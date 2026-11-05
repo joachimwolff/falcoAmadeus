@@ -1,6 +1,0 @@
-site_name: falcoAmadeus
-strict: true
-
-theme: readthedocs
-nav:
-   - Home: 'index.md'

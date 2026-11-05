@@ -46,9 +46,6 @@ jobs:
       - name: Run test suite (make check)
         run: make check
 
-      - name: Read the Docs page matches README.md
-        run: python3 documentation/sync_from_readme.py --check
-
       - name: Paired-end duplication and pairing tests
         run: test/paired/run_paired_tests.sh ./falcoAmadeus
 
