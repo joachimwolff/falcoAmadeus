@@ -35,3 +35,6 @@ test/*.trs
 test_output/
 test_build/
 test-suite.log
+
+# build output
+/falcoAmadeus
