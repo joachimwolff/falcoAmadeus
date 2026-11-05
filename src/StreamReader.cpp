@@ -4122,7 +4122,7 @@ read_chunked_core(FalcoConfig &config, FastqStats &master, std::size_t nthreads,
                                 std::move(release_input), can_drop);
 }
 
-#if defined(USE_ISAL) || defined(USE_RAPIDGZIP)
+// [FalcoAmadeus] generic streaming parse, built without any gzip library too
 // [FalcoAmadeus] Adapts a sequential byte source (anything with
 // fill(out, cap) returning bytes written, 0 at end) to the chunk-source
 // interface of read_stream_fused: producing a chunk is a single work item.
@@ -4684,7 +4684,7 @@ read_stream_fused(FalcoConfig &config, FastqStats &master,
     CombTileSums::merge_into(csums, *H);
   }
 }
-#endif  // USE_ISAL || USE_RAPIDGZIP
+// end of the generic streaming parse
 
 // [FalcoAmadeus] SAM worker: tab-delimited fields, newline records. Same per-base
 // machinery as the FASTQ worker, only the separators differ.
@@ -5442,26 +5442,17 @@ class FdFastqSource {
 
 bool
 piped_fastq_supported() {
-#if defined(USE_ISAL) || defined(USE_RAPIDGZIP)
   return true;
-#else
-  return false;
-#endif
 }
 
 void
 read_piped_fastq(FalcoConfig &config, FastqStats &master,
                  std::size_t nthreads) {
-#if defined(USE_ISAL) || defined(USE_RAPIDGZIP)
   FdFastqSource raw(config.filename);
   SerialChunkSource<FdFastqSource> src(raw);
   // a pipe delivers a few GB/s at most: small chunks keep the double buffer
   // (and the memory) small without slowing the parse down
   read_stream_fused(config, master, nthreads, src, std::size_t(16) << 20);
-#else
-  (void)config; (void)master; (void)nthreads;
-  throw std::runtime_error("piped FASTQ streaming requires ISA-L");
-#endif
 }
 
 bool
