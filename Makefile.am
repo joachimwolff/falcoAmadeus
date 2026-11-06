@@ -75,7 +75,6 @@ falcoAmadeus_SOURCES = \
 
 TESTS = test/falco.test
 TEST_EXTENSIONS = .test
-CLEANFILES = tests_build/test_data.tgz
 
 # EXTRA_DIST packs the whole test/ directory; keep stray in-tree test-suite
 # artifacts out of release tarballs (a shipped falco.log breaks the VPATH
