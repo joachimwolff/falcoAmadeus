@@ -236,8 +236,6 @@ static const auto adapter_seqs = std::vector<std::string>{
   "GGGGGGGGGGGG",
 };
 // clang-format on
-
-static const std::size_t adapter_size = 12;
 };  // namespace FileConstants
 
 /********************************************************************/

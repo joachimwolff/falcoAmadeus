@@ -1,9 +1,11 @@
-# FalcoAmadeus: a faster, sequencing-aware falco
+# FalcoAmadeus: library-level quality control of sequencing data from raw reads
 
-**FalcoAmadeus** is a performance-focused fork of
-[falco](https://github.com/smithlabcode/falco) (itself an emulation of the
-popular [FastQC](https://www.bioinformatics.babraham.ac.uk/projects/fastqc)
-software) that checks large sequencing reads for common problems.
+**FalcoAmadeus** writes the FastQC report of
+[falco](https://github.com/smithlabcode/falco) (itself an emulation of
+[FastQC](https://www.bioinformatics.babraham.ac.uk/projects/fastqc)) and, in
+the same run, reports the properties of the library as a whole: duplicates,
+complexity, insert sizes, contamination and UMIs. It reads FASTQ (plain, gzip
+or BGZF), SAM and BAM in parallel.
 
 By default it produces the same output as upstream falco 1.3.2 with one
 corrected grade: Per base N content is graded as in FastQC (warn above 5 %,
@@ -14,13 +16,18 @@ it compares a fraction with the percent limits. With
 speed work never changes results. Everything else new below is **opt-in**
 behind a flag or a new mode.
 
-## Why this fork exists
+## History
 
-These optimizations were offered to upstream falco as a patch, but the
-maintainers declined to merge it. FalcoAmadeus exists to make the faster
-implementation available to users who want it, and to add the sequencing-aware
-and reporting features below, while keeping the output identical to the
-original apart from the corrected N-content grade.
+FalcoAmadeus began as a set of speed improvements to falco, which were
+offered to the falco project as a patch and declined. The fork has since
+grown well beyond that patch. Besides the FastQC report, it now describes the
+library as a whole from the raw reads: exact and error- and UMI-aware
+duplicate rates of read pairs, optical duplicates, library complexity, insert
+sizes and adapter dimers, a contamination screen, a trimming preview, UMI
+quality, assay-specific grading and acceptance rules. Where these statistics
+port a published method (Picard, preseq, fastp, cutadapt), they were checked
+against the original program. The single-end FastQC report is still that of
+falco, apart from the corrected N-content grade.
 
 ## What FalcoAmadeus does differently
 
@@ -136,8 +143,8 @@ original apart from the corrected N-content grade.
 
 - **MultiQC-friendly.** The `fastqc_data.txt` output is ingested by MultiQC as a
   FastQC report. `--name NAME` sets an explicit sample name (so inputs passed
-  with unhelpful names — e.g. Galaxy paired-collection elements all called
-  *forward*/*reverse* — stay distinct instead of collapsing), and
+  with unhelpful names, such as Galaxy paired-collection elements all called
+  *forward*/*reverse*, stay distinct instead of collapsing), and
   `--paired-data mates|combined|both` chooses whether MultiQC gets the two mates
   separately or a single pooled sample per pair.
 
@@ -337,11 +344,14 @@ with any FASTQ/FASTQ.gz/SAM/BAM file:
 $ falcoAmadeus example.fq
 ```
 
-This generates three files in the output directory:
+This writes five files to the output directory:
 
-* `fastqc_data.txt` — a text summary of the QC metrics (ingestible by MultiQC).
-* `falcoAmadeus_report.html` — the interactive HTML report.
-* `summary.txt` — a tab-separated pass/warn/fail result for each module.
+* `fastqc_data.txt`: a text summary of the QC metrics (ingestible by MultiQC).
+* `falcoAmadeus_report.html`: the interactive HTML report.
+* `summary.txt`: a tab-separated pass/warn/fail result for each module.
+* `falcoAmadeus_summary.json`: all metrics, including those of the optional
+  analyses.
+* `falcoAmadeus_mqc.json`: general-statistics columns for MultiQC.
 
 **Paired-end** (one combined report + per-mate data for MultiQC +
 `paired_duplication.txt`):
@@ -394,10 +404,10 @@ FalcoAmadeus-specific options:
 | `--name NAME` | Sample name for the report `Filename` / MultiQC, instead of the input basename. |
 | `-t, --threads N` | Parse with N threads; works for FASTQ, gzipped FASTQ, SAM and BAM (byte-identical output at every thread count). |
 
-The FastQC-compatible options carried over from falco — `-o/--outdir`,
+The FastQC-compatible options carried over from falco (`-o/--outdir`,
 `-f/--format`, `-c/--contaminants`, `-a/--adapters`, `-l/--limits`, `--nogroup`,
 `-s/-subsample`, `-b/-bisulfite`, `-r/-reverse-complement`, the `-skip-*` flags
-and `-D`/`-R`/`-S` filename overrides — are unchanged. (The FastQC dummy flags
+and `-D`/`-R`/`-S` filename overrides) are unchanged. (The FastQC dummy flags
 that falco silently ignored, such as `--casava`, `--nano`, `--extract`,
 `--java`, `--kmers`, `--dir` and `--min_length`, have been dropped.)
 
@@ -411,9 +421,9 @@ FalcoAmadeus is a **fork** of falco.
 * The original falco code is Copyright (C) 2019–2022 Guilherme de Sena Brandine
   and Andrew D. Smith, released under the GNU General Public License. Their
   authorship of the original work is gratefully acknowledged.
-* The FalcoAmadeus fork and all modifications to it — the parallel parser, the
-  paired-end analysis, assay-aware grading, the redesigned HTML report, the new
-  command-line options, and everything else added here — are
+* The FalcoAmadeus fork and all modifications to it (the parallel parser, the
+  library statistics, assay-aware grading, the redesigned HTML report, the new
+  command-line options, and everything else added here) are
   Copyright (C) 2026 Joachim Wolff.
 
 FalcoAmadeus is free software: you can redistribute it and/or modify it under
