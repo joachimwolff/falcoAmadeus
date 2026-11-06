@@ -1,5 +1,22 @@
 # Changelog
 
+## FalcoAmadeus 4.0.1
+
+### Fixed
+
+- **macOS builds compile again.** The duplication prefix collected
+  pointers to the tracker's counts (`std::size_t`) as `std::uint64_t *`.
+  The two types are the same on Linux but differ on macOS, so version 4
+  did not compile with clang and libc++ (Bioconda osx-64 and osx-arm64).
+  Output is unchanged. Built and tested on macOS (Apple Silicon) with the
+  compilers of the Bioconda build (clang 19.1.7, libc++).
+- **The pipe test runs on macOS.** It made its input without a final
+  newline with GNU `head -c -1`, which BSD `head` rejects.
+
+### Documentation
+
+- The citation names the manuscript title.
+
 ## FalcoAmadeus 4
 
 ### Added
