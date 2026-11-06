@@ -1143,7 +1143,7 @@ class BamReader : public StreamReader {
   htsFile *hts;
   bam_hdr_t *hdr;
   bam1_t *b;
-  int rd_ret, fmt_ret;
+  int rd_ret;
   int n_threads = 1;   // htslib decompression thread pool size
   char *last;
   // [FalcoAmadeus] reused scratch for the ASCII-decoded SEQ (nibbles unpacked

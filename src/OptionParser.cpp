@@ -371,7 +371,6 @@ read_config_file(const string &config_filename,
     throw runtime_error("cannot open config file: " + config_filename);
 
   string line;
-  size_t line_number = 0;
   while (in) {
 
     if (!getline(in, line))
@@ -405,7 +404,6 @@ read_config_file(const string &config_filename,
       config_file_options.push_back(line);
     }
     in.peek();
-    ++line_number;
   }
 }
 
