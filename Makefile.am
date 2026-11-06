@@ -24,17 +24,20 @@ ACLOCAL_AMFLAGS = -I m4
 # OPENMP_CXXFLAGS: OpenMP powers the multi-threaded (-t) parser (from AC_OPENMP)
 AM_CXXFLAGS = -Wall -Wextra -Wpedantic -pthread $(OPENMP_CXXFLAGS)
 AM_LDFLAGS = -pthread $(OPENMP_CXXFLAGS)
+# feature defines go to AM_CPPFLAGS: CPPFLAGS belongs to the user, and make
+# passes it on (make distcheck runs configure again without these features)
+AM_CPPFLAGS =
 if ENABLE_HTS
-CPPFLAGS += -DUSE_HTS
+AM_CPPFLAGS += -DUSE_HTS
 endif
 if HAVE_LIBDEFLATE
-CPPFLAGS += -DUSE_LIBDEFLATE
+AM_CPPFLAGS += -DUSE_LIBDEFLATE
 endif
 if HAVE_ISAL
-CPPFLAGS += -DUSE_ISAL
+AM_CPPFLAGS += -DUSE_ISAL
 endif
 if HAVE_RAPIDGZIP
-CPPFLAGS += -DUSE_RAPIDGZIP @RAPIDGZIP_CPPFLAGS@
+AM_CPPFLAGS += -DUSE_RAPIDGZIP @RAPIDGZIP_CPPFLAGS@
 endif
 
 bin_PROGRAMS = falcoAmadeus
