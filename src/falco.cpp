@@ -1128,7 +1128,7 @@ fastqc_style_rate(FpView &keys, const std::size_t nthreads,
   }
   if (i < n) {
     // flat index of the tracked keys (fingerprints are uniformly distributed)
-    std::vector<std::uint64_t *> slot_val;  // per tracked key, its count
+    std::vector<std::size_t *> slot_val;  // per tracked key, its count
     std::vector<std::uint64_t> slot_key;
     std::size_t nslots = 1;
     while (nslots < 4 * c.sequence_count.size() + 4)

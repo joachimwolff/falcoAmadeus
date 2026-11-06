@@ -19,7 +19,9 @@ awk 'BEGIN {
     printf "@r%d\n%s\n+\n%s\n", i, s, q
   }
 }' > "$W/reads.fastq"
-head -c -1 "$W/reads.fastq" > "$W/nonl.fastq"  # no newline at the end
+# no newline at the end (head -c -1 is GNU only)
+head -c "$(( $(wc -c < "$W/reads.fastq") - 1 ))" "$W/reads.fastq" \
+  > "$W/nonl.fastq"
 
 data() { grep -v '^Filename' "$1/fastqc_data.txt" | tail -n +2; }
 

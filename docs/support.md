@@ -30,7 +30,7 @@ modifications and additions are Copyright (C) 2026 Joachim Wolff.
 
 If you use falcoAmadeus in your research, please cite the software and the work it builds on:
 
-- Wolff J. falcoAmadeus: quality control of sequencing libraries before alignment.
+- Wolff J. falcoAmadeus: library-level quality control of sequencing data from raw reads.
   [https://github.com/joachimwolff/falcoAmadeus](https://github.com/joachimwolff/falcoAmadeus)
 - de Sena Brandine G, Smith AD. Falco: high-speed FastQC emulation for quality control of
   sequencing data. *F1000Research*. 2019;8:1874. doi:10.12688/f1000research.21142.2
